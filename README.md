@@ -77,6 +77,7 @@ This allows rapid deployment without editing payloads manually during operations
 | switch <ID>  | Interact with a specific shell     |
 | kill <ID>    | Terminate a shell session          |
 | payloads     | Display the payload list           |
+| rename/rn <ID> <name>     | Rename Session        |
 | clear / cls  | Clear screen                       |
 | help         | Show help menu                     |
 | exit / quit  | Shut down the handler              |
@@ -94,7 +95,7 @@ openssl req -x509 -newkey rsa:2048 -sha256 -nodes \
 ```
 
 ## Future Enhancements
-- Session Renaming 
+- Session Renaming (Added 12 Jan 2026)
 - Chunked File Upload & Download
 - File Integrity Verification
 - File Transfer Progress Indicators
