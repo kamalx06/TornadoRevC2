@@ -53,12 +53,12 @@ TornadoRevC2 includes a large, categorized reverse shell payload list.
 
 This allows rapid deployment without editing payloads manually during operations.
 
-### Automatic Host Information Collection
-When a shell connects, TornadoRevC2 automatically collects host details before the operator interacts with the session.
-- Works on both Unix and Windows targets via inline Python (Unix) or PowerShell (Windows)
-- Collected once at connect time and stored on the session
-- Displayed immediately in the console in grouped sections and saved to the session log directory
-- Reusable via the `sysinfo` command to refresh information at any time
+### Manual Host Information Collection
+TornadoRevC2 collects host information **only when the operator explicitly executes the `sysinfo` command**, providing better operational stealth by avoiding automatic enumeration when a new session connects.
+* Works on both Unix and Windows targets via inline Python (Unix) or PowerShell (Windows)
+* Executed only on demand through the `sysinfo` command
+* Updates the session object with the latest host information
+* Displays the results in grouped sections and saves them to the session log directory for later reference
 
 Collected fields are organized into five sections when displayed:
 
@@ -121,6 +121,9 @@ Interactive shells receive improved PTY/TTY support for a better operator experi
 | `clear` / `cls` | Clear screen |
 | `help` | Show help menu |
 | `exit` / `quit` | Shut down the handler |
+| `upload [--resume] <ID> <local> <remote>` | Chunked upload with SHA256 verify |
+| `download [--resume] <ID> <remote> <local>` | Chunked download with SHA256 verify |
+| `verify/hash <ID> <remote>` | Check remote file size and SHA256 |
 
 Inside a client shell (`switch <ID>`), omit the session ID for file transfer and session commands.
 
@@ -131,7 +134,7 @@ Inside a client shell (`switch <ID>`), omit the session ID for file transfer and
 | `download [--resume] <remote> <local>` | Pull a remote file to the operator |
 | `verify` / `hash <remote>` | Show remote file size and SHA256 |
 | `help` | Show client-shell help |
-| `exit` / `quit` | Return to the main menu |
+| `exit(e)` / `quit(q)` | Return to the main menu |
 
 ### Per-Session Logging
 Every session gets its own dedicated directory under `logs/`, named after the session (ID, user, hostname, IP, OS, and timestamp).
@@ -217,8 +220,7 @@ openssl req -x509 -newkey rsa:2048 -sha256 -nodes \
 - Chunked File Upload & Download (Added)
 - File Integrity Verification (Added)
 - File Transfer Progress Indicators (Added)
-- Automatic Host Information Collection (Added)
-- `sysinfo` Command (Added)
+- `sysinfo`, `download`, `upload`, `verify/hash` Commands (Added)
 - Enhanced PTY/TTY Terminal Handling (Added)
 - Per-Session Directory Logging (Added)
 - Resumable File Transfers (Added)
