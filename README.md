@@ -86,6 +86,41 @@ This allows rapid deployment without editing payloads manually during operations
 - A unique session ID is generated when a session is opened
 - Every command sent to target and its output are logged locally for further analysis
 
+### Chunked File Upload & Download
+Transfer files to and from connected sessions without leaving the handler.
+- Platform-aware chunk sizes (32 KB Unix, 4 KB Windows)
+- Works over existing reverse shell channels (TCP/TLS)
+- Upload from operator machine to remote target
+- Download from remote target to operator machine
+- Commands available from main menu (with session ID) or inside a client shell
+
+| Command | Description |
+|---------|-------------|
+| `upload <ID> <local> <remote>` | Push a local file to the target |
+| `download <ID> <remote> <local>` | Pull a remote file to the operator |
+| `verify <ID> <remote>` | Show remote file size and SHA256 |
+
+Inside a client shell (`switch <ID>`), omit the ID: `upload`, `download`, `verify`.
+
+### File Integrity Verification
+Every upload and download is verified end-to-end with SHA256.
+- Local hash computed before upload; remote hash verified after
+- Remote hash fetched before download; local hash verified after
+- Mismatch reports both hashes for manual inspection
+- Standalone `verify` / `hash` command for remote file checks
+
+### File Transfer Progress Indicators
+Live progress feedback during transfers:
+- ASCII progress bar with percentage
+- Transferred / total size display
+- Transfer rate (bytes per second)
+- Estimated time remaining (ETA)
+
+### Command Autocomplete
+TornadoRevC2 supports **TAB-based autocompletion** for faster operation.
+- Built-in command completion
+- Session ID completion for commands such as `switch`, `kill`, `rename`, `upload`, `download`, and `verify`
+
 ## TLS Certificate Generation
 ```bash
 openssl req -x509 -newkey rsa:2048 -sha256 -nodes \
@@ -96,6 +131,7 @@ openssl req -x509 -newkey rsa:2048 -sha256 -nodes \
 
 ## Future Enhancements
 - Session Renaming (Added 12 Jan 2026)
-- Chunked File Upload & Download
-- File Integrity Verification
-- File Transfer Progress Indicators
+- Chunked File Upload & Download (Added 11 Aug 2026)
+- File Integrity Verification (Added 11 Aug 2026)
+- File Transfer Progress Indicators (Added 11 Aug 2026)
+- Command Autocomplete (Added 11 Aug 2026)
