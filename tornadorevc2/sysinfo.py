@@ -213,6 +213,7 @@ info = {{
     'cwd': os.getcwd(),
     'pid': os.getpid(),
     'python': sys.version.split()[0],
+    'collection_mode': 'full',
 }}
 print('{SYSINFO_MARK_START}' + json.dumps(info) + '{SYSINFO_MARK_END}', end='')
 """
@@ -337,6 +338,143 @@ printf '}}%s' "$END"
 """
 
 
+def _unix_stealth_collector_source():
+    return f"""
+import json, os, platform, socket, sys
+
+def get_os_name():
+    try:
+        with open('/etc/os-release') as fh:
+            for line in fh:
+                if line.startswith('PRETTY_NAME='):
+                    return line.split('=', 1)[1].strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return platform.system()
+
+def get_ips():
+    ips = set()
+    try:
+        for item in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = item[4][0]
+            if not ip.startswith('127.'):
+                ips.add(ip)
+    except Exception:
+        pass
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.connect(('8.8.8.8', 80))
+        ip = probe.getsockname()[0]
+        probe.close()
+        if ip and not ip.startswith('127.'):
+            ips.add(ip)
+    except Exception:
+        pass
+    try:
+        with open('/proc/net/fib_trie') as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith('/32 host LOCAL'):
+                    continue
+                parts = line.split()
+                if len(parts) >= 2 and parts[0].count('.') == 3:
+                    ip = parts[0]
+                    if not ip.startswith('127.'):
+                        ips.add(ip)
+    except Exception:
+        pass
+    return ', '.join(sorted(ips))
+
+user = os.environ.get('USER') or os.environ.get('LOGNAME') or ''
+try:
+    user = user or __import__('getpass').getuser()
+except Exception:
+    pass
+
+info = {{
+    'collection_mode': 'stealth',
+    'hostname': socket.gethostname(),
+    'username': user,
+    'os': get_os_name(),
+    'architecture': platform.machine(),
+    'ip_addresses': get_ips(),
+    'cwd': os.getcwd(),
+    'pid': os.getpid(),
+}}
+print('{SYSINFO_MARK_START}' + json.dumps(info) + '{SYSINFO_MARK_END}', end='')
+"""
+
+
+def _unix_stealth_shell_fallback():
+    return f"""#!/bin/sh
+START='{SYSINFO_MARK_START}'
+END='{SYSINFO_MARK_END}'
+json_escape() {{ printf '%s' "$1" | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g'; }}
+hostname_val=$(cat /proc/sys/kernel/hostname 2>/dev/null || hostname 2>/dev/null)
+username_val=$(id -un 2>/dev/null || whoami 2>/dev/null)
+os_val=$(uname -s 2>/dev/null)
+arch_val=$(uname -m 2>/dev/null)
+cwd_val=$(pwd 2>/dev/null)
+pid_val=$$
+if [ -r /etc/os-release ]; then
+  pretty=$(grep ^PRETTY_NAME= /etc/os-release 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"')
+  [ -n "$pretty" ] && os_val="$pretty"
+fi
+ip_val=""
+if [ -r /proc/net/fib_trie ]; then
+  ip_val=$(awk '/32 host LOCAL/{{next}} /^[0-9]/{{print $1}}' /proc/net/fib_trie 2>/dev/null | grep -v '^127\\.' | sort -u | tr '\\n' ',' | sed 's/,$//; s/,/, /g')
+fi
+printf '%s{{' "$START"
+printf '"collection_mode":"stealth",'
+printf '"hostname":"%s",' "$(json_escape "$hostname_val")"
+printf '"username":"%s",' "$(json_escape "$username_val")"
+printf '"os":"%s",' "$(json_escape "$os_val")"
+printf '"architecture":"%s",' "$(json_escape "$arch_val")"
+printf '"ip_addresses":"%s",' "$(json_escape "$ip_val")"
+printf '"cwd":"%s",' "$(json_escape "$cwd_val")"
+printf '"pid":"%s"' "$(json_escape "$pid_val")"
+printf '}}%s' "$END"
+"""
+
+
+def _unix_stealth_collect_cmd():
+    py_source = _unix_stealth_collector_source()
+    sh_source = _unix_stealth_shell_fallback()
+    py_cmd = _b64_exec_cmd(py_source, (
+        ('python3', 'python'),
+        ('python', 'python'),
+    ))
+    sh_cmd = _b64_exec_cmd(sh_source, (
+        ('sh', '-d'),
+        ('sh', '-D'),
+    ))
+    return f"{py_cmd} || {sh_cmd}"
+
+
+def _win_stealth_ps():
+    return f"""
+$ErrorActionPreference = 'SilentlyContinue'
+$os = [System.Environment]::OSVersion.VersionString
+try {{ $os = (Get-CimInstance Win32_OperatingSystem).Caption }} catch {{}}
+$ips = @(
+    [System.Net.Dns]::GetHostAddresses($env:COMPUTERNAME) |
+    Where-Object {{ $_.AddressFamily -eq 'InterNetwork' -and $_.IPAddressToString -notlike '127.*' }} |
+    ForEach-Object {{ $_.IPAddressToString }}
+)
+$info = @{{
+    collection_mode = 'stealth'
+    hostname = $env:COMPUTERNAME
+    username = $env:USERNAME
+    os = $os
+    architecture = $env:PROCESSOR_ARCHITECTURE
+    ip_addresses = ($ips | Sort-Object -Unique) -join ', '
+    cwd = (Get-Location).Path
+    pid = $PID
+}}
+'{SYSINFO_MARK_START}' + (ConvertTo-Json -Compress $info) + '{SYSINFO_MARK_END}'
+"""
+
+
 def _unix_collect_cmd():
     py_source = _unix_collector_source()
     sh_source = _unix_shell_fallback_source()
@@ -383,6 +521,7 @@ $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
     [Security.Principal.WindowsBuiltInRole]::Administrator
 )
 $info = @{{
+    collection_mode = 'full'
     hostname = $env:COMPUTERNAME
     fqdn = [System.Net.Dns]::GetHostEntry($env:COMPUTERNAME).HostName
     username = $env:USERNAME
@@ -416,9 +555,13 @@ $info = @{{
 """
 
 
-def build_collect_commands(shell_type):
-    unix_cmd = _unix_collect_cmd()
-    win_ps = _win_collect_ps()
+def build_collect_commands(shell_type, mode='stealth'):
+    if mode == 'full':
+        unix_cmd = _unix_collect_cmd()
+        win_ps = _win_collect_ps()
+    else:
+        unix_cmd = _unix_stealth_collect_cmd()
+        win_ps = _win_stealth_ps()
     if shell_type == 'windows':
         return None, win_ps
     if shell_type == 'unix':
@@ -476,6 +619,14 @@ SYSINFO_SECTIONS = (
 )
 
 
+SYSINFO_STEALTH_SECTIONS = (
+    ('Essentials', (
+        'hostname', 'username', 'os', 'architecture',
+        'ip_addresses', 'cwd', 'pid',
+    )),
+)
+
+
 def format_sysinfo(info, colors=None):
     if not info:
         return 'System information unavailable'
@@ -485,9 +636,11 @@ def format_sysinfo(info, colors=None):
     cyan = c.get('cyan', '')
     yellow = c.get('yellow', '')
     end = c.get('end', '')
-    lines = [f"{bold}{green}System Information{end}"]
-    seen = set()
-    for section, keys in SYSINFO_SECTIONS:
+    mode = info.get('collection_mode', 'stealth')
+    lines = [f"{bold}{green}System Information{end} ({mode} mode)"]
+    sections = SYSINFO_STEALTH_SECTIONS if mode == 'stealth' else SYSINFO_SECTIONS
+    seen = {'collection_mode'}
+    for section, keys in sections:
         section_lines = []
         for key in keys:
             value = info.get(key)

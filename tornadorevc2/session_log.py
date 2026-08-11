@@ -18,8 +18,10 @@ class SessionLogger:
         self.command_log = os.path.join(self.session_dir, 'session.log')
         self.sysinfo_path = os.path.join(self.session_dir, 'sysinfo.json')
         self.transfers_dir = os.path.join(self.session_dir, 'transfers')
+        self.executions_dir = os.path.join(self.session_dir, 'executions')
         os.makedirs(self.session_dir, exist_ok=True)
         os.makedirs(self.transfers_dir, exist_ok=True)
+        os.makedirs(self.executions_dir, exist_ok=True)
 
     def _timestamp(self):
         return datetime.datetime.now().isoformat(timespec='seconds')
@@ -56,3 +58,29 @@ class SessionLogger:
             if detail:
                 f.write(f"Detail:   {detail}\n")
         self.log_event(f"Transfer {direction}: {status} ({local_path} <-> {remote_path})")
+
+    def log_execution(self, metadata):
+        stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        name = metadata.get('name', 'payload')
+        safe_name = re.sub(r'[^\w.\-]+', '_', name)[:48]
+        path = os.path.join(self.executions_dir, f"exec_{safe_name}_{stamp}.json")
+        record = dict(metadata)
+        record['timestamp'] = self._timestamp()
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(record, f, indent=2)
+            f.write('\n')
+        status = 'success' if record.get('success') else 'failed'
+        self.log_event(
+            f"Payload execution {status}: {record.get('name')} "
+            f"({record.get('type')}, {record.get('runtime_ms', 0)} ms)"
+        )
+
+    def log_clipboard(self, action, success, detail=''):
+        status = 'success' if success else 'failed'
+        self.log_event(f"Clipboard {action}: {status}" + (f" ({detail})" if detail else ''))
+
+    def log_tunnel(self, message):
+        self.log_event(f"Tunnel: {message}")
+
+    def log_reconnect(self, detail):
+        self.log_event(f"Session reconnected — {detail}")
