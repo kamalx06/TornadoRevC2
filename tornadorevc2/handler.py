@@ -724,11 +724,12 @@ class TORNADOREVC2:
                     if cmd_lower == 'help':
                         print(f"""
     {self.colors['green']}SESSION:{self.colors['end']}
-    sysinfo                     Collect/display host information
+    sysinfo                                Collect/display host information
+    exit(e) / quit(q) / CTRL+C             Return to the main menu
 
     {self.colors['green']}FILE TRANSFER:{self.colors['end']}
     upload [--resume] <local> <remote>     Chunked upload with SHA256 verify
-    download [--resume] <remote> <local> Chunked download with SHA256 verify
+    download [--resume] <remote> <local>   Chunked download with SHA256 verify
     verify/hash <remote>                   Remote file size and SHA256""")
                         continue
 
@@ -889,7 +890,7 @@ class TORNADOREVC2:
 
     {self.colors['green']}FILE TRANSFER:{self.colors['end']}
     upload [--resume] <ID> <local> <remote>     Chunked upload with SHA256 verify
-    download [--resume] <ID> <remote> <local> Chunked download with SHA256 verify
+    download [--resume] <ID> <remote> <local>   Chunked download with SHA256 verify
     verify/hash <ID> <remote>                   Remote file size and SHA256
 
     {self.colors['yellow']}Inside a client shell, omit <ID> and use --resume to continue interrupted transfers{self.colors['end']}""")
