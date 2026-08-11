@@ -1,3 +1,4 @@
+import base64
 import json
 import re
 
@@ -20,14 +21,16 @@ def _extract_marked(output, start_mark, end_mark):
     return payload.strip()
 
 
-def _minify_python(source):
-    lines = []
-    for line in source.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith('#'):
-            continue
-        lines.append(stripped)
-    return ';'.join(lines)
+def _b64_exec_cmd(source, interpreters):
+    payload = base64.b64encode(source.strip().encode('utf-8')).decode('ascii')
+    parts = []
+    for name, flag in interpreters:
+        parts.append(
+            f"{name} -c 'import base64; exec(base64.b64decode(\"{payload}\"))' 2>/dev/null"
+            if flag == 'python'
+            else f"echo {payload} | base64 {flag} 2>/dev/null | {name} 2>/dev/null"
+        )
+    return ' || '.join(parts)
 
 
 def _unix_collector_source():
@@ -44,6 +47,25 @@ def safe(fn, default=''):
         return default if val is None else val
     except Exception:
         return default
+
+def get_shell():
+    sh = os.environ.get('SHELL', '')
+    if sh:
+        return sh
+    try:
+        return __import__('pwd').getpwuid(os.getuid()).pw_shell
+    except Exception:
+        return ''
+
+def get_os_name():
+    try:
+        with open('/etc/os-release') as fh:
+            for line in fh:
+                if line.startswith('PRETTY_NAME='):
+                    return line.split('=', 1)[1].strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return platform.system()
 
 def get_ips():
     ips = set()
@@ -64,10 +86,15 @@ def get_ips():
     except Exception:
         pass
     try:
-        out = __import__('subprocess').check_output(['ifconfig'], text=True, timeout=3)
-        for match in __import__('re').findall(r'inet (\\d+\\.\\d+\\.\\d+\\.\\d+)', out):
-            if not match.startswith('127.'):
-                ips.add(match)
+        out = __import__('subprocess').check_output(
+            ['ip', '-4', '-o', 'addr'], stderr=__import__('subprocess').DEVNULL, text=True, timeout=3
+        )
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 4:
+                ip = parts[3].split('/')[0]
+                if not ip.startswith('127.'):
+                    ips.add(ip)
     except Exception:
         pass
     return ', '.join(sorted(ips))
@@ -121,13 +148,39 @@ def get_disk():
     except Exception:
         return ''
 
-def get_locale():
-    if not locale:
-        return ''
+def get_timezone():
+    tz = '/'.join(x for x in time.tzname if x)
+    if tz:
+        return tz
+    tz_env = os.environ.get('TZ', '')
+    if tz_env:
+        return tz_env
     try:
-        return ','.join(x for x in locale.getdefaultlocale() if x) or ''
+        with open('/etc/timezone') as fh:
+            return fh.read().strip()
+    except Exception:
+        pass
+    try:
+        out = __import__('subprocess').check_output(
+            ['timedatectl', 'show', '-p', 'Timezone', '--value'],
+            stderr=__import__('subprocess').DEVNULL, text=True, timeout=2,
+        )
+        return out.strip()
     except Exception:
         return ''
+
+def get_locale():
+    for key in ('LC_ALL', 'LANG', 'LC_CTYPE'):
+        val = os.environ.get(key, '')
+        if val:
+            return val
+    if locale:
+        try:
+            loc = locale.getlocale()
+            return ','.join(x for x in loc if x) or ''
+        except Exception:
+            pass
+    return ''
 
 user = os.environ.get('USER') or os.environ.get('LOGNAME') or ''
 try:
@@ -140,11 +193,11 @@ info = {{
     'fqdn': safe(lambda: socket.getfqdn()),
     'username': user,
     'home': safe(lambda: os.path.expanduser('~')),
-    'shell': os.environ.get('SHELL', ''),
+    'shell': get_shell(),
     'uid': safe(lambda: os.geteuid(), '') if hasattr(os, 'geteuid') else '',
     'gid': safe(lambda: os.getegid(), '') if hasattr(os, 'getegid') else '',
     'is_root': bool(getattr(os, 'geteuid', lambda: -1)() == 0),
-    'os': platform.system(),
+    'os': get_os_name(),
     'os_release': platform.release(),
     'os_version': platform.version(),
     'kernel': safe(lambda: platform.uname().release),
@@ -154,7 +207,7 @@ info = {{
     'memory': get_memory(),
     'disk': get_disk(),
     'uptime': get_uptime(),
-    'timezone': safe(lambda: '/'.join(x for x in time.tzname if x)),
+    'timezone': get_timezone(),
     'locale': get_locale(),
     'ip_addresses': get_ips(),
     'cwd': os.getcwd(),
@@ -165,17 +218,137 @@ print('{SYSINFO_MARK_START}' + json.dumps(info) + '{SYSINFO_MARK_END}', end='')
 """
 
 
+def _unix_shell_fallback_source():
+    return f"""#!/bin/sh
+# POSIX shell sysinfo collector (used when Python is unavailable)
+START='{SYSINFO_MARK_START}'
+END='{SYSINFO_MARK_END}'
+
+json_escape() {{
+    printf '%s' "$1" | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g'
+}}
+
+num_or_empty() {{
+    case "$1" in
+        ''|*[!0-9]*) printf '' ;;
+        *) printf '%s' "$1" ;;
+    esac
+}}
+
+hostname_val=$(hostname 2>/dev/null)
+fqdn_val=$(hostname -f 2>/dev/null)
+[ -z "$fqdn_val" ] && fqdn_val="$hostname_val"
+username_val=$(id -un 2>/dev/null || whoami 2>/dev/null)
+home_val=${{HOME:-$(eval echo "~$username_val" 2>/dev/null)}}
+shell_val=${{SHELL:-$(getent passwd "$username_val" 2>/dev/null | cut -d: -f7)}}
+uid_val=$(id -u 2>/dev/null)
+gid_val=$(id -g 2>/dev/null)
+is_root=no
+[ "$uid_val" = "0" ] && is_root=yes
+os_val=$(uname -s 2>/dev/null)
+kernel_val=$(uname -r 2>/dev/null)
+arch_val=$(uname -m 2>/dev/null)
+platform_val="$os_val $kernel_val $arch_val"
+cpu_count_val=$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null)
+cpu_count_val=$(num_or_empty "$cpu_count_val")
+
+memory_val=""
+if [ -r /proc/meminfo ]; then
+    total_kb=$(awk '/^MemTotal:/ {{print $2}}' /proc/meminfo)
+    avail_kb=$(awk '/^MemAvailable:/ {{print $2}}' /proc/meminfo)
+    [ -z "$avail_kb" ] && avail_kb=$(awk '/^MemFree:/ {{print $2}}' /proc/meminfo)
+    if [ -n "$total_kb" ]; then
+        total_mb=$((total_kb / 1024))
+        avail_mb=$((avail_kb / 1024))
+        memory_val="${{avail_mb}} MB free / ${{total_mb}} MB total"
+    fi
+fi
+
+disk_val=""
+if df -B1 . >/dev/null 2>&1; then
+    set -- $(df -B1 . 2>/dev/null | awk 'NR==2 {{print $2, $4}}')
+    if [ -n "$1" ] && [ -n "$2" ]; then
+        total_gb=$(awk -v b="$1" 'BEGIN {{printf "%.1f", b/1073741824}}')
+        free_gb=$(awk -v b="$2" 'BEGIN {{printf "%.1f", b/1073741824}}')
+        disk_val="${{free_gb}} GB free / ${{total_gb}} GB total"
+    fi
+fi
+
+uptime_val=""
+if [ -r /proc/uptime ]; then
+    secs=$(awk '{{print int($1)}}' /proc/uptime)
+    days=$((secs / 86400))
+    rem=$((secs % 86400))
+    hours=$((rem / 3600))
+    minutes=$(((rem % 3600) / 60))
+    uptime_val=""
+    [ "$days" -gt 0 ] && uptime_val="${{days}}d "
+    [ "$hours" -gt 0 ] && uptime_val="${{uptime_val}}${{hours}}h "
+    uptime_val="${{uptime_val}}${{minutes}}m"
+fi
+
+ip_val=$(hostname -I 2>/dev/null | sed 's/127\\.[0-9.]*//g; s/  */ /g; s/^ //; s/ $//; s/ /, /g')
+if [ -z "$ip_val" ] && command -v ip >/dev/null 2>&1; then
+    ip_val=$(ip -4 -o addr 2>/dev/null | awk '{{print $4}}' | cut -d/ -f1 | awk '!/^127\\./ && NF {{print}}' | tr '\\n' ',' | sed 's/,$//; s/,/, /g')
+fi
+
+timezone_val=${{TZ:-}}
+[ -z "$timezone_val" ] && [ -r /etc/timezone ] && timezone_val=$(tr -d '\\n' </etc/timezone)
+if [ -z "$timezone_val" ] && command -v timedatectl >/dev/null 2>&1; then
+    timezone_val=$(timedatectl show -p Timezone --value 2>/dev/null)
+fi
+
+locale_val=${{LC_ALL:-${{LANG:-}}}}
+cwd_val=$(pwd 2>/dev/null)
+pid_val=$$
+python_val=""
+
+if [ -r /etc/os-release ]; then
+    pretty=$(grep ^PRETTY_NAME= /etc/os-release 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"')
+    [ -n "$pretty" ] && os_val="$pretty"
+fi
+
+printf '%s{{' "$START"
+printf '"hostname":"%s",' "$(json_escape "$hostname_val")"
+printf '"fqdn":"%s",' "$(json_escape "$fqdn_val")"
+printf '"username":"%s",' "$(json_escape "$username_val")"
+printf '"home":"%s",' "$(json_escape "$home_val")"
+printf '"shell":"%s",' "$(json_escape "$shell_val")"
+printf '"uid":"%s",' "$(json_escape "$uid_val")"
+printf '"gid":"%s",' "$(json_escape "$gid_val")"
+printf '"is_root":"%s",' "$is_root"
+printf '"os":"%s",' "$(json_escape "$os_val")"
+printf '"os_release":"%s",' "$(json_escape "$kernel_val")"
+printf '"os_version":"%s",' "$(json_escape "$platform_val")"
+printf '"kernel":"%s",' "$(json_escape "$kernel_val")"
+printf '"architecture":"%s",' "$(json_escape "$arch_val")"
+printf '"platform":"%s",' "$(json_escape "$platform_val")"
+printf '"cpu_count":"%s",' "$(json_escape "$cpu_count_val")"
+printf '"memory":"%s",' "$(json_escape "$memory_val")"
+printf '"disk":"%s",' "$(json_escape "$disk_val")"
+printf '"uptime":"%s",' "$(json_escape "$uptime_val")"
+printf '"timezone":"%s",' "$(json_escape "$timezone_val")"
+printf '"locale":"%s",' "$(json_escape "$locale_val")"
+printf '"ip_addresses":"%s",' "$(json_escape "$ip_val")"
+printf '"cwd":"%s",' "$(json_escape "$cwd_val")"
+printf '"pid":"%s",' "$(json_escape "$pid_val")"
+printf '"python":"%s"' "$(json_escape "$python_val")"
+printf '}}%s' "$END"
+"""
+
+
 def _unix_collect_cmd():
-    script = _minify_python(_unix_collector_source())
-    return (
-        f"python3 -c \"{script}\" 2>/dev/null || "
-        f"python -c \"{script}\" 2>/dev/null || "
-        f"(printf '%s' '{SYSINFO_MARK_START}'; "
-        f"printf '{{\"hostname\":\"%s\",\"username\":\"%s\",\"os\":\"unknown\",\"cwd\":\"%s\"}}' "
-        f"\"$(hostname 2>/dev/null)\" \"$(whoami 2>/dev/null || id -un 2>/dev/null)\" "
-        f"\"$(pwd 2>/dev/null)\"; "
-        f"printf '%s' '{SYSINFO_MARK_END}')"
-    )
+    py_source = _unix_collector_source()
+    sh_source = _unix_shell_fallback_source()
+    py_cmd = _b64_exec_cmd(py_source, (
+        ('python3', 'python'),
+        ('python', 'python'),
+    ))
+    sh_cmd = _b64_exec_cmd(sh_source, (
+        ('sh', '-d'),
+        ('sh', '-D'),
+    ))
+    return f"{py_cmd} || {sh_cmd}"
 
 
 def _win_collect_ps():

@@ -950,25 +950,16 @@ class TORNADOREVC2:
             client_info['init'] = True
 
         self.recv_output(client_sock, timeout=2.0)
-        sysinfo = self.collect_sysinfo(client_sock, inferred)
-        if sysinfo:
-            client_info['sysinfo'] = sysinfo
 
-        session_id = self._make_session_id(client_id, addr, inferred, sysinfo)
+        session_id = self._make_session_id(client_id, addr, inferred)
         logger = SessionLogger(session_id)
         client_info['logger'] = logger
-        if sysinfo:
-            logger.save_sysinfo(sysinfo)
         logger.log_event(f"Session connected from {addr[0]}:{addr[1]} ({inferred})")
 
-        display_user = (sysinfo or {}).get('username', '?')
-        display_host = (sysinfo or {}).get('hostname', addr[0])
         print(
-            f"{self.colors['green']}New Client #{client_id}: {display_user}@{display_host} "
-            f"({addr[0]}:{addr[1]}, {inferred.upper()}) | switch {client_id}{self.colors['end']}"
+            f"{self.colors['green']}New Client #{client_id}: {addr[0]}:{addr[1]} "
+            f"({inferred.upper()}) | switch {client_id}{self.colors['end']}"
         )
-        if sysinfo:
-            print(format_sysinfo(sysinfo, self.colors))
         print(f"{self.colors['blue']}Logs: {logger.session_dir}{self.colors['end']}")
 
     def start(self):
