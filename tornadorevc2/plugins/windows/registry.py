@@ -21,7 +21,7 @@ $keys=@(
 $autoruns=@(); $software=@()
 foreach($k in $keys[0..4]){{
   if(Test-Path $k){{Get-ItemProperty $k -EA 0|Get-Member -MemberType NoteProperty|? Name -notmatch '^PS'|ForEach-Object{{$p=Get-ItemProperty $k;$autoruns+=@{{key=$k;name=$_.Name;value=$p.($_.Name)}}}}}}
-}
+}}
 Get-ItemProperty 'HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*' -EA 0|Select-Object -First 40 DisplayName,DisplayVersion,Publisher,InstallDate|ForEach-Object{{$software+=@{{name=$_.DisplayName;ver=$_.DisplayVersion;pub=$_.Publisher;date=$_.InstallDate}}}}
 $result=[ordered]@{{
   summary=@{{autoruns=$autoruns.Count;software=$software.Count}}
