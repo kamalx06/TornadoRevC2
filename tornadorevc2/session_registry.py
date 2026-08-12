@@ -17,6 +17,15 @@ def _norm(value):
     return str(value or '').strip().lower()
 
 
+def normalize_ip(ip):
+    ip = _norm(ip)
+    if ip.startswith('::ffff:'):
+        ip = ip[7:]
+    if ip == '::1':
+        return '127.0.0.1'
+    return ip
+
+
 def _parse_hostname_from_probe(probe_output):
     for line in (probe_output or '').splitlines():
         line = line.strip()
@@ -34,29 +43,53 @@ def _parse_hostname_from_probe(probe_output):
     return ''
 
 
-def compute_fingerprint(info, probe_output=''):
-    """Build a stable fingerprint from host identifiers."""
+def identity_tuple(info, probe_output=''):
     sysinfo = info.get('sysinfo') or {}
     identity = info.get('identity') or {}
-
     hostname = _norm(sysinfo.get('hostname') or identity.get('hostname'))
     username = _norm(sysinfo.get('username') or identity.get('username'))
     if not hostname:
         hostname = _parse_hostname_from_probe(probe_output)
-
-    os_name = _norm(sysinfo.get('os') or info.get('type'))
-    arch = _norm(sysinfo.get('architecture'))
     shell_type = _norm(info.get('type') or 'unknown')
-    addr_ip = _norm((info.get('addr') or ('',))[0])
+    return hostname, username, shell_type
 
-    if not os_name and probe_output:
-        probe = probe_output.lower()
-        if 'windows' in probe or 'microsoft' in probe:
-            os_name = 'windows'
-        elif any(x in probe for x in ('linux', 'uid=', 'bsd', 'darwin')):
-            os_name = 'unix'
 
-    parts = [hostname, username, os_name, arch, shell_type, addr_ip]
+def record_identity_tuple(record):
+    sysinfo = record.get('sysinfo') or {}
+    identity = record.get('identity') or {}
+    return (
+        _norm(sysinfo.get('hostname') or identity.get('hostname')),
+        _norm(sysinfo.get('username') or identity.get('username')),
+        _norm(record.get('type')),
+    )
+
+
+def identities_match(incoming, stored, info=None, stored_record=None):
+    in_host, in_user, in_type = incoming
+    rec_host, rec_user, rec_type = stored
+    if in_host and rec_host and in_host == rec_host:
+        if in_user and rec_user:
+            return in_user == rec_user
+        return in_type == rec_type or not in_type or not rec_type
+    if in_user and rec_user and in_user == rec_user and in_type == rec_type:
+        return True
+    if info and stored_record:
+        in_ip = normalize_ip((info.get('addr') or ('',))[0])
+        rec_ip = normalize_ip((stored_record.get('addr') or [''])[0])
+        if in_ip and rec_ip and in_ip == rec_ip and in_type == rec_type:
+            if in_host and rec_host and in_host == rec_host:
+                return True
+            if in_user and rec_user and in_user == rec_user:
+                return True
+    return False
+
+
+def compute_fingerprint(info, probe_output=''):
+    """Stable fingerprint from hostname, username, and shell type."""
+    hostname, username, shell_type = identity_tuple(info, probe_output)
+    parts = [hostname, username, shell_type]
+    if not hostname and not username:
+        parts.append(normalize_ip((info.get('addr') or ('',))[0]))
     raw = '|'.join(parts)
     return hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]
 
@@ -90,6 +123,22 @@ class SessionRegistry:
                 f.write('\n')
         except OSError:
             pass
+
+    def _find_record_for_info(self, info):
+        fp = info.get('fingerprint')
+        if fp and fp in self._data['sessions']:
+            return fp, self._data['sessions'][fp]
+        sid = info.get('id')
+        if sid is not None:
+            for key, rec in self._data['sessions'].items():
+                if rec.get('session_id') == sid:
+                    return key, rec
+        incoming = identity_tuple(info)
+        for key, rec in self._data['sessions'].items():
+            if identities_match(incoming, record_identity_tuple(rec), info, rec):
+                return key, rec
+        fp = compute_fingerprint(info)
+        return fp, self._data['sessions'].get(fp, {})
 
     def register_active(self, info, fingerprint, probe_output=''):
         """Record or update metadata for an active session."""
@@ -126,42 +175,46 @@ class SessionRegistry:
         self._save()
         return fp
 
-    def find_reconnect(self, fingerprint, probe_output='', info=None):
-        """Return stored session record if fingerprint matches a disconnected session."""
+    def find_reconnect(self, fingerprint, probe_output='', info=None, live_ids=None):
+        """Return a prior session record that should be restored for this host."""
+        live_ids = live_ids or set()
+        incoming = identity_tuple(info or {}, probe_output)
+
+        def is_restorable(rec):
+            if not rec:
+                return False
+            sid = rec.get('session_id')
+            if rec.get('status') == 'disconnected':
+                return True
+            return rec.get('status') == 'active' and sid not in live_ids
+
         if fingerprint:
             record = self._data['sessions'].get(fingerprint)
-            if record and record.get('status') == 'disconnected':
+            if is_restorable(record):
                 return record
 
-        if not info:
-            return None
-
-        addr_ip = _norm((info.get('addr') or ('',))[0])
-        identity = info.get('identity') or {}
-        sysinfo = info.get('sysinfo') or {}
-        host = _norm(sysinfo.get('hostname') or identity.get('hostname') or _parse_hostname_from_probe(probe_output))
-        user = _norm(sysinfo.get('username') or identity.get('username'))
-        shell_type = _norm(info.get('type'))
-
         best = None
+        best_score = -1
         for rec in self._data['sessions'].values():
-            if rec.get('status') != 'disconnected':
+            if not is_restorable(rec):
                 continue
-            rec_addr = _norm((rec.get('addr') or [''])[0])
-            rec_si = rec.get('sysinfo') or {}
-            rec_id = rec.get('identity') or {}
-            rec_host = _norm(rec_si.get('hostname') or rec_id.get('hostname'))
-            rec_user = _norm(rec_si.get('username') or rec_id.get('username'))
-            rec_type = _norm(rec.get('type'))
-
-            if addr_ip and rec_addr != addr_ip:
+            stored = record_identity_tuple(rec)
+            if not identities_match(incoming, stored, info, rec):
                 continue
-            if host and rec_host and host == rec_host:
-                return rec
-            if user and rec_user and user == rec_user and shell_type == rec_type:
-                return rec
-            if shell_type and rec_type == shell_type and not host and not rec_host:
+            score = 0
+            in_host, in_user, in_type = incoming
+            rec_host, rec_user, rec_type = stored
+            if in_host and rec_host and in_host == rec_host:
+                score += 4
+            if in_user and rec_user and in_user == rec_user:
+                score += 4
+            if in_type and rec_type and in_type == rec_type:
+                score += 2
+            if rec.get('status') == 'disconnected':
+                score += 1
+            if score > best_score:
                 best = rec
+                best_score = score
 
         return best
 
@@ -196,10 +249,10 @@ class SessionRegistry:
         return new_fp
 
     def mark_disconnected(self, info):
-        fp = info.get('fingerprint')
+        fp, record = self._find_record_for_info(info)
         if not fp:
             fp = compute_fingerprint(info)
-        record = self._data['sessions'].get(fp, {})
+        record = dict(record or {})
         record.update({
             'session_id': info['id'],
             'fingerprint': fp,
@@ -215,7 +268,12 @@ class SessionRegistry:
             'last_seen': datetime.datetime.now().isoformat(timespec='seconds'),
             'connect_count': info.get('connect_count', record.get('connect_count', 1)),
         })
+        old_keys = [key for key, rec in self._data['sessions'].items()
+                    if key != fp and rec.get('session_id') == info.get('id')]
+        for key in old_keys:
+            self._data['sessions'].pop(key, None)
         self._data['sessions'][fp] = record
+        info['fingerprint'] = fp
         self._save()
 
     def log_reconnect(self, old_id, new_id, fingerprint, addr):
@@ -291,8 +349,9 @@ class SessionRegistry:
         name = rec.get('name')
         display = f"#{sid} ({name})" if name else f"#{sid}"
         sysinfo = rec.get('sysinfo') or {}
-        host = sysinfo.get('hostname', '?')
-        user = sysinfo.get('username', '?')
+        identity = rec.get('identity') or {}
+        host = sysinfo.get('hostname') or identity.get('hostname') or '?'
+        user = sysinfo.get('username') or identity.get('username') or '?'
         addr = rec.get('addr', ['?', '?'])
         count = rec.get('connect_count', 1)
         status_color = colors['yellow'] if disconnected else colors['green']
