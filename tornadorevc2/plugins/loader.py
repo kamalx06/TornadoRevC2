@@ -5,19 +5,31 @@ import importlib.util
 import os
 import sys
 import threading
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional
 
 from .api import PluginCommand, get_registry
 
-
-BUILTIN_PLUGIN_MODULES = (
-    'tornadorevc2.plugins.shared.virtualization',
-)
 
 EXTERNAL_PLUGIN_DIR = os.environ.get(
     'TORNADOREVC2_PLUGIN_DIR',
     os.path.join(os.getcwd(), 'plugins'),
 )
+
+
+def _discover_builtin_plugin_modules() -> tuple:
+    root = os.path.dirname(os.path.abspath(__file__))
+    modules = ['tornadorevc2.plugins.shared.virtualization']
+    for sub in ('linux', 'windows'):
+        subdir = os.path.join(root, sub)
+        if not os.path.isdir(subdir):
+            continue
+        for fn in sorted(os.listdir(subdir)):
+            if fn.endswith('.py') and fn != '__init__.py' and not fn.startswith('_'):
+                modules.append(f'tornadorevc2.plugins.{sub}.{fn[:-3]}')
+    return tuple(dict.fromkeys(modules))
+
+
+BUILTIN_PLUGIN_MODULES = _discover_builtin_plugin_modules()
 
 
 class PluginLoader:
@@ -150,6 +162,6 @@ class PluginLoader:
 
     def builtin_path_for_name(self, plugin_name: str) -> Optional[str]:
         for mod in BUILTIN_PLUGIN_MODULES:
-            if plugin_name in mod:
+            if mod.endswith(f'.{plugin_name}') or plugin_name in mod:
                 return mod
         return None

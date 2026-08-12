@@ -1,270 +1,333 @@
-"""Linux virtualization and container detection collector."""
+"""Aggressive Linux virtualization and container detection collector."""
 
 from ...constants import PLUGIN_MARK_END, PLUGIN_MARK_START
-from ...sysinfo import _b64_exec_cmd
+from ..api import plugin, SessionContext
+from ..shared.common import format_virtualization_report
+from ..shared.runner import run_collector_plugin
+from ._helpers import build_linux_collector_command
 
 
-def _linux_collector_source():
+def _collector_source():
     return r'''
-import json, os, re, socket
+import json, os, re, socket, stat, struct, subprocess, sys, time
+try:
+    from urllib.request import Request, urlopen
+except ImportError:
+    from urllib2 import Request, urlopen
 
-MARK_START = "''' + PLUGIN_MARK_START + r'''"
-MARK_END = "''' + PLUGIN_MARK_END + r'''"
+MS = "''' + PLUGIN_MARK_START + r'''"
+ME = "''' + PLUGIN_MARK_END + r'''"
+CLOUD_TIMEOUT = 1.5
 
-def safe(fn, default=None):
+def rd(p):
     try:
-        return fn()
-    except Exception:
-        return default
-
-def read_text(path):
-    try:
-        with open(path, 'r', errors='ignore') as fh:
-            return fh.read()
+        with open(p, 'r', errors='ignore') as f:
+            return f.read()
     except Exception:
         return ''
 
-def file_exists(path):
+def ex(p):
     try:
-        return os.path.exists(path)
+        return os.path.exists(p)
     except Exception:
         return False
 
-def read_lines(path):
-    text = read_text(path)
-    return text.splitlines() if text else []
+def hit(d, k, text, weight=15):
+    e = d.setdefault(k, {'detected': False, 'confidence': 0, 'indicators': []})
+    if text and text not in e['indicators']:
+        e['indicators'].append(text)
+        e['detected'] = True
+        e['confidence'] = min(100, e['confidence'] + weight)
 
-def add_indicator(bucket, text):
-    if text and text not in bucket:
-        bucket.append(text)
+def cloud_probe(url, hdr=None):
+    try:
+        req = Request(url, headers=hdr or {})
+        r = urlopen(req, timeout=CLOUD_TIMEOUT)
+        return r.read(512).decode('utf-8', 'ignore')[:256]
+    except Exception:
+        return ''
 
-def detect():
+def readlink(p):
+    try:
+        return os.readlink(p)
+    except Exception:
+        return ''
+
+def ns_ids():
+    out = {}
+    try:
+        st = os.stat('/proc/self/ns/pid')
+        out['pid'] = st.st_ino
+        st = os.stat('/proc/self/ns/mnt')
+        out['mnt'] = st.st_ino
+        st = os.stat('/proc/self/ns/net')
+        out['net'] = st.st_ino
+        st = os.stat('/proc/self/ns/uts')
+        out['uts'] = st.st_ino
+        st = os.stat('/proc/1/ns/pid')
+        out['pid_host'] = st.st_ino
+    except Exception:
+        pass
+    return out
+
+def sock_access(path):
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(0.5)
+        s.connect(path)
+        s.close()
+        return True
+    except Exception:
+        return False
+
+def main():
+    det = {}
     indicators = []
-    sockets = []
     artifacts = []
-    detections = {}
-
-    cgroup_text = read_text('/proc/1/cgroup') + '\n' + read_text('/proc/self/cgroup')
-    mountinfo = read_text('/proc/self/mountinfo')
-    version_text = read_text('/proc/version').lower()
-    cpuinfo = read_text('/proc/cpuinfo').lower()
+    sockets = []
     env = dict(os.environ)
-
-    def set_det(name, detected, confidence='low', extra=None):
-        entry = detections.setdefault(name, {'detected': False, 'confidence': 'none', 'indicators': []})
-        if detected:
-            entry['detected'] = True
-            order = {'none': 0, 'low': 1, 'medium': 2, 'high': 3}
-            if order.get(confidence, 0) > order.get(entry['confidence'], 0):
-                entry['confidence'] = confidence
-        if extra:
-            for item in extra:
-                if item not in entry['indicators']:
-                    entry['indicators'].append(item)
+    cgroup = rd('/proc/1/cgroup') + rd('/proc/self/cgroup')
+    mountinfo = rd('/proc/self/mountinfo')
+    cpuinfo = rd('/proc/cpuinfo').lower()
+    modules = rd('/proc/modules').lower()
+    version = rd('/proc/version').lower()
+    status = rd('/proc/self/status')
+    cmdline = rd('/proc/cmdline')
+    cloud_meta = {}
 
     # Docker
-    docker_hits = []
-    if file_exists('/.dockerenv'):
-        docker_hits.append('/.dockerenv present')
-        artifacts.append('/.dockerenv')
-    if 'docker' in cgroup_text.lower():
-        docker_hits.append('docker in cgroup')
+    if ex('/.dockerenv'):
+        hit(det, 'docker', '/.dockerenv present', 25); artifacts.append('/.dockerenv')
+    if 'docker' in cgroup.lower():
+        hit(det, 'docker', 'docker hierarchy in cgroup', 20)
     if env.get('container') == 'docker':
-        docker_hits.append('container=docker env')
-    for sock in ('/var/run/docker.sock', '/run/docker.sock'):
-        if file_exists(sock):
-            docker_hits.append(sock)
-            sockets.append(sock)
-    set_det('docker', bool(docker_hits), 'high' if file_exists('/.dockerenv') else 'medium', docker_hits)
+        hit(det, 'docker', 'container=docker env', 15)
+    for s in ('/var/run/docker.sock', '/run/docker.sock'):
+        if ex(s):
+            hit(det, 'docker', s + ' present', 15); sockets.append(s)
+            if sock_access(s):
+                hit(det, 'docker', s + ' accessible (host bridge risk)', 25)
 
     # Podman
-    podman_hits = []
-    if file_exists('/run/.containerenv'):
-        podman_hits.append('/run/.containerenv present')
-        artifacts.append('/run/.containerenv')
-    if env.get('container') == 'podman':
-        podman_hits.append('container=podman env')
-    if 'podman' in cgroup_text.lower():
-        podman_hits.append('podman in cgroup')
-    for sock in ('/run/podman/podman.sock', '/var/run/podman/podman.sock'):
-        if file_exists(sock):
-            podman_hits.append(sock)
-            sockets.append(sock)
-    set_det('podman', bool(podman_hits), 'high' if file_exists('/run/.containerenv') else 'medium', podman_hits)
+    if ex('/run/.containerenv'):
+        hit(det, 'podman', '/run/.containerenv present', 25); artifacts.append('/run/.containerenv')
+    if 'podman' in cgroup.lower() or env.get('container') == 'podman':
+        hit(det, 'podman', 'podman container markers', 20)
+    for s in ('/run/podman/podman.sock', '/var/run/podman/podman.sock'):
+        if ex(s):
+            hit(det, 'podman', s, 15); sockets.append(s)
+
+    # containerd / CRI-O
+    for s in ('/run/containerd/containerd.sock', '/var/run/containerd/containerd.sock'):
+        if ex(s):
+            hit(det, 'containerd', s, 20); sockets.append(s)
+    if 'containerd' in cgroup.lower() or 'cri-containerd' in cgroup.lower():
+        hit(det, 'containerd', 'containerd in cgroup', 20)
+    for s in ('/var/run/crio/crio.sock', '/run/crio/crio.sock'):
+        if ex(s):
+            hit(det, 'crio', s, 20); sockets.append(s)
+    if 'crio' in cgroup.lower():
+        hit(det, 'crio', 'CRI-O in cgroup', 20)
 
     # Kubernetes
-    k8s_hits = []
     if env.get('KUBERNETES_SERVICE_HOST'):
-        k8s_hits.append('KUBERNETES_SERVICE_HOST=' + env.get('KUBERNETES_SERVICE_HOST', ''))
-    if file_exists('/var/run/secrets/kubernetes.io/serviceaccount/token'):
-        k8s_hits.append('service account token present')
+        hit(det, 'kubernetes', 'KUBERNETES_SERVICE_HOST=' + env['KUBERNETES_SERVICE_HOST'], 25)
+    if ex('/var/run/secrets/kubernetes.io/serviceaccount/token'):
+        hit(det, 'kubernetes', 'K8s service account token', 25)
         artifacts.append('/var/run/secrets/kubernetes.io/serviceaccount/token')
-    if 'kubepods' in cgroup_text.lower() or 'kube' in cgroup_text.lower():
-        k8s_hits.append('kube in cgroup')
-    if file_exists('/etc/kubernetes/kubelet.conf'):
-        k8s_hits.append('/etc/kubernetes/kubelet.conf')
-        artifacts.append('/etc/kubernetes/kubelet.conf')
-    set_det('kubernetes', bool(k8s_hits), 'high' if env.get('KUBERNETES_SERVICE_HOST') else 'medium', k8s_hits)
+    if 'kubepods' in cgroup.lower():
+        hit(det, 'kubernetes', 'kubepods cgroup hierarchy', 20)
+    sa_ns = rd('/var/run/secrets/kubernetes.io/serviceaccount/namespace').strip()
+    pod = env.get('HOSTNAME', '')
 
-    # LXC / LXD
-    lxc_hits = []
-    if 'lxc' in cgroup_text.lower():
-        lxc_hits.append('lxc in cgroup')
-    if env.get('container') in ('lxc', 'lxd'):
-        lxc_hits.append('container=' + env.get('container'))
-    for path in ('/proc/1/environ',):
-        txt = read_text(path)
-        if 'lxc' in txt.lower():
-            lxc_hits.append('lxc in /proc/1/environ')
-    if file_exists('/dev/lxd/sock'):
-        lxc_hits.append('/dev/lxd/sock')
-        sockets.append('/dev/lxd/sock')
-    set_det('lxc_lxd', bool(lxc_hits), 'medium', lxc_hits)
+    # LXC/LXD
+    if 'lxc' in cgroup.lower() or env.get('container') in ('lxc', 'lxd'):
+        hit(det, 'lxc_lxd', 'LXC/LXD markers', 20)
+    if ex('/dev/lxd/sock'):
+        hit(det, 'lxc_lxd', '/dev/lxd/sock', 15); sockets.append('/dev/lxd/sock')
 
     # systemd-nspawn
-    nspawn_hits = []
-    if env.get('container') == 'systemd-nspawn':
-        nspawn_hits.append('container=systemd-nspawn env')
-    if file_exists('/run/systemd/container'):
-        nspawn_hits.append('/run/systemd/container')
-        artifacts.append('/run/systemd/container')
-        nspawn_hits.append(read_text('/run/systemd/container').strip())
-    set_det('systemd_nspawn', bool(nspawn_hits), 'high' if nspawn_hits else 'none', nspawn_hits)
+    if env.get('container') == 'systemd-nspawn' or ex('/run/systemd/container'):
+        hit(det, 'systemd_nspawn', 'systemd-nspawn container', 20)
+
+    # OpenVZ/Virtuozzo
+    if ex('/proc/vz') or 'openvz' in cgroup.lower() or 'veid' in env:
+        hit(det, 'openvz', 'OpenVZ/Virtuozzo markers', 20)
 
     # WSL
-    wsl_hits = []
-    if 'microsoft' in version_text or 'wsl' in version_text:
-        wsl_hits.append('/proc/version indicates WSL')
-    if env.get('WSL_DISTRO_NAME'):
-        wsl_hits.append('WSL_DISTRO_NAME=' + env['WSL_DISTRO_NAME'])
-    if file_exists('/proc/sys/fs/binfmt_misc/WSLInterop'):
-        wsl_hits.append('WSLInterop binfmt')
-    set_det('wsl', bool(wsl_hits), 'high' if env.get('WSL_DISTRO_NAME') else 'medium', wsl_hits)
+    if env.get('WSL_DISTRO_NAME') or 'microsoft' in version or ex('/proc/sys/fs/binfmt_misc/WSLInterop'):
+        hit(det, 'wsl', 'WSL environment detected', 25)
 
-    # DMI / SMBIOS
-    dmi_dir = '/sys/class/dmi/id'
+    # DMI
     dmi = {}
+    dmi_dir = '/sys/class/dmi/id'
     if os.path.isdir(dmi_dir):
-        for key in ('product_name', 'sys_vendor', 'board_vendor', 'bios_vendor', 'chassis_vendor'):
-            val = read_text(os.path.join(dmi_dir, key)).strip()
-            if val and val not in ('None', 'To Be Filled By O.E.M.'):
-                dmi[key] = val
+        for k in ('product_name', 'sys_vendor', 'board_vendor', 'bios_vendor', 'chassis_vendor', 'product_serial'):
+            v = rd(os.path.join(dmi_dir, k)).strip()
+            if v and 'o.e.m' not in v.lower():
+                dmi[k] = v
+    blob = ' '.join(dmi.values()).lower()
 
-    vendor_blob = ' '.join(dmi.values()).lower()
-
-    # Hypervisors
-    hv_map = {
-        'vmware': (['vmware'], ['vmware'], ['vmw_']),
+    hv_rules = {
+        'vmware': (['vmware'], ['vmw', 'vmxnet'], []),
         'virtualbox': (['virtualbox', 'innotek', 'vbox'], ['vboxguest', 'vboxsf'], []),
-        'hyperv': (['microsoft', 'hyper-v'], ['hv_', 'hyperv'], []),
-        'kvm': (['kvm', 'qemu'], ['kvm'], ['hypervisor']),
-        'qemu': (['qemu', 'bochs'], [], []),
+        'hyperv': (['microsoft', 'hyper-v'], ['hv_', 'hyperv', 'vmbus'], []),
+        'kvm': (['kvm', 'qemu'], ['kvm', 'virtio'], ['hypervisor']),
+        'qemu': (['qemu', 'bochs'], ['virtio'], []),
         'xen': (['xen'], ['xen'], []),
     }
+    if ex('/proc/xen'):
+        hit(det, 'xen', '/proc/xen present', 25)
+    if ex('/sys/hypervisor/type'):
+        hvtype = rd('/sys/hypervisor/type').strip()
+        hit(det, 'hypervisor', '/sys/hypervisor/type=' + hvtype, 20)
 
-    modules_text = read_text('/proc/modules').lower()
-    for hv, (dmi_keys, mod_keys, cpu_keys) in hv_map.items():
-        hits = []
-        for token in dmi_keys:
-            if token in vendor_blob:
-                hits.append('DMI vendor/product: ' + token)
-        for token in mod_keys:
-            if token in modules_text:
-                hits.append('kernel module: ' + token)
-        for token in cpu_keys:
-            if token in cpuinfo:
-                hits.append('cpuinfo: ' + token)
-        if hv == 'kvm' and 'hypervisor' in cpuinfo:
-            hits.append('CPU hypervisor flag set')
-        conf = 'high' if len(hits) >= 2 else ('medium' if hits else 'none')
-        set_det(hv, bool(hits), conf, hits)
+    for hv, (dmi_t, mod_t, cpu_t) in hv_rules.items():
+        for t in dmi_t:
+            if t in blob:
+                hit(det, hv, 'DMI match: ' + t, 20)
+        for t in mod_t:
+            if t in modules:
+                hit(det, hv, 'kernel module: ' + t, 15)
+        for t in cpu_t:
+            if t in cpuinfo:
+                hit(det, hv, 'cpuinfo: ' + t, 15)
 
-    # Generic container signals
-    in_container = bool(
-        file_exists('/.dockerenv') or file_exists('/run/.containerenv')
-        or env.get('container') or 'docker' in cgroup_text.lower()
-        or 'kubepods' in cgroup_text.lower() or 'lxc' in cgroup_text.lower()
-    )
+    # Cloud VMs
+    cloud_ep = [
+        ('aws', 'http://169.254.169.254/latest/meta-data/instance-id', {'Metadata': 'true'}),
+        ('azure', 'http://169.254.169.254/metadata/instance?api-version=2021-02-01', {'Metadata': 'true'}),
+        ('gcp', 'http://metadata.google.internal/computeMetadata/v1/instance/id', {'Metadata-Flavor': 'Google'}),
+        ('oci', 'http://169.254.169.254/opc/v1/instance/', {}),
+        ('digitalocean', 'http://169.254.169.254/metadata/v1/id', {}),
+    ]
+    cloud_provider = ''
+    for name, url, hdr in cloud_ep:
+        resp = cloud_probe(url, hdr)
+        if resp:
+            hit(det, 'cloud_' + name, name.upper() + ' metadata endpoint responded', 25)
+            cloud_meta[name] = resp[:120]
+            cloud_provider = cloud_provider or name.upper()
 
-    # Derive summary
-    runtime = None
-    orchestrator = None
-    environment_type = 'Physical Host'
-    virtualization_type = None
-    confidence = 'low'
-    container_id = env.get('HOSTNAME', '')
-    namespace = env.get('KUBERNETES_NAMESPACE') or env.get('POD_NAMESPACE')
-    node = env.get('KUBERNETES_NODE_NAME') or env.get('NODE_NAME')
+    # cgroup v2
+    cg2 = ' cgroup2 ' in (' ' + mountinfo + ' ') or ex('/sys/fs/cgroup/cgroup.controllers')
+    if cg2:
+        hit(det, 'cgroup', 'cgroup v2 detected', 10)
+    if '0::/' in cgroup or '0::/init.scope' in cgroup:
+        hit(det, 'cgroup', 'cgroup v2 unified hierarchy', 10)
 
-    if detections.get('docker', {}).get('detected'):
-        runtime = 'docker'
-    elif detections.get('podman', {}).get('detected'):
-        runtime = 'podman'
-    elif detections.get('lxc_lxd', {}).get('detected'):
-        runtime = 'lxc/lxd'
-    elif detections.get('systemd_nspawn', {}).get('detected'):
-        runtime = 'systemd-nspawn'
+    # Capabilities / privileged container hints
+    caps = ''
+    for line in status.splitlines():
+        if line.startswith('CapEff:'):
+            caps = line.split(':', 1)[1].strip()
+    privileged = caps.endswith('ffffffff') or caps.endswith('ffffffffffffffff')
+    if privileged:
+        hit(det, 'privileges', 'effective capabilities appear fully privileged', 20)
 
-    if detections.get('kubernetes', {}).get('detected'):
-        orchestrator = 'Kubernetes'
-    if detections.get('wsl', {}).get('detected'):
-        environment_type = 'WSL Environment'
-        virtualization_type = 'WSL'
-        confidence = detections['wsl']['confidence']
+    # Nested virt
+    nested = 'nested' in cmdline.lower() or 'kvm_intel' in modules and 'nested' in rd('/sys/module/kvm_intel/parameters/nested').lower()
+    nested_txt = 'Detected' if nested else 'Not detected'
+
+    # Hardware virt in guest
+    hw_virt = 'vmx' in cpuinfo or 'svm' in cpuinfo
+
+    # Sandbox heuristics
+    sandbox = []
+    if dmi.get('product_name', '').lower() in ('virtualbox', 'vmware virtual platform', 'kvm'):
+        sandbox.append('generic analysis VM product name')
+    if dmi.get('sys_vendor', '').lower() in ('qemu', 'innotek', 'xen'):
+        sandbox.append('common VM vendor string')
+    try:
+        if os.path.isdir('/home') and len(os.listdir('/home')) <= 1 and ex('/.dockerenv'):
+            sandbox.append('minimal home + container (possible sandbox)')
+    except Exception:
+        pass
+
+    namespaces = ns_ids()
+    in_container = any(det.get(k, {}).get('detected') for k in (
+        'docker', 'podman', 'containerd', 'crio', 'kubernetes', 'lxc_lxd', 'systemd_nspawn', 'openvz'
+    )) or ex('/.dockerenv') or ex('/run/.containerenv')
+
+    runtime = ''
+    if det.get('docker', {}).get('detected'): runtime = 'Docker'
+    elif det.get('podman', {}).get('detected'): runtime = 'Podman'
+    elif det.get('containerd', {}).get('detected'): runtime = 'containerd'
+    elif det.get('crio', {}).get('detected'): runtime = 'CRI-O'
+    elif det.get('lxc_lxd', {}).get('detected'): runtime = 'LXC/LXD'
+    elif det.get('systemd_nspawn', {}).get('detected'): runtime = 'systemd-nspawn'
+
+    orchestrator = 'Kubernetes' if det.get('kubernetes', {}).get('detected') else ''
+    virt_type = ''
+    for hv in ('vmware', 'virtualbox', 'hyperv', 'kvm', 'qemu', 'xen'):
+        if det.get(hv, {}).get('detected'):
+            virt_type = hv.upper() if hv != 'hyperv' else 'Hyper-V'
+            break
+
+    if det.get('wsl', {}).get('detected'):
+        env_type = 'WSL Environment'
     elif in_container:
-        if orchestrator:
-            environment_type = orchestrator + ' Pod/Container'
-        else:
-            environment_type = (runtime or 'container').title() + ' Container'
-        confidence = 'high' if runtime else 'medium'
+        env_type = (orchestrator + ' Container') if orchestrator else ((runtime or 'Container') + ' Container')
+    elif virt_type or cloud_provider:
+        env_type = 'Virtual Machine'
     else:
-        for hv in ('vmware', 'virtualbox', 'hyperv', 'kvm', 'qemu', 'xen'):
-            if detections.get(hv, {}).get('detected'):
-                virtualization_type = hv.upper() if hv != 'hyperv' else 'Hyper-V'
-                environment_type = 'Virtual Machine'
-                confidence = detections[hv]['confidence']
-                break
+        env_type = 'Physical Host'
 
-    host_relationship = 'bare metal'
-    if in_container and virtualization_type:
-        host_relationship = 'container on virtual machine'
+    host_rel = 'bare metal'
+    if in_container and (virt_type or cloud_provider):
+        host_rel = 'container on virtual machine'
     elif in_container:
-        host_relationship = 'container on host'
-    elif virtualization_type:
-        host_relationship = 'guest virtual machine'
+        host_rel = 'container on host'
+    elif virt_type or cloud_provider:
+        host_rel = 'guest virtual machine'
 
-    for det in detections.values():
-        for ind in det.get('indicators') or []:
-            add_indicator(indicators, ind)
+    host_access = []
+    for s in ('/var/run/docker.sock', '/run/docker.sock'):
+        if s in sockets and sock_access(s):
+            host_access.append('Docker socket exposed and accessible')
 
-    return {
-        'environment_type': environment_type,
-        'container_id': container_id[:64] if in_container else '',
-        'runtime': runtime or '',
-        'orchestrator': orchestrator or '',
-        'namespace': namespace or '',
-        'node': node or '',
-        'virtualization_type': virtualization_type or '',
-        'host_relationship': host_relationship,
+    # Aggregate confidence
+    scores = [v.get('confidence', 0) for v in det.values() if v.get('detected')]
+    confidence = min(100, max(scores) if scores else (30 if env_type != 'Physical Host' else 5))
+    if len(scores) >= 3:
+        confidence = min(100, confidence + 15)
+    if host_access:
+        confidence = min(100, confidence + 10)
+
+    for v in det.values():
+        for i in v.get('indicators') or []:
+            if i not in indicators:
+                indicators.append(i)
+
+    result = {
+        'environment_type': env_type,
+        'runtime': runtime,
+        'orchestrator': orchestrator,
+        'namespace': sa_ns or env.get('KUBERNETES_NAMESPACE', ''),
+        'node': env.get('KUBERNETES_NODE_NAME', env.get('NODE_NAME', '')),
+        'container_id': pod if in_container else '',
+        'host_relationship': host_rel,
+        'virtualization_type': virt_type,
+        'cloud_provider': cloud_provider,
+        'host_access': '; '.join(host_access) if host_access else 'None detected',
+        'container_privileges': 'Likely privileged/full caps' if privileged else 'Standard/non-privileged',
+        'nested_virtualization': nested_txt,
+        'hardware_virtualization': 'Available in guest CPU' if hw_virt else 'Not detected in guest',
+        'sandbox_indicators': '; '.join(sandbox) if sandbox else 'None',
         'confidence': confidence,
-        'indicators': indicators[:40],
+        'indicators': indicators[:60],
+        'namespaces': namespaces,
         'sockets': sockets,
         'artifacts': artifacts,
-        'detections': detections,
+        'cloud_metadata': cloud_meta,
+        'detections': det,
         'dmi': dmi,
     }
+    print(MS + json.dumps(result, separators=(',', ':')) + ME)
 
-result = detect()
-print(MARK_START + json.dumps(result, separators=(',', ':')) + MARK_END)
+main()
 '''
 
 
-def build_linux_detection_command():
-    source = _linux_collector_source()
-    interpreters = [
-        ('python3', 'python'),
-        ('python', 'python'),
-        ('python2', 'python'),
-    ]
-    body = _b64_exec_cmd(source, interpreters)
-    return f"({body}) 2>/dev/null; true"
+def build_command():
+    return build_linux_collector_command(_collector_source())

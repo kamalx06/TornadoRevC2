@@ -1,168 +1,116 @@
-"""Windows virtualization and container detection collector."""
+"""Aggressive Windows virtualization and container detection collector."""
 
 from ...constants import PLUGIN_MARK_END, PLUGIN_MARK_START
 
 
-def build_windows_detection_script():
+def build_command():
     return rf"""
 $ErrorActionPreference='SilentlyContinue'
 $start='{PLUGIN_MARK_START}'
 $end='{PLUGIN_MARK_END}'
-function Add-Det($map,$name,$detected,$conf,$items){{
-  if(-not $map.ContainsKey($name)){{$map[$name]=@{{detected=$false;confidence='none';indicators=@()}}}}
-  $e=$map[$name]
-  if($detected){{$e.detected=$true
-    $order=@{{none=0;low=1;medium=2;high=3}}
-    if($order[$conf] -gt $order[$e.confidence]){{$e.confidence=$conf}}
-  }}
-  foreach($i in $items){{if($i -and ($e.indicators -notcontains $i)){{$e.indicators+=$i}}}}
+function Hit($det,$name,$text,$w=15){{
+  if(-not $det.ContainsKey($name)){{$det[$name]=@{{detected=$false;confidence=0;indicators=@()}}}}
+  $e=$det[$name]
+  if($text -and ($e.indicators -notcontains $text)){{$e.indicators+=$text;$e.detected=$true;$e.confidence=[Math]::Min(100,$e.confidence+$w)}}
 }}
-$det=@{{}}
-$indicators=@()
-$sockets=@()
-$artifacts=@()
+function CloudProbe($url,$hdr){{
+  try{{$r=Invoke-WebRequest -Uri $url -Headers $hdr -TimeoutSec 2 -UseBasicParsing; return $r.Content.Substring(0,[Math]::Min(200,$r.Content.Length))}}catch{{return ''}}
+}}
+$det=@{{}}; $indicators=@(); $sockets=@(); $artifacts=@(); $cloud=@{{}}
 
-# Docker Desktop / containers
-$dockerHits=@()
-if(Test-Path 'HKLM:\\SOFTWARE\\Docker Inc.\\Docker'){{$dockerHits+='Docker Desktop registry key'}}
-foreach($svc in Get-Service -Name 'com.docker.service','docker' -ErrorAction SilentlyContinue){{
-  if($svc){{$dockerHits+=('service: '+$svc.Name)}}
-}}
-if($env:DOCKER_HOST){{$dockerHits+=('DOCKER_HOST='+$env:DOCKER_HOST)}}
-if(Test-Path '\\\\.\\pipe\\docker_engine'){{$dockerHits+='docker_engine named pipe';$sockets+='\\\\.\\pipe\\docker_engine'}}
-if(Test-Path 'C:\\ProgramData\\Docker'){{$dockerHits+='C:\\ProgramData\\Docker';$artifacts+='C:\\ProgramData\\Docker'}}
-Add-Det $det 'docker' ($dockerHits.Count -gt 0) $(if($dockerHits.Count -ge 2){{'high'}}else{{'medium'}}) $dockerHits
+# Docker / containerd / K8s
+Hit $det 'docker' (Test-Path 'HKLM:\\SOFTWARE\\Docker Inc.\\Docker') 'Docker Desktop registry' 20
+if(Test-Path '\\\\.\\pipe\\docker_engine'){{Hit $det 'docker' 'docker_engine pipe present' 20;$sockets+='\\\\.\\pipe\\docker_engine'}}
+if($env:DOCKER_HOST){{Hit $det 'docker' ('DOCKER_HOST='+$env:DOCKER_HOST) 15}}
+Get-Service -Name 'com.docker.service','docker','containerd' -EA 0|ForEach-Object{{Hit $det 'docker' ('service: '+$_.Name) 15}}
+if($env:KUBERNETES_SERVICE_HOST){{Hit $det 'kubernetes' ('K8S service host='+$env:KUBERNETES_SERVICE_HOST) 25}}
+Get-Service -Name 'kubelet','kube-proxy' -EA 0|ForEach-Object{{Hit $det 'kubernetes' ('service: '+$_.Name) 15}}
+if(Test-Path 'C:\\ProgramData\\Docker'){{Hit $det 'docker' 'C:\\ProgramData\\Docker' 10;$artifacts+='C:\\ProgramData\\Docker'}}
 
 # WSL
-$wslHits=@()
-if($env:WSL_DISTRO_NAME){{$wslHits+=('WSL_DISTRO_NAME='+$env:WSL_DISTRO_NAME)}}
-if($env:WSL_INTEROP){{$wslHits+=('WSL_INTEROP present')}}
-if(Get-Command wsl.exe -ErrorAction SilentlyContinue){{$wslHits+='wsl.exe available'}}
-try{{
-  $lxss=Get-ChildItem 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss' -ErrorAction SilentlyContinue
-  if($lxss){{$wslHits+='WSL distributions registry'}}
-}}catch{{}}
-Add-Det $det 'wsl' ($wslHits.Count -gt 0) $(if($env:WSL_DISTRO_NAME){{'high'}}else{{'medium'}}) $wslHits
+if($env:WSL_DISTRO_NAME){{Hit $det 'wsl' ('WSL_DISTRO_NAME='+$env:WSL_DISTRO_NAME) 25}}
+if(Get-Command wsl.exe -EA 0){{Hit $det 'wsl' 'wsl.exe present' 10}}
 
-# Kubernetes
-$k8sHits=@()
-if($env:KUBERNETES_SERVICE_HOST){{$k8sHits+=('KUBERNETES_SERVICE_HOST='+$env:KUBERNETES_SERVICE_HOST)}}
-foreach($svc in Get-Service -Name 'kubelet','kube-proxy' -ErrorAction SilentlyContinue){{
-  if($svc){{$k8sHits+=('service: '+$svc.Name)}}
-}}
-if(Test-Path 'C:\\etc\\kubernetes'){{$k8sHits+='C:\\etc\\kubernetes';$artifacts+='C:\\etc\\kubernetes'}}
-if(Test-Path 'C:\\ProgramData\\kubernetes'){{$k8sHits+='C:\\ProgramData\\kubernetes';$artifacts+='C:\\ProgramData\\kubernetes'}}
-Add-Det $det 'kubernetes' ($k8sHits.Count -gt 0) $(if($env:KUBERNETES_SERVICE_HOST){{'high'}}else{{'medium'}}) $k8sHits
+# Hyper-V / VM detection via CIM
+$cs=Get-CimInstance Win32_ComputerSystem -EA 0
+$bios=Get-CimInstance Win32_BIOS -EA 0
+if($cs.Manufacturer -match 'Microsoft' -and $cs.Model -match 'Virtual'){{Hit $det 'hyperv' ('Manufacturer/Model: '+$cs.Manufacturer+' / '+$cs.Model) 25}}
+if($cs.Manufacturer -match 'VMware'){{Hit $det 'vmware' ('Manufacturer: '+$cs.Manufacturer) 20}}
+if($cs.Manufacturer -match 'innotek|Oracle|VirtualBox'){{Hit $det 'virtualbox' ('Manufacturer: '+$cs.Manufacturer) 20}}
+if($cs.Manufacturer -match 'Xen'){{Hit $det 'xen' ('Manufacturer: '+$cs.Manufacturer) 20}}
+if($bios.SMBIOSBIOSVersion -match 'QEMU|Bochs|SeaBIOS'){{Hit $det 'qemu' ('BIOS: '+$bios.SMBIOSBIOSVersion) 20}}
+Get-CimInstance Win32_SystemDriver -EA 0|?{{$_.Name -match 'vmw|vmx|vbox|xen|virtio|qemu|hv_'}}|ForEach-Object{{$n=$_.Name;if($n -match 'vmw'){{Hit $det 'vmware' ('driver: '+$n) 15}}elseif($n -match 'vbox'){{Hit $det 'virtualbox' ('driver: '+$n) 15}}elseif($n -match 'hv_'){{Hit $det 'hyperv' ('driver: '+$n) 15}}else{{Hit $det 'qemu' ('driver: '+$n) 10}}}}
+try{{$hv=Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Virtual Machine\\Guest\\Parameters' -EA 0;if($hv){{Hit $det 'hyperv' 'Hyper-V guest parameters registry' 20}}}}catch{{}}
 
-# Hyper-V
-$hypervHits=@()
-try{{
-  $hv=Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
-  if($hv -and $hv.Model -match 'Virtual Machine'){{$hypervHits+=('Model: '+$hv.Model)}}
-  if($hv -and $hv.Manufacturer -match 'Microsoft'){{$hypervHits+=('Manufacturer: '+$hv.Manufacturer)}}
-}}catch{{}}
-foreach($svc in Get-Service -Name 'vmms','vmicheartbeat','vmickvpexchange' -ErrorAction SilentlyContinue){{
-  if($svc){{$hypervHits+=('service: '+$svc.Name)}}
-}}
-try{{
-  $key=Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Virtual Machine\\Guest\\Parameters' -ErrorAction SilentlyContinue
-  if($key){{$hypervHits+='Hyper-V guest parameters registry'}}
-}}catch{{}}
-Add-Det $det 'hyperv' ($hypervHits.Count -gt 0) $(if($hypervHits.Count -ge 2){{'high'}}else{{'medium'}}) $hypervHits
+# Windows containers
+Get-Service -Name 'hns','vmcompute','vmms' -EA 0|ForEach-Object{{Hit $det 'windows_containers' ('service: '+$_.Name) 15}}
+if(Test-Path 'C:\\ProgramData\\Docker\\windowsfilter'){{Hit $det 'windows_containers' 'windowsfilter directory' 15}}
 
-# VMware
-$vmwHits=@()
-try{{
-  $cs=Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
-  if($cs.Manufacturer -match 'VMware'){{$vmwHits+=('Manufacturer: '+$cs.Manufacturer)}}
-  if($cs.Model -match 'VMware'){{$vmwHits+=('Model: '+$cs.Model)}}
-}}catch{{}}
-Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue | Where-Object {{$_.Name -match 'VMware'}} | ForEach-Object {{$vmwHits+=('PnP: '+$_.Name)}}
-Get-CimInstance Win32_SystemDriver -ErrorAction SilentlyContinue | Where-Object {{$_.Name -match 'vmw|vmx'}} | ForEach-Object {{$vmwHits+=('driver: '+$_.Name)}}
-Add-Det $det 'vmware' ($vmwHits.Count -gt 0) $(if($vmwHits.Count -ge 2){{'high'}}else{{'medium'}}) $vmwHits
+# Cloud metadata
+$aws=CloudProbe 'http://169.254.169.254/latest/meta-data/instance-id' @{{Metadata='true'}}
+if($aws){{Hit $det 'cloud_aws' 'AWS metadata responded' 25;$cloud['aws']=$aws}}
+$az=CloudProbe 'http://169.254.169.254/metadata/instance?api-version=2021-02-01' @{{Metadata='true'}}
+if($az){{Hit $det 'cloud_azure' 'Azure metadata responded' 25;$cloud['azure']=$az}}
+$gcp=CloudProbe 'http://metadata.google.internal/computeMetadata/v1/instance/id' @{{'Metadata-Flavor'='Google'}}
+if($gcp){{Hit $det 'cloud_gcp' 'GCP metadata responded' 25;$cloud['gcp']=$gcp}}
 
-# VirtualBox
-$vboxHits=@()
-try{{
-  $cs=Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
-  if($cs.Manufacturer -match 'innotek|Oracle|VirtualBox'){{$vboxHits+=('Manufacturer: '+$cs.Manufacturer)}}
-}}catch{{}}
-Get-CimInstance Win32_SystemDriver -ErrorAction SilentlyContinue | Where-Object {{$_.Name -match 'VBox|vbox'}} | ForEach-Object {{$vboxHits+=('driver: '+$_.Name)}}
-Add-Det $det 'virtualbox' ($vboxHits.Count -gt 0) $(if($vboxHits.Count -ge 2){{'high'}}else{{'medium'}}) $vboxHits
+# CPUID hypervisor bit via WMI (best-effort)
+try{{$proc=Get-CimInstance Win32_Processor -EA 0|Select-Object -First 1;if($proc -and $proc.Name -match 'Virtual'){{Hit $det 'hypervisor' 'Processor name indicates virtualization' 15}}}}catch{{}}
 
-# KVM / QEMU (via guest drivers or firmware)
-$qemuHits=@()
-try{{
-  $bios=Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue
-  if($bios.SMBIOSBIOSVersion -match 'QEMU|Bochs|SeaBIOS'){{$qemuHits+=('BIOS: '+$bios.SMBIOSBIOSVersion)}}
-  if($bios.Manufacturer -match 'QEMU|Bochs'){{$qemuHits+=('BIOS vendor: '+$bios.Manufacturer)}}
-}}catch{{}}
-Get-CimInstance Win32_SystemDriver -ErrorAction SilentlyContinue | Where-Object {{$_.Name -match 'qemu|vios|virtio'}} | ForEach-Object {{$qemuHits+=('driver: '+$_.Name)}}
-Add-Det $det 'qemu' ($qemuHits.Count -gt 0) 'medium' $qemuHits
-Add-Det $det 'kvm' ($qemuHits.Count -gt 0) 'medium' $qemuHits
+$inContainer = ($det['docker'].detected -or $env:CONTAINER -or $env:KUBERNETES_SERVICE_HOST -or $det['windows_containers'].detected)
+$runtime=''; if($det['docker'].detected){{$runtime='Docker Desktop'}} elseif($det['windows_containers'].detected){{$runtime='Windows Containers'}}
+$orchestrator = $(if($det['kubernetes'].detected){{'Kubernetes'}}else{{''}})
+$virt=''; foreach($p in @(@('vmware','VMware'),@('virtualbox','VirtualBox'),@('hyperv','Hyper-V'),@('qemu','QEMU'),@('xen','Xen'))){{if($det[$p[0]].detected){{$virt=$p[1];break}}}}
+$cloudp=''; foreach($k in @('cloud_aws','cloud_azure','cloud_gcp')){{if($det[$k].detected){{$cloudp=$k.Replace('cloud_','').ToUpper();break}}}}
 
-# Xen
-$xenHits=@()
-Get-CimInstance Win32_SystemDriver -ErrorAction SilentlyContinue | Where-Object {{$_.Name -match 'xen'}} | ForEach-Object {{$xenHits+=('driver: '+$_.Name)}}
-try{{
-  $cs=Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
-  if($cs.Manufacturer -match 'Xen'){{$xenHits+=('Manufacturer: '+$cs.Manufacturer)}}
-}}catch{{}}
-Add-Det $det 'xen' ($xenHits.Count -gt 0) 'medium' $xenHits
+if($det['wsl'].detected){{$envType='WSL Environment'}}
+elseif($inContainer){{$envType=($(if($orchestrator){{$orchestrator+' Container'}}else{{$runtime+' Container'}}))}}
+elseif($virt -or $cloudp){{$envType='Virtual Machine'}}
+else{{$envType='Physical Host'}}
 
-# Summary
-$inContainer = ($det['docker'].detected -or $env:CONTAINER -or $env:KUBERNETES_SERVICE_HOST)
-$runtime=''
-$orchestrator=''
-$environmentType='Physical Host'
-$virtualizationType=''
-$confidence='low'
-$containerId=$env:COMPUTERNAME
-$namespace=$env:POD_NAMESPACE
-if(-not $namespace){{$namespace=$env:KUBERNETES_NAMESPACE}}
-$node=$env:NODE_NAME
-if(-not $node){{$node=$env:KUBERNETES_NODE_NAME}}
+$hostRel='bare metal'
+if($inContainer -and ($virt -or $cloudp)){{$hostRel='container on virtual machine'}}
+elseif($inContainer){{$hostRel='container on host'}}
+elseif($virt -or $cloudp){{$hostRel='guest virtual machine'}}
 
-if($det['docker'].detected){{$runtime='docker'}}
-if($det['kubernetes'].detected){{$orchestrator='Kubernetes'}}
-if($det['wsl'].detected){{
-  $environmentType='WSL Environment'
-  $virtualizationType='WSL'
-  $confidence=$det['wsl'].confidence
-}} elseif($inContainer){{
-  if($orchestrator){{$environmentType="$orchestrator Pod/Container"}}
-  elseif($runtime){{$environmentType=(Get-Culture).TextInfo.ToTitleCase($runtime)+' Container'}}
-  else {{$environmentType='Container'}}
-  if($runtime){{$confidence='high'}} else {{$confidence='medium'}}
-}} else {{
-  foreach($pair in @(@('vmware','VMware'),@('virtualbox','VirtualBox'),@('hyperv','Hyper-V'),@('kvm','KVM'),@('qemu','QEMU'),@('xen','Xen'))){{
-    $k=$pair[0];$label=$pair[1]
-    if($det[$k].detected){{$virtualizationType=$label;$environmentType='Virtual Machine';$confidence=$det[$k].confidence;break}}
-  }}
-}}
+$hostAccess='None detected'
+if(Test-Path '\\\\.\\pipe\\docker_engine'){{$hostAccess='Docker engine pipe present'}}
 
-$hostRelationship='bare metal'
-if($inContainer -and $virtualizationType){{$hostRelationship='container on virtual machine'}}
-elseif($inContainer){{$hostRelationship='container on host'}}
-elseif($virtualizationType){{$hostRelationship='guest virtual machine'}}
+$scores=@($det.Values|? detected|ForEach-Object confidence)
+$confidence=0; if($scores.Count){{$confidence=[Math]::Min(100,($scores|Measure-Object -Maximum).Maximum + $(if($scores.Count -ge 3){{15}}else{{0}}))}}
+
+$nested='Not detected'
+try{{$feat=Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -EA 0;if($feat -and $feat.State -eq 'Enabled' -and ($virt -or $cloudp)){{$nested='Hyper-V role enabled inside guest'}}}}catch{{}}
+
+$sandbox=@()
+if($cs -and $cs.Model -match 'Virtual Machine' -and $cs.Manufacturer -match 'Microsoft|VMware|innotek|QEMU'){{$sandbox+='common VM hardware profile'}}
+if($cs -and -not $cs.UserName){{$sandbox+='no interactive username context'}}
 
 foreach($e in $det.Values){{foreach($i in $e.indicators){{if($indicators -notcontains $i){{$indicators+=$i}}}}}}
 
 $result=[ordered]@{{
-  environment_type=$environmentType
-  container_id=$(if($inContainer){{$containerId}}else{{''}})
+  environment_type=$envType
   runtime=$runtime
   orchestrator=$orchestrator
-  namespace=$(if($namespace){{$namespace}}else{{''}})
-  node=$(if($node){{$node}}else{{''}})
-  virtualization_type=$virtualizationType
-  host_relationship=$hostRelationship
+  namespace=$env:POD_NAMESPACE
+  node=$env:NODE_NAME
+  container_id=$(if($inContainer){{$env:COMPUTERNAME}}else{{''}})
+  host_relationship=$hostRel
+  virtualization_type=$virt
+  cloud_provider=$cloudp
+  host_access=$hostAccess
+  container_privileges=$(if($inContainer){{'Container context'}}else{{'N/A'}})
+  nested_virtualization=$nested
+  hardware_virtualization=$(if($virt){{'Guest VM environment'}}else{{'Not detected'}})
+  sandbox_indicators=($(if($sandbox){{$sandbox -join '; '}}else{{'None'}}))
   confidence=$confidence
   indicators=$indicators
+  namespaces=@{{}}
   sockets=$sockets
   artifacts=$artifacts
+  cloud_metadata=$cloud
   detections=$det
 }}
-$json=($result | ConvertTo-Json -Depth 6 -Compress)
+$json=($result|ConvertTo-Json -Depth 8 -Compress)
 Write-Output ($start+$json+$end)
 """
