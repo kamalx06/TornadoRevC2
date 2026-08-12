@@ -145,6 +145,7 @@ def _render_transcript(entries):
 def _build_html(metadata, entries):
     generated = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     title = f"TornadoRevC2 Session #{metadata['session_id']} Transcript"
+
     rows = ''.join([
         _detail_row('Session ID', metadata.get('session_id')),
         _detail_row('Session Name', metadata.get('name')),
@@ -162,7 +163,10 @@ def _build_html(metadata, entries):
         _detail_row('Connect Count', metadata.get('connect_count')),
         _detail_row('Log Directory', metadata.get('log_dir')),
     ])
+
     transcript = _render_transcript(entries)
+    status = str(metadata.get('status', 'unknown')).lower()
+    status_class = 'active' if status == 'active' else 'inactive'
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -172,133 +176,359 @@ def _build_html(metadata, entries):
 <title>{html.escape(title)}</title>
 <style>
 :root {{
-  --bg: #0f1419;
-  --panel: #1a2332;
-  --panel-2: #111822;
-  --text: #e6edf3;
-  --muted: #9da7b3;
-  --accent: #3fb950;
-  --accent-2: #58a6ff;
-  --border: #30363d;
-  --cmd: #ffa657;
-  --event: #a371f7;
+    --bg: #0b1020;
+    --bg-2: #111827;
+    --panel: rgba(17,24,39,.82);
+    --panel-2: rgba(15,23,42,.88);
+    --text: #e5e7eb;
+    --muted: #94a3b8;
+    --border: rgba(148,163,184,.18);
+    --accent: #60a5fa;
+    --accent-2: #22c55e;
+    --cmd: #f59e0b;
+    --event: #a855f7;
+    --danger: #ef4444;
+    --shadow: 0 18px 40px rgba(0,0,0,.35);
 }}
+
 * {{ box-sizing: border-box; }}
-body {{
-  margin: 0;
-  font-family: "Segoe UI", Tahoma, sans-serif;
-  background: var(--bg);
-  color: var(--text);
-  line-height: 1.5;
+
+html, body {{
+margin: 0;
+padding: 0;
+background:
+radial-gradient(circle at top right, rgba(96,165,250,.12), transparent 35%),
+radial-gradient(circle at bottom left, rgba(34,197,94,.08), transparent 30%),
+var(--bg);
+color: var(--text);
+font-family: Inter, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+line-height: 1.55;
 }}
-.wrap {{ max-width: 1100px; margin: 0 auto; padding: 24px; }}
-header {{
-  background: linear-gradient(135deg, #1f2937, #111827);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 24px;
-  margin-bottom: 24px;
+
+.wrap {{
+max-width: 1180px;
+margin: 0 auto;
+padding: 36px 24px 56px;
 }}
-h1 {{ margin: 0 0 8px; font-size: 1.6rem; }}
-.subtitle {{ color: var(--muted); margin: 0; }}
+
+.hero {{
+position: relative;
+overflow: hidden;
+background: linear-gradient(135deg, rgba(30,41,59,.98), rgba(15,23,42,.98));
+border: 1px solid var(--border);
+border-radius: 22px;
+padding: 34px;
+margin-bottom: 26px;
+box-shadow: var(--shadow);
+}}
+
+.hero::after {{
+content: "";
+position: absolute;
+inset: 0;
+background:
+linear-gradient(120deg, transparent 0%, rgba(255,255,255,.05) 45%, transparent 70%);
+pointer-events: none;
+}}
+
+.brand {{
+display: flex;
+align-items: center;
+justify-content: space-between;
+gap: 18px;
+}}
+
+.brand h1 {{
+margin: 0 0 8px;
+font-size: 2rem;
+font-weight: 800;
+letter-spacing: -0.02em;
+}}
+
+.subtitle {{
+margin: 0;
+color: var(--muted);
+}}
+
+.status-pill {{
+display: inline-flex;
+align-items: center;
+gap: 8px;
+padding: 10px 16px;
+border-radius: 999px;
+border: 1px solid var(--border);
+background: rgba(255,255,255,.04);
+font-size: .85rem;
+font-weight: 700;
+text-transform: uppercase;
+letter-spacing: .08em;
+}}
+
+.status-pill.active {{ color: #4ade80; }}
+.status-pill.inactive {{ color: #f87171; }}
+
+.grid {{
+display: grid;
+grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+gap: 16px;
+margin-top: 24px;
+}}
+
+.card {{
+background: rgba(255,255,255,.04);
+border: 1px solid var(--border);
+border-radius: 18px;
+padding: 18px;
+}}
+
+.card .label {{
+color: var(--muted);
+font-size: .8rem;
+text-transform: uppercase;
+letter-spacing: .08em;
+}}
+
+.card .value {{
+margin-top: 8px;
+font-size: 1.15rem;
+font-weight: 700;
+}}
+
 section {{
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 20px;
-  margin-bottom: 24px;
+background: var(--panel);
+border: 1px solid var(--border);
+border-radius: 18px;
+padding: 22px;
+margin-bottom: 22px;
+box-shadow: var(--shadow);
 }}
-h2 {{
-  margin: 0 0 16px;
-  font-size: 1.1rem;
-  color: var(--accent-2);
+
+.section-head {{
+display: flex;
+align-items: center;
+justify-content: space-between;
+gap: 12px;
+margin-bottom: 18px;
 }}
-table {{
-  width: 100%;
-  border-collapse: collapse;
+
+.section-head h2 {{
+margin: 0;
+font-size: 1.15rem;
 }}
-th, td {{
-  text-align: left;
-  padding: 10px 12px;
-  border-bottom: 1px solid var(--border);
-  vertical-align: top;
-}}
-th {{
-  width: 180px;
-  color: var(--muted);
-  font-weight: 600;
-}}
-.entry {{
-  background: var(--panel-2);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 14px;
-  margin-bottom: 14px;
-}}
-.meta {{
-  display: flex;
-  gap: 10px;
-  align-items: center;
-  margin-bottom: 10px;
-  color: var(--muted);
-  font-size: 0.9rem;
-}}
+
 .badge {{
-  display: inline-block;
-  padding: 2px 8px;
-  border-radius: 999px;
-  font-size: 0.75rem;
-  font-weight: 700;
-  letter-spacing: 0.03em;
-  text-transform: uppercase;
+display: inline-flex;
+align-items: center;
+gap: 6px;
+padding: 6px 10px;
+border-radius: 999px;
+font-size: .72rem;
+font-weight: 700;
+letter-spacing: .06em;
+text-transform: uppercase;
 }}
-.cmd-badge {{ background: rgba(255,166,87,0.15); color: var(--cmd); }}
-.event-badge {{ background: rgba(163,113,247,0.15); color: var(--event); }}
+
+.badge.blue {{
+background: rgba(96,165,250,.14);
+color: #93c5fd;
+border: 1px solid rgba(96,165,250,.22);
+}}
+
+.badge.green {{
+background: rgba(34,197,94,.14);
+color: #86efac;
+border: 1px solid rgba(34,197,94,.22);
+}}
+
+table {{
+width: 100%;
+border-collapse: collapse;
+overflow: hidden;
+border-radius: 14px;
+}}
+
+th, td {{
+padding: 12px 14px;
+border-bottom: 1px solid rgba(148,163,184,.14);
+vertical-align: top;
+}}
+
+th {{
+width: 220px;
+color: var(--muted);
+font-weight: 600;
+}}
+
+tbody tr:nth-child(odd) {{
+background: rgba(255,255,255,.02);
+}}
+
+.entry {{
+background: var(--panel-2);
+border: 1px solid var(--border);
+border-radius: 16px;
+padding: 16px;
+margin-bottom: 16px;
+}}
+
+.meta {{
+display: flex;
+align-items: center;
+justify-content: space-between;
+gap: 12px;
+margin-bottom: 12px;
+color: var(--muted);
+font-size: .9rem;
+}}
+
+.meta .left {{
+display: flex;
+align-items: center;
+gap: 10px;
+}}
+
+.cmd-badge {{
+background: rgba(245,158,11,.14);
+color: var(--cmd);
+border: 1px solid rgba(245,158,11,.22);
+}}
+
+.event-badge {{
+background: rgba(168,85,247,.14);
+color: #d8b4fe;
+border: 1px solid rgba(168,85,247,.22);
+}}
+
 pre {{
-  margin: 0;
-  white-space: pre-wrap;
-  word-break: break-word;
-  font-family: Consolas, "Courier New", monospace;
-  font-size: 0.92rem;
+margin: 0;
+white-space: pre-wrap;
+word-break: break-word;
+font-family: "JetBrains Mono", Consolas, "SFMono-Regular", monospace;
+font-size: .92rem;
 }}
-.command-text {{ color: var(--cmd); margin-bottom: 10px; }}
+
+.command-text {{
+color: var(--cmd);
+background: rgba(245,158,11,.08);
+border: 1px solid rgba(245,158,11,.18);
+border-radius: 12px;
+padding: 12px;
+margin-bottom: 12px;
+}}
+
 .output {{
-  background: #0b1017;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 12px;
+background: #060b16;
+border: 1px solid rgba(148,163,184,.18);
+border-radius: 12px;
+padding: 14px;
+overflow-x: auto;
 }}
-.output.empty {{ color: var(--muted); font-style: italic; }}
-.event-text {{ color: #d2a8ff; }}
-.empty {{ color: var(--muted); }}
+
+.output.empty {{
+color: var(--muted);
+font-style: italic;
+}}
+
+.event-text {{
+color: #e9d5ff;
+background: rgba(168,85,247,.08);
+border: 1px solid rgba(168,85,247,.18);
+border-radius: 12px;
+padding: 12px;
+}}
+
+.empty {{
+color: var(--muted);
+}}
+
 footer {{
-  color: var(--muted);
-  font-size: 0.85rem;
-  text-align: center;
-  padding: 8px 0 24px;
+text-align: center;
+color: var(--muted);
+font-size: .85rem;
+padding-top: 8px;
 }}
-</style>
+
+@media (max-width: 720px) {{
+.brand {{
+flex-direction: column;
+align-items: flex-start;
+}}
+
+```
+.meta {{
+    flex-direction: column;
+    align-items: flex-start;
+}}
+
+th {{
+    width: 150px;
+}}
+```
+
+}} </style>
+
 </head>
 <body>
 <div class="wrap">
-  <header>
-    <h1>{html.escape(title)}</h1>
-    <p class="subtitle">Generated {html.escape(generated)} · TornadoRevC2 Session Transcript Export</p>
-  </header>
-  <section>
-    <h2>Session Details</h2>
-    <table>{rows}</table>
-  </section>
-  <section>
-    <h2>Command &amp; Output Transcript</h2>
+
+<header class="hero">
+    <div class="brand">
+        <div>
+            <h1>{html.escape(title)}</h1>
+            <p class="subtitle">Generated {html.escape(generated)} · TornadoRevC2 Session Transcript Export</p>
+        </div>
+        <div class="status-pill {status_class}">{html.escape(status.title())}</div>
+    </div>
+
+```
+<div class="grid">
+    <div class="card">
+        <div class="label">Target Host</div>
+        <div class="value">{html.escape(str(metadata.get('hostname') or '—'))}</div>
+    </div>
+    <div class="card">
+        <div class="label">User</div>
+        <div class="value">{html.escape(str(metadata.get('username') or '—'))}</div>
+    </div>
+    <div class="card">
+        <div class="label">Operating System</div>
+        <div class="value">{html.escape(str(metadata.get('os') or '—'))}</div>
+    </div>
+    <div class="card">
+        <div class="label">Protocol</div>
+        <div class="value">{html.escape(str(metadata.get('protocol') or '—'))}</div>
+    </div>
+</div>
+```
+
+</header>
+
+<section>
+    <div class="section-head">
+        <h2>Session Metadata</h2>
+        <span class="badge blue">Forensic Summary</span>
+    </div>
+    <table>
+        <tbody>{rows}</tbody>
+    </table>
+</section>
+
+<section>
+    <div class="section-head">
+        <h2>Command & Output Transcript</h2>
+        <span class="badge green">{len(entries)} entries</span>
+    </div>
     {transcript}
-  </section>
-  <footer>TornadoRevC2 — authorized use only</footer>
+</section>
+
+<footer>
+    <strong>TornadoRevC2</strong> · Session transcript report · Authorized use only
+</footer>
+
 </div>
 </body>
 </html>
 """
-
 
 class SessionExporter:
     """Build HTML transcript reports for active or archived sessions."""
