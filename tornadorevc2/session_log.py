@@ -99,6 +99,30 @@ class SessionLogger:
             if detail:
                 f.write(f"\n--- Raw Data ---\n{detail}\n")
         self.log_event(f"Plugin {plugin_name}: completed")
+        return path
+
+    def log_privesc_check(self, tool, duration_sec, success, output_path, exit_code=None, detail=''):
+        plugins_dir = getattr(self, 'plugins_dir', None) or os.path.join(self.session_dir, 'plugins')
+        os.makedirs(plugins_dir, exist_ok=True)
+        stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        meta_path = os.path.join(plugins_dir, f"privesccheck_{stamp}.json")
+        record = {
+            'timestamp': self._timestamp(),
+            'tool': tool,
+            'duration_sec': round(duration_sec, 2),
+            'success': success,
+            'exit_code': exit_code,
+            'output_path': output_path,
+            'detail': detail,
+        }
+        with open(meta_path, 'w', encoding='utf-8') as f:
+            json.dump(record, f, indent=2)
+            f.write('\n')
+        status = 'success' if success else 'failed'
+        self.log_event(
+            f"Privesc check {status}: {tool} ({duration_sec:.1f}s) -> {output_path or 'no output'}"
+        )
+        return meta_path
 
     def log_reconnect(self, detail):
         self.log_event(f"Session reconnected — {detail}")

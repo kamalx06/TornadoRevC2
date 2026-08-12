@@ -18,7 +18,13 @@ EXTERNAL_PLUGIN_DIR = os.environ.get(
 
 def _discover_builtin_plugin_modules() -> tuple:
     root = os.path.dirname(os.path.abspath(__file__))
-    modules = ['tornadorevc2.plugins.shared.virtualization']
+    skip_shared = {'common', 'runner', '__init__'}
+    modules = []
+    shared_dir = os.path.join(root, 'shared')
+    if os.path.isdir(shared_dir):
+        for fn in sorted(os.listdir(shared_dir)):
+            if fn.endswith('.py') and fn[:-3] not in skip_shared:
+                modules.append(f'tornadorevc2.plugins.shared.{fn[:-3]}')
     for sub in ('linux', 'windows'):
         subdir = os.path.join(root, sub)
         if not os.path.isdir(subdir):

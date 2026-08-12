@@ -55,6 +55,7 @@ tornadorevc2/
       common.py           # Formatting, confidence scoring, platform helpers
       runner.py           # Collector execution and JSON parsing
       virtualization.py   # Cross-platform virtualization plugin entry
+      privesccheck.py     # LinPEAS / WinPEAS privilege escalation enumeration
     linux/
       virtualization.py   # Aggressive Linux VM/container/cloud collector
       secrets.py          # Credential and config artifact search
@@ -73,6 +74,7 @@ tornadorevc2/
       defender.py         # Windows Defender and security products
       certificates.py     # Certificate store enumeration
 tornadorevc2.py           # Entry point
+tools/privesc/            # Operator-provided LinPEAS / WinPEAS scripts (not bundled)
 plugins/                  # Optional external plugin directory
 ```
 
@@ -102,7 +104,7 @@ def run(session: SessionContext, args):
 | Capability | Method / Property |
 |------------|-------------------|
 | Session metadata | `session_id`, `platform`, `sysinfo`, `identity`, `addr`, `tls` |
-| Shell execution | `run_shell()`, `run_marked()` |
+| Shell execution | `run_shell()`, `run_shell_streaming()`, `run_marked()` |
 | File transfer | `upload()`, `download()`, `verify_remote()` |
 | Logging | `log_event()`, `log_command()`, `log_plugin_result()` |
 | Host info | `collect_sysinfo()`, `get_cwd()` |
@@ -165,6 +167,36 @@ Results are displayed in the terminal and saved under `logs/<session>/plugins/` 
 | `eventlogs` | Security, System, Application, and PowerShell log summaries |
 | `defender` | Windows Defender status, exclusions, ASR rules, and installed security products |
 | `certificates` | Certificate stores, code-signing certs, and enterprise certificates |
+
+### Cross-Platform Plugins
+
+| Plugin | Description |
+|--------|-------------|
+| `virtualization` | Aggressive VM, container, orchestration, and cloud detection |
+| `privesccheck` | Automatic LinPEAS (Linux) or WinPEAS (Windows) privilege escalation enumeration |
+
+## Privilege Escalation Enumeration (`privesccheck`)
+
+The `privesccheck` plugin automatically selects the correct PEAS tool based on session platform — operators never choose between LinPEAS and WinPEAS manually.
+
+| Target | Tool | Local path (default) |
+|--------|------|----------------------|
+| Linux / Unix | LinPEAS | `tools/privesc/linpeas.sh` |
+| Windows | WinPEAS | `tools/privesc/winPEAS.bat` or `winPEASx64.exe` |
+
+Override paths with `TORNADOREVC2_LINPEAS`, `TORNADOREVC2_WINPEAS`, or `TORNADOREVC2_PRIVESC_DIR`.
+
+**In-memory execution:**
+
+- **Linux:** Pipes base64-decoded `linpeas.sh` directly into `bash` stdin — no script file on disk. Very large scripts fall back to `/dev/shm` staging with automatic removal after execution.
+- **Windows:** Decodes WinPEAS in PowerShell, runs via `cmd /c` or staged `.exe`, and deletes temporary artifacts immediately in a `finally` block.
+
+**Output:** Live streaming to the terminal, full output saved under `logs/<session>/plugins/`, plus JSON metadata (tool, duration, exit code, success/failure). Tool contents are never logged.
+
+```bash
+# Place LinPEAS / WinPEAS in tools/privesc/ first
+run privesccheck 1
+```
 
 ## Aggressive Virtualization & Container Detection
 
@@ -255,9 +287,31 @@ Multi-session management with thread-safe client handling, session persistence, 
 
 Route operator tools through a session to reach internal hosts (`socks <ID> <port>`).
 
-### File Transfer, Payload Execution, Clipboard, Export
+**Automatic cleanup:** When the last SOCKS proxy for a session is stopped (`socks stop <proxy_id>`), TornadoRevC2:
 
-Chunked upload/download with SHA256 verification and resume support. In-memory Python, PowerShell, PE, and ELF execution. Remote clipboard read. HTML session transcript export.
+- Terminates the remote tunnel agent process
+- Deletes the uploaded Python agent script
+- Removes port marker files and SOCKS-related temp artifacts
+- Verifies cleanup and logs the result to the session directory
+
+Session disconnect also triggers full remote cleanup.
+
+### In-Memory Payload Execution (`runexe` / `runpy` / `runps` / `runelf`)
+
+Chunked upload with SHA256 verification, then in-memory execution:
+
+- **`runpy` / `runps`:** Python and PowerShell scripts executed from memory
+- **`runexe`:** Windows PE loaded from memory into a ephemeral temp process with stdout/stderr capture, command-line argument support, and immediate temp file removal
+- **`runelf`:** Linux ELF via `memfd_create` with `/dev/shm` fallback
+
+```bash
+runexe 1 C:\tools\payload.exe -- --flag value
+runexe 1 beacon.exe --save-output C:\local\out.txt
+```
+
+### File Transfer, Clipboard, Export
+
+Chunked upload/download with SHA256 verification and resume support. Remote clipboard read. HTML session transcript export.
 
 ## Operator Commands
 
@@ -274,7 +328,9 @@ Chunked upload/download with SHA256 verification and resume support. In-memory P
 | `runpy/runps/runexe/runelf <ID> <local>` | In-memory payload execution |
 | `clipboard <ID>` | Read remote clipboard |
 | `upload/download/verify` | File transfer with integrity checks |
-| `socks <ID> <port>` | SOCKS5 internal pivoting |
+| `socks <ID> <port>` | Start SOCKS5 internal pivoting |
+| `socks stop <proxy_id>` | Stop SOCKS proxy and clean up remote artifacts |
+| `tunnels` | List active SOCKS proxies |
 | `export <ID>` | Export HTML session transcript |
 | `rename/rn <ID> <name>` | Rename a session |
 | `payloads` | Display payload list |
@@ -335,6 +391,9 @@ run virtualization 1
 run secrets 1
 run systemd 1
 
+# Privilege escalation (place PEAS scripts in tools/privesc/ first)
+run privesccheck 1
+
 # Windows target
 run adinfo 2
 run services 2
@@ -353,6 +412,9 @@ openssl req -x509 -newkey rsa:2048 -sha256 -nodes \
 
 ## Changelog
 
+- Privilege Escalation Plugin (`privesccheck` — LinPEAS / WinPEAS) (Added)
+- SOCKS Remote Artifact Cleanup on `socks stop` (Added)
+- `runexe` Reliability Fix — stdout/stderr capture, args, temp cleanup (Fixed)
 - Plugin Architecture with Linux and Windows Enumeration Suite (Added)
 - Aggressive Virtualization & Container Detection Plugin (Added)
 - Session Log and Export Control-Sequence Sanitization (Added)

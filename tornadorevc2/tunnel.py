@@ -426,6 +426,79 @@ class TunnelManager:
     def _agent_batch(self, client_sock, items, timeout=15.0):
         return self._agent_request(client_sock, {'op': 'batch', 'items': items}, timeout=timeout)
 
+    def _session_proxy_count(self, client_sock):
+        with self._lock:
+            return sum(
+                1 for p in self._proxies.values()
+                if p.get('client_sock') == client_sock
+            )
+
+    def _cleanup_remote_tunnel_artifacts(self, client_sock, reason='cleanup'):
+        """Kill remote tunnel agent and remove SOCKS-related files."""
+        agent = self._session_agents.get(client_sock)
+        info = self.h._client_info(client_sock)
+        if not agent and not info:
+            return False
+
+        shell_type = (info or {}).get('type', 'unix')
+        token = (agent or {}).get('token') or self._agent_token(client_sock)
+        if not token:
+            return False
+
+        agent_path = (agent or {}).get('remote_path', '')
+        port_path = (agent or {}).get('port_path', '')
+        if not agent_path or not port_path:
+            agent_path, port_path = self._remote_paths(client_sock, shell_type, token)
+
+        path_esc = self.h._escape_path(agent_path, shell_type)
+        port_esc = self.h._escape_path(port_path, shell_type)
+        token_esc = token.replace("'", "'\\''")
+
+        if shell_type == 'windows':
+            cleanup_ps = (
+                f"$token='{token}';"
+                f"$agent='{path_esc}';$port='{port_esc}';"
+                f"Get-CimInstance Win32_Process -Filter \"CommandLine LIKE '%.tornado_agent_{token}.py%'\" "
+                f"| ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }};"
+                f"$left=@();"
+                f"foreach($f in @($agent,$port)){{"
+                f"  if($f -and (Test-Path -LiteralPath $f)){{Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue;"
+                f"  if(Test-Path -LiteralPath $f){{$left+=$f}}}}}};"
+                f"if($left.Count){{'{TUNNEL_MARK_START}PARTIAL:'+($left -join ',')+'{TUNNEL_MARK_END}'}}"
+                f"else{{'{TUNNEL_MARK_START}OK{TUNNEL_MARK_END}'}}"
+            )
+            result = self._tunnel_marked(client_sock, '', cleanup_ps, 'windows', timeout=20.0)
+        else:
+            sock_path = os.path.join(
+                os.path.dirname(port_path.replace('\\', '/')),
+                f".tornado_tun_{token}.sock",
+            )
+            sock_esc = self.h._escape_path(sock_path, shell_type)
+            unix_cmd = (
+                f"pkill -f '.tornado_agent_{token_esc}.py' 2>/dev/null; "
+                f"rm -f '{path_esc}' '{port_esc}' '{sock_esc}' 2>/dev/null; "
+                f"left=''; "
+                f"for f in '{path_esc}' '{port_esc}' '{sock_esc}'; do "
+                f"[ -e \"$f\" ] && left=\"$left $f\"; done; "
+                f"if [ -n \"$left\" ]; then "
+                f"printf '%sPARTIAL:%s%s' '{TUNNEL_MARK_START}' \"$left\" '{TUNNEL_MARK_END}'; "
+                f"else printf '%sOK%s' '{TUNNEL_MARK_START}' '{TUNNEL_MARK_END}'; fi"
+            )
+            result = self._tunnel_marked(client_sock, unix_cmd, '', shell_type, timeout=20.0)
+
+        with self._lock:
+            self._session_agents.pop(client_sock, None)
+
+        ok = result == 'OK'
+        detail = 'all artifacts removed' if ok else (result or 'no response')
+        msg = f"Remote tunnel cleanup ({reason}): {detail}"
+        if ok:
+            print(f"{self.h.colors['green']}{msg}{self.h.colors['end']}")
+        else:
+            print(f"{self.h.colors['yellow']}{msg}{self.h.colors['end']}")
+        self._log(client_sock, msg)
+        return ok
+
     def cleanup_session(self, client_sock):
         """Stop SOCKS proxies and remove agent state for a session."""
         to_stop = []
@@ -434,9 +507,9 @@ class TunnelManager:
                 if proxy.get('client_sock') == client_sock:
                     to_stop.append(pid)
         for proxy_id in to_stop:
-            self._stop_proxy(proxy_id, reason='session disconnected')
+            self._stop_proxy(proxy_id, reason='session disconnected', cleanup_remote=False)
+        self._cleanup_remote_tunnel_artifacts(client_sock, reason='session disconnected')
         with self._lock:
-            self._session_agents.pop(client_sock, None)
             self._session_locks.pop(client_sock, None)
 
     def start_socks(self, client_sock, listen_port):
@@ -634,7 +707,7 @@ class TunnelManager:
             except OSError:
                 pass
 
-    def _stop_proxy(self, proxy_id, reason='operator request'):
+    def _stop_proxy(self, proxy_id, reason='operator request', cleanup_remote=True):
         with self._lock:
             proxy = self._proxies.pop(proxy_id, None)
         if not proxy:
@@ -649,6 +722,8 @@ class TunnelManager:
         print(f"{self.h.colors['yellow']}{msg}{self.h.colors['end']}")
         if client_sock:
             self._log(client_sock, msg)
+            if cleanup_remote and self._session_proxy_count(client_sock) == 0:
+                self._cleanup_remote_tunnel_artifacts(client_sock, reason=reason)
         return True
 
     def list_tunnels(self):

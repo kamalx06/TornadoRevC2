@@ -1,6 +1,9 @@
 """Plugin API — session context and command registration decorator."""
 
+import select
+import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -149,6 +152,48 @@ class SessionContext:
         if not self._handler.send_to_revshell(self._client_sock, cmd):
             return ''
         return self._handler.recv_output(self._client_sock, timeout=timeout)
+
+    def run_shell_streaming(
+        self,
+        cmd: str,
+        timeout: float = 3600.0,
+        idle_timeout: float = 60.0,
+        on_chunk=None,
+    ) -> str:
+        """Execute a command and stream output until idle or timeout."""
+        self._handler._flush_shell(self._client_sock, timeout=1.0)
+        if not self._handler.send_to_revshell(self._client_sock, cmd):
+            return ''
+        deadline = time.time() + timeout
+        last_data = time.time()
+        parts = []
+        c = self.colors
+        while time.time() < deadline:
+            remaining = min(1.0, deadline - time.time())
+            if remaining <= 0:
+                break
+            try:
+                r, _, _ = select.select([self._client_sock], [], [], remaining)
+            except Exception:
+                break
+            if r:
+                try:
+                    chunk = self._client_sock.recv(65536)
+                except Exception:
+                    break
+                if not chunk:
+                    break
+                text = chunk.decode(errors='ignore')
+                parts.append(text)
+                last_data = time.time()
+                if on_chunk:
+                    on_chunk(text)
+                else:
+                    sys.stdout.write(text)
+                    sys.stdout.flush()
+            elif time.time() - last_data >= idle_timeout:
+                break
+        return ''.join(parts)
 
     def run_marked(
         self,
