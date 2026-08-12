@@ -43,15 +43,41 @@ def _parse_hostname_from_probe(probe_output):
     return ''
 
 
+def _norm_machine_id(value):
+    value = str(value or '').strip().lower()
+    return value.replace('{', '').replace('}', '')
+
+
+def _machine_id_from_sources(sysinfo, identity):
+    sysinfo = sysinfo or {}
+    identity = identity or {}
+    return _norm_machine_id(
+        sysinfo.get('machine_id') or identity.get('machine_id')
+    )
+
+
+def machine_id_from_info(info, probe_output=''):
+    sysinfo = info.get('sysinfo') if info else {}
+    identity = info.get('identity') if info else {}
+    return _machine_id_from_sources(sysinfo, identity)
+
+
+def machine_id_from_record(record):
+    if not record:
+        return ''
+    return _machine_id_from_sources(record.get('sysinfo'), record.get('identity'))
+
+
 def identity_tuple(info, probe_output=''):
     sysinfo = info.get('sysinfo') or {}
     identity = info.get('identity') or {}
     hostname = _norm(sysinfo.get('hostname') or identity.get('hostname'))
     username = _norm(sysinfo.get('username') or identity.get('username'))
+    machine_id = machine_id_from_info(info, probe_output)
     if not hostname:
         hostname = _parse_hostname_from_probe(probe_output)
     shell_type = _norm(info.get('type') or 'unknown')
-    return hostname, username, shell_type
+    return hostname, username, shell_type, machine_id
 
 
 def record_identity_tuple(record):
@@ -61,12 +87,21 @@ def record_identity_tuple(record):
         _norm(sysinfo.get('hostname') or identity.get('hostname')),
         _norm(sysinfo.get('username') or identity.get('username')),
         _norm(record.get('type')),
+        machine_id_from_record(record),
     )
 
 
 def identities_match(incoming, stored, info=None, stored_record=None):
-    in_host, in_user, in_type = incoming
-    rec_host, rec_user, rec_type = stored
+    in_host, in_user, in_type, in_mid = incoming
+    rec_host, rec_user, rec_type, rec_mid = stored
+
+    if in_mid and rec_mid:
+        if in_mid != rec_mid:
+            return False
+        if in_user and rec_user:
+            return in_user == rec_user
+        return True
+
     if in_host and rec_host and in_host == rec_host:
         if in_user and rec_user:
             return in_user == rec_user
@@ -85,10 +120,10 @@ def identities_match(incoming, stored, info=None, stored_record=None):
 
 
 def compute_fingerprint(info, probe_output=''):
-    """Stable fingerprint from hostname, username, and shell type."""
-    hostname, username, shell_type = identity_tuple(info, probe_output)
-    parts = [hostname, username, shell_type]
-    if not hostname and not username:
+    """Stable fingerprint from hostname, username, and persistent machine ID."""
+    hostname, username, shell_type, machine_id = identity_tuple(info, probe_output)
+    parts = [hostname, username, machine_id, shell_type]
+    if not any([hostname, username, machine_id]):
         parts.append(normalize_ip((info.get('addr') or ('',))[0]))
     raw = '|'.join(parts)
     return hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]
@@ -193,6 +228,18 @@ class SessionRegistry:
             if is_restorable(record):
                 return record
 
+        incoming_mid = machine_id_from_info(info or {}, probe_output)
+        if incoming_mid:
+            for rec in self._data['sessions'].values():
+                if not is_restorable(rec):
+                    continue
+                if machine_id_from_record(rec) != incoming_mid:
+                    continue
+                incoming = identity_tuple(info or {}, probe_output)
+                stored = record_identity_tuple(rec)
+                if identities_match(incoming, stored, info, rec):
+                    return rec
+
         best = None
         best_score = -1
         for rec in self._data['sessions'].values():
@@ -202,8 +249,10 @@ class SessionRegistry:
             if not identities_match(incoming, stored, info, rec):
                 continue
             score = 0
-            in_host, in_user, in_type = incoming
-            rec_host, rec_user, rec_type = stored
+            in_host, in_user, in_type, in_mid = incoming
+            rec_host, rec_user, rec_type, rec_mid = stored
+            if in_mid and rec_mid and in_mid == rec_mid:
+                score += 10
             if in_host and rec_host and in_host == rec_host:
                 score += 4
             if in_user and rec_user and in_user == rec_user:

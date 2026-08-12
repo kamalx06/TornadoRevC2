@@ -17,7 +17,7 @@ MAIN_COMMANDS = (
     'switch', 'kill', 'status', 'ls', 'sessions', 'reconnects', 'payloads',
     'rename', 'rn', 'upload', 'download', 'verify', 'hash', 'sysinfo',
     'clear', 'cls', 'runpy', 'runps', 'runexe', 'runelf', 'clipboard',
-    'socks', 'tunnels',
+    'socks', 'tunnels', 'export',
     'help', 'exit', 'quit', 'e', 'q',
 )
 CLIENT_COMMANDS = (
@@ -29,7 +29,7 @@ CLIENT_COMMANDS = (
 ID_COMMANDS = {
     'switch', 'kill', 'rename', 'rn', 'upload', 'download', 'verify',
     'hash', 'sysinfo', 'runpy', 'runps', 'runexe', 'runelf', 'clipboard',
-    'socks',
+    'socks', 'export',
 }
 
 PAYLOAD_EXEC_TYPES = ('python', 'powershell', 'pe', 'elf')

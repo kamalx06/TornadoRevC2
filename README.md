@@ -34,7 +34,8 @@ tornadorevc2/
   clipboard.py    # Remote clipboard read
   tunnel.py       # SOCKS5 internal network pivoting
   session_registry.py  # Session persistence and reconnect support
-  payloads.py     # Dynamic payload catalog
+  export.py         # HTML transcript report generation
+  payloads.py       # Dynamic payload catalog
   handler.py      # Main server and session logic
 tornadorevc2.py   # Entry point
 ```
@@ -87,7 +88,7 @@ On Linux and Unix targets without Python available, a lightweight shell fallback
 - Safe disconnect detection
 - Thread-safe client management
 - **Session persistence:** metadata preserved on disconnect; restored when the same client reconnects
-- **Stable fingerprinting:** hostname, username, OS, architecture, and shell type
+- **Stable fingerprinting:** hostname, username, persistent machine ID (`/etc/machine-id` or Windows `MachineGuid`), and shell type
 - **`sessions` / `reconnects` commands** for registry and reconnect history
 
 ### Internal Network Pivoting (SOCKS5)
@@ -122,7 +123,24 @@ When a session drops and the same host reconnects, TornadoRevC2 restores:
 - Existing log directory (commands append to the same `session.log`)
 - Connect count and fingerprint tracking
 
+On connect, a lightweight stealth identity probe reads hostname, username, and the system machine identifier (`/etc/machine-id` on Linux/Unix, `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid` on Windows). These values are hashed into a stable fingerprint used for automatic session matching and reconnect detection.
+
 Registry stored at `logs/.registry/sessions.json`. Reconnect events appear in the console and session log.
+
+### Session Transcript Export
+Generate clean, self-contained HTML reports for documentation or pentest deliverables.
+- **`export <ID>`** from the main menu exports the selected session transcript
+- Works for **active** and **disconnected** sessions tracked in the registry
+- Report includes session metadata and the full command/output log in chronological order
+- Saved under `exports/` as `session_<ID>_<YYYY-MM-DD>.html`
+
+Report fields include session ID, hostname, username, OS, architecture, IP address, protocol, connection/disconnection times, and the complete transcript.
+
+Example:
+```bash
+export 3
+# exports/session_3_2026-08-11.html
+```
 
 ### Fully Interactive Operator Terminal
 - Real interactive shell per client
@@ -177,6 +195,7 @@ Interactive shells receive improved PTY/TTY support for a better operator experi
 | `socks <ID> <listen_port>` | SOCKS5 proxy for internal pivoting |
 | `tunnels` | List active SOCKS proxies |
 | `socks stop <proxy_id>` | Stop a SOCKS proxy |
+| `export <ID>` | Export HTML session transcript report |
 
 Inside a client shell (`switch <ID>`), omit the session ID for file transfer and session commands.
 
@@ -214,6 +233,8 @@ logs/001_user@hostname_192.168.1.10_unix_10-08-2026_143022/
 - Payload execution metadata (name, type, hash, runtime, success/failure) is logged under `executions/` — payload contents are not logged
 - Clipboard operations are recorded in `session.log`
 - Session connect and disconnect events are recorded automatically
+
+Exported HTML reports are written separately under `exports/` and do not modify session logs.
 
 ### In-Memory Payload Execution
 Execute scripts and binaries on the target without persistent disk artifacts whenever technically possible.
@@ -302,6 +323,7 @@ openssl req -x509 -newkey rsa:2048 -sha256 -nodes \
 ```
 
 ## Changelog
+- Session Transcript HTML Export (Added)
 - SOCKS5 Internal Network Pivoting (Added)
 - Session Persistence and Reconnect Support (Added)
 - In-Memory Payload Execution (Added)
