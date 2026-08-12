@@ -40,7 +40,7 @@ def format_section(title: str, fields: Dict[str, Any], width: int = 11) -> str:
         if isinstance(value, list):
             if not value:
                 continue
-            lines.append(f"{key + ':':<{width}}}{value[0]}")
+            lines.append(f"{key + ':':<{width}}}}{value[0]}")
             for item in value[1:]:
                 lines.append(f"{'':<{width}}{item}")
         else:
