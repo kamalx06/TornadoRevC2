@@ -1,6 +1,6 @@
 # TORNADOREVC2 — Professional Reverse Shell Handler
 
-TornadoRevC2 is a professional, universal reverse shell handler written in Python. It is not a full C2 framework, but a highly capable reverse shell handler with advanced operator features — including a modular plugin system for post-compromise enumeration and operator assistance during authorized security research, red-team labs, and penetration testing.
+TornadoRevC2 is a professional, universal reverse shell handler written in Python. It is **not** a full command-and-control framework — it is a highly capable reverse shell handler with advanced operator features, including a modular plugin system for post-compromise enumeration and operator assistance during authorized security research, red-team labs, malware analysis, and penetration testing.
 
 **Supported target platforms:** Linux and Windows (primary), plus generic Unix/BSD compatibility where practical.
 
@@ -55,9 +55,12 @@ tornadorevc2/
       common.py           # Formatting, confidence scoring, platform helpers
       runner.py           # Collector execution and JSON parsing
       virtualization.py   # Cross-platform virtualization plugin entry
+      quickenum.py        # Fast structured host assessment entry
+      wiper.py            # Secure multi-pass file wipe entry
       privesccheck.py     # LinPEAS / WinPEAS privilege escalation enumeration
     linux/
       virtualization.py   # Aggressive Linux VM/container/cloud collector
+      quickenum.py        # Linux QuickEnum collector script
       secrets.py          # Credential and config artifact search
       cron.py             # Cron and scheduled execution enumeration
       systemd.py          # Systemd services, timers, failed units
@@ -65,6 +68,7 @@ tornadorevc2/
       history.py          # Shell history and login activity
     windows/
       virtualization.py   # Aggressive Windows VM/container/cloud collector
+      quickenum.py        # Windows QuickEnum collector script
       shares.py           # SMB shares and mapped drives
       adinfo.py           # Active Directory and domain enumeration
       services.py         # Windows service enumeration
@@ -130,22 +134,32 @@ Plugins load dynamically — no handler restart required. The plugin registry is
 plugins list
 
 # Inspect a plugin
-plugins info virtualization
+plugins info quickenum
 
 # Run against an active session
-run virtualization 1
+run quickenum 1
 run secrets 2
-run services 3
+run wiper 1 /tmp/sensitive.log
 ```
 
 Results are displayed in the terminal and saved under `logs/<session>/plugins/` (human-readable report + raw JSON).
 
 ## Built-in Plugins
 
+### Cross-Platform Plugins
+
+| Plugin | Description |
+|--------|-------------|
+| `quickenum` | Fast structured host assessment (30–60 seconds) — hostname, user, network, environment, findings |
+| `virtualization` | Aggressive VM, container, orchestration, and cloud detection |
+| `privesccheck` | LinPEAS / WinPEAS privilege escalation enumeration (operator-supplied local script path) |
+| `wiper` | Secure multi-pass file overwrite (zeros → ones → random) then delete |
+
 ### Linux / Unix Plugins
 
 | Plugin | Description |
 |--------|-------------|
+| `quickenum` | Fast host overview: user, sudo, kernel, containers, network, mounts, cron, credentials |
 | `virtualization` | Aggressive VM, container, orchestration, and cloud detection with multi-layer confidence scoring |
 | `secrets` | Search configs, environment variables, SSH keys, cloud credentials, tokens, and sensitive artifacts |
 | `cron` | Enumerate cron jobs, system cron directories, user crontabs, and at queues |
@@ -157,6 +171,7 @@ Results are displayed in the terminal and saved under `logs/<session>/plugins/` 
 
 | Plugin | Description |
 |--------|-------------|
+| `quickenum` | Fast host overview: admin status, domain, network, shares, services, Defender, autoruns, credentials |
 | `virtualization` | Aggressive VM, container, orchestration, and cloud detection with multi-layer confidence scoring |
 | `shares` | Enumerate SMB shares, administrative shares, mapped drives, and network hosts |
 | `adinfo` | Domain membership, domain controllers, forest/trusts, and organizational units |
@@ -167,12 +182,106 @@ Results are displayed in the terminal and saved under `logs/<session>/plugins/` 
 | `defender` | Windows Defender status, exclusions, ASR rules, and installed security products |
 | `certificates` | Certificate stores, code-signing certs, and enterprise certificates |
 
-### Cross-Platform Plugins
+## QuickEnum — Fast Host Assessment
 
-| Plugin | Description |
-|--------|-------------|
-| `virtualization` | Aggressive VM, container, orchestration, and cloud detection |
-| `privesccheck` | LinPEAS / WinPEAS privilege escalation enumeration (operator-supplied local script path) |
+The `quickenum` plugin answers: **“What is the most useful information I can gather from this host within 30–60 seconds?”**
+
+It performs a single round-trip collection (not sequential plugin calls) and produces a structured report. Logic is condensed from existing collectors (virtualization, secrets, mounts, systemd, defender, etc.) for speed.
+
+```bash
+run quickenum 1
+run quickenum 2
+```
+
+### Linux / Unix collection
+
+- Hostname, user, UID/GID, sudo capability, OS, kernel, architecture
+- Virtualization/container status (Docker, Podman, Kubernetes, WSL)
+- Cloud instance detection, Docker socket exposure
+- IP addresses, default route, DNS, listening ports
+- Mount summary, writable+executable mount points
+- Systemd status, recent cron entries
+- SSH keys, authorized_keys, shell history, credential artifacts (`.env`, AWS, kubeconfig, etc.)
+
+### Windows collection
+
+- Hostname, user, admin/integrity status, OS, build, architecture
+- Domain membership, Active Directory presence, virtualization/container status
+- IP addresses, routes, DNS, listening ports
+- SMB shares, running services, scheduled tasks
+- Windows Defender status, security products, registry autoruns
+- PowerShell history, credential artifacts, certificate store summary
+
+### Example output
+
+```text
+Host Summary
+------------
+Hostname:              web01
+OS:                    Ubuntu 24.04
+Kernel:                6.8.0
+Architecture:          x86_64
+
+User
+----
+User:                  www-data
+UID:                   33
+GID:                   33
+Sudo:                  no
+CWD:                   /var/www
+
+Environment
+-----------
+Type:                  Docker container
+Orchestrator:          Kubernetes
+Namespace:             production
+
+Network
+-------
+IP:                    10.10.20.15
+Default Gateway:       10.10.20.1
+Listening Ports:       22, 80, 443
+
+Findings
+--------
+- Docker container (.dockerenv)
+- Kubernetes environment
+- Docker socket exposed (accessible)
+- .env file found
+- SSH authorized_keys present
+
+Collection time: 4.2s
+```
+
+Reports are saved to `logs/<session>/plugins/` as human-readable text and JSON.
+
+## Secure File Wiper (`wiper`)
+
+The `wiper` plugin securely removes a file on the remote target using a **3-pass overwrite** followed by deletion:
+
+1. **Zeros** — entire file filled with `0x00`
+2. **Ones** — entire file filled with `0xFF`
+3. **Random** — entire file filled with cryptographically random data
+
+Each pass is flushed to disk (`fsync` on Linux; `Flush(true)` on Windows) before the next pass. The file is then deleted.
+
+```bash
+# Linux target
+run wiper 1 /tmp/exfil.log
+run wiper 1 /home/user/.bash_history
+
+# Windows target
+run wiper 2 C:\Users\Public\staging.dat
+run wiper 2 "C:\ProgramData\logs\sensitive.txt"
+```
+
+### Storage media caveat
+
+**HDD:** A 3-pass overwrite followed by deletion provides strong assurance on traditional spinning disks.
+
+**SSD / NVMe:** Because of wear leveling and internal remapping, overwriting a file multiple times **does not guarantee** that the original flash cells were overwritten. A 3-pass overwrite may leave previous versions in remapped blocks that the operating system cannot access. For SSDs, full-disk encryption, secure erase utilities, or physical destruction may be required for high-assurance sanitization.
+
+The plugin displays this caveat before each wipe operation. Results (path, size, passes, verification status) are logged under `logs/<session>/plugins/`.
 
 ## Privilege Escalation Enumeration (`privesccheck`)
 
@@ -206,68 +315,7 @@ Download LinPEAS / WinPEAS from [PEASS-ng](https://github.com/carlospolop/PEASS-
 
 The `virtualization` plugin performs deep multi-layer detection — not a single heuristic check. It combines independent signals into a weighted confidence score and lists every indicator that contributed.
 
-### Linux Detection
-
-Detects and enumerates: Docker, Podman, Kubernetes, containerd, CRI-O, LXC/LXD, systemd-nspawn, WSL, KVM, VMware, VirtualBox, Hyper-V, Xen, QEMU, OpenVZ/Virtuozzo, and cloud VMs (AWS, Azure, GCP, OCI, DigitalOcean).
-
-**Techniques used:**
-
-- `/proc/1/cgroup`, `/proc/self/cgroup`, `/proc/self/mountinfo`, `/proc/self/status`
-- `/proc/cpuinfo`, `/proc/modules`, `/proc/xen`, `/proc/cmdline`
-- `/sys/class/dmi/id/*`, `/sys/hypervisor`
-- `/.dockerenv`, `/run/.containerenv`, runtime sockets
-- Namespace inspection (pid, mnt, net, uts)
-- cgroup v1/v2 analysis, mount namespace analysis
-- Cloud metadata endpoints (non-blocking, short timeout)
-- Docker socket accessibility testing
-- Privileged container detection via capabilities
-- Nested virtualization and sandbox heuristics
-
-### Windows Detection
-
-Detects: Hyper-V, VMware, VirtualBox, KVM/QEMU, Xen, WSL, Docker Desktop, containerd, Kubernetes, Windows containers, and cloud environments.
-
-**Techniques used:**
-
-- PowerShell, WMI/CIM, registry, services, drivers
-- Device enumeration, SMBIOS/BIOS vendor strings
-- Hyper-V guest parameters, Docker engine pipe
-- Cloud metadata endpoints (AWS, Azure, GCP)
-- Sandbox and analysis VM heuristics
-
-### Example Output
-
-```text
-Environment
-----------------------
-Type:                  Docker Container
-Runtime:               Docker
-Orchestrator:          Kubernetes
-Namespace:             production
-Node:                  worker-02
-Container ID:          8a1b2c3d4e5f
-Host Relationship:     container on host
-Host Access:           Docker socket exposed and accessible
-Container Privileges:  Standard/non-privileged
-Nested Virtualization: Not detected
-Confidence:            98%
-
-Indicators
-----------
-- /.dockerenv present
-- docker hierarchy in cgroup
-- /var/run/docker.sock accessible (host bridge risk)
-- kubepods cgroup hierarchy
-- K8s service account token
-
-Detections
------------
-  docker               yes (40%)
-    - /.dockerenv present
-    - /var/run/docker.sock accessible (host bridge risk)
-  kubernetes           yes (45%)
-    - kubepods cgroup hierarchy
-```
+Run `run virtualization <ID>` for full detail, or `run quickenum <ID>` for a condensed environment summary.
 
 ## Core Handler Features
 
@@ -329,6 +377,8 @@ Chunked upload/download with SHA256 verification and resume support. Remote clip
 | `sysinfo <ID> [--stealth\|--full]` | Refresh and display host information |
 | `plugins [list\|load\|unload\|reload\|info]` | Manage plugins |
 | `run <plugin> <ID> [args...]` | Execute a plugin on a session |
+| `run quickenum <ID>` | Fast structured host assessment |
+| `run wiper <ID> <remote_path>` | Secure 3-pass file wipe on target |
 | `runpy/runps/runexe/runelf <ID> <local>` | In-memory payload execution |
 | `clipboard <ID>` | Read remote clipboard |
 | `upload/download/verify` | File transfer with integrity checks |
@@ -352,7 +402,16 @@ logs/001_user@hostname_192.168.1.10_unix_10-08-2026_143022/
   transfers/       # Upload/download event logs
   executions/      # Payload execution metadata
   plugins/         # Plugin reports and raw JSON data
+      quickenum_*.log
+      wiper_*.log
 ```
+
+Every plugin run writes a timestamped log file under `plugins/`:
+
+- Human-readable report (Report section)
+- Structured JSON export (Raw Data section) when the collector produces JSON
+
+Example: `plugins/quickenum_20260812_054812.log`, `plugins/wiper_20260812_055030.log`
 
 ## Writing External Plugins
 
@@ -385,12 +444,10 @@ python tornadorevc2.py -H 0.0.0.0 -p 4444 -tp 8443 -c server.pem -k server.key
 ### Example Session Workflow
 
 ```bash
-# After a shell connects
-switch 1
-sysinfo --stealth
-exit
+# After a shell connects — fast triage first
+run quickenum 1
 
-# Run enumeration plugins from the main menu
+# Deeper enumeration as needed
 run virtualization 1
 run secrets 1
 run systemd 1
@@ -400,10 +457,14 @@ run privesccheck 1 ./linpeas.sh
 run privesccheck 2 C:\tools\winPEAS.bat
 
 # Windows target
+run quickenum 2
 run adinfo 2
 run services 2
 run defender 2
-run eventlogs 2
+
+# Secure cleanup of a staged artifact on target
+run wiper 1 /tmp/staging.log
+run wiper 2 C:\Users\Public\temp.dat
 ```
 
 ## TLS Certificate Generation
@@ -417,6 +478,8 @@ openssl req -x509 -newkey rsa:2048 -sha256 -nodes \
 
 ## Changelog
 
+- QuickEnum Plugin — fast structured host assessment (Added)
+- Secure File Wiper Plugin — 3-pass overwrite with SSD/NVMe caveat (Added)
 - Privilege Escalation Plugin (`privesccheck` — LinPEAS / WinPEAS) (Added)
 - SOCKS Remote Artifact Cleanup on `socks stop` (Added)
 - `runexe` Reliability Fix — stdout/stderr capture, args, temp cleanup (Fixed)

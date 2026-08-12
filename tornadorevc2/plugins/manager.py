@@ -239,6 +239,8 @@ class PluginManager:
     plugins reload <name>               Reload a plugin module
     plugins info <name>                 Show plugin details
     run <plugin> <session_id> [args...]   Execute plugin on a session
+                                          quickenum: run quickenum <ID>
+                                          wiper:     run wiper <ID> <remote_file_path>
                                           privesccheck: run privesccheck <ID> <local_script>
 
     {c['yellow']}External plugins: place modules in ./{EXTERNAL_PLUGIN_DIR}{c['end']}""")

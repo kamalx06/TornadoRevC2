@@ -167,3 +167,51 @@ def format_generic_report(data: Dict[str, Any], title: str = 'Results') -> str:
     if not sections:
         return f'{title}: no data collected.'
     return '\n\n'.join(sections)
+
+
+def format_quickenum_report(data: Dict[str, Any]) -> str:
+    sections = []
+    host = data.get('host_summary') or {}
+    if host:
+        sections.append(format_section('Host Summary', host))
+    user = data.get('user') or {}
+    if user:
+        sections.append(format_section('User', user))
+    env = data.get('environment') or {}
+    if env:
+        sections.append(format_section('Environment', env))
+    network = data.get('network') or {}
+    if network:
+        sections.append(format_section('Network', network))
+    for title, key in (
+        ('Storage', 'storage'),
+        ('Services', 'services'),
+        ('Security', 'security'),
+        ('Credentials', 'credentials'),
+        ('Persistence', 'persistence'),
+    ):
+        block = data.get(key) or {}
+        if block:
+            sections.append(format_section(title, block))
+    findings = data.get('findings') or []
+    if findings:
+        sections.append(format_list_section('Findings', [str(f) for f in findings]))
+    elapsed = data.get('elapsed_sec')
+    if elapsed is not None:
+        sections.append(f'Collection time: {elapsed:.1f}s')
+    if not sections:
+        return 'QuickEnum: no data collected.'
+    return '\n\n'.join(sections)
+
+
+def format_wiper_report(data: Dict[str, Any]) -> str:
+    lines = ['Secure Wipe Result', '-' * 18]
+    for key in ('path', 'size', 'passes', 'method', 'verified', 'platform'):
+        val = data.get(key)
+        if val not in (None, ''):
+            lines.append(f'{key.replace("_", " ").title():<12}{val}')
+    if data.get('message'):
+        lines.append(f"Message:     {data['message']}")
+    if data.get('error'):
+        lines.append(f"Error:       {data['error']}")
+    return '\n'.join(lines)
