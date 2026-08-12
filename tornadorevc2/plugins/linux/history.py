@@ -10,7 +10,6 @@ from ._helpers import build_linux_collector_command
 def _collector_source():
     return r'''
 import json, os, glob, subprocess
-MS="''' + PLUGIN_MARK_START + r'''"; ME="''' + PLUGIN_MARK_END + r'''"
 hist_files = []
 candidates = [
     os.path.expanduser('~/.bash_history'), os.path.expanduser('~/.zsh_history'),
@@ -35,18 +34,18 @@ for p in ('/var/log/apt/history.log', '/var/log/dnf.log', '/var/log/yum.log'):
                 pkg_hist.append({'path': p, 'tail': f.readlines()[-15:]})
         except Exception:
             pass
-last = ''
 try:
-    last = subprocess.check_output(['last', '-n', '15'], stderr=subprocess.DEVNULL, text=True, timeout=5)
+    out = subprocess.check_output(['last', '-n', '15'], stderr=subprocess.STDOUT, timeout=5)
+    last = out.decode('utf-8', 'ignore') if isinstance(out, bytes) else out
 except Exception:
-    pass
+    last = ''
 result = {
     'summary': {'history_files': len(hist_files), 'package_logs': len(pkg_hist)},
     'shell_history': hist_files[:20],
     'package_manager_history': [{'path': x['path'], 'recent': [l.strip()[:160] for l in x['tail']]} for x in pkg_hist],
     'recent_logins': last.splitlines()[:15] if last else [],
 }
-print(MS + json.dumps(result, separators=(',', ':')) + ME)
+_emit(result)
 '''
 
 

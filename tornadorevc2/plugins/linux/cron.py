@@ -10,7 +10,6 @@ from ._helpers import build_linux_collector_command
 def _collector_source():
     return r'''
 import json, os, glob, subprocess
-MS="''' + PLUGIN_MARK_START + r'''"; ME="''' + PLUGIN_MARK_END + r'''"
 entries = []
 paths = glob.glob('/etc/cron.*/*') + glob.glob('/etc/cron.d/*') + ['/etc/crontab']
 for p in paths:
@@ -37,15 +36,16 @@ for p in glob.glob('/var/spool/cron/crontabs/*') + glob.glob('/var/spool/cron/*'
 # at jobs
 at_list = ''
 try:
-    at_list = subprocess.check_output(['atq'], stderr=subprocess.DEVNULL, text=True, timeout=3)
+    out = subprocess.check_output(['atq'], stderr=subprocess.STDOUT, timeout=3)
+    at_list = out.decode('utf-8', 'ignore') if isinstance(out, bytes) else out
 except Exception:
-    pass
+    at_list = ''
 result = {
     'summary': {'cron_entries': len(entries), 'at_jobs': len(at_list.splitlines()) if at_list else 0},
     'cron_jobs': entries[:100],
     'at_queue': at_list.splitlines()[:20] if at_list else [],
 }
-print(MS + json.dumps(result, separators=(',', ':')) + ME)
+_emit(result)
 '''
 
 

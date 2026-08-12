@@ -10,7 +10,6 @@ from ._helpers import build_linux_collector_command
 def _collector_source():
     return r'''
 import json, os, subprocess
-MS="''' + PLUGIN_MARK_START + r'''"; ME="''' + PLUGIN_MARK_END + r'''"
 mounts = []
 try:
     with open('/proc/mounts', 'r', errors='ignore') as f:
@@ -37,7 +36,7 @@ result = {
     'container_related': docker_mounts[:30],
     'writable_executable': writable_exec[:30],
 }
-print(MS + json.dumps(result, separators=(',', ':')) + ME)
+_emit(result)
 '''
 
 

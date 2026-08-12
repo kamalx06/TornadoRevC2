@@ -10,7 +10,6 @@ from ._helpers import build_linux_collector_command
 def _collector_source():
     return r'''
 import json, os, re, glob
-MS="''' + PLUGIN_MARK_START + r'''"; ME="''' + PLUGIN_MARK_END + r'''"
 paths = [
     '/etc/passwd','/etc/shadow','/etc/sudoers','/etc/ssh/sshd_config',
     '/root/.ssh/id_rsa','/root/.ssh/id_ed25519','/root/.ssh/authorized_keys',
@@ -59,7 +58,7 @@ result = {
     'files': findings[:100],
     'environment_variables': env_hits[:40],
 }
-print(MS + json.dumps(result, separators=(',', ':')) + ME)
+_emit(result)
 '''
 
 

@@ -15,9 +15,7 @@ try:
 except ImportError:
     from urllib2 import Request, urlopen
 
-MS = "''' + PLUGIN_MARK_START + r'''"
-ME = "''' + PLUGIN_MARK_END + r'''"
-CLOUD_TIMEOUT = 1.5
+CLOUD_TIMEOUT = 1.0
 
 def rd(p):
     try:
@@ -323,7 +321,7 @@ def main():
         'detections': det,
         'dmi': dmi,
     }
-    print(MS + json.dumps(result, separators=(',', ':')) + ME)
+    _emit(result)
 
 main()
 '''

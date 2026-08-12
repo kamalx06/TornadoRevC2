@@ -276,11 +276,16 @@ class TORNADOREVC2:
 
     def recv_output(self, client_sock, timeout=1.0, until_marker=None):
         data = b""
-        end = time.time() + timeout
-        while time.time() < end:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
             try:
-                r, _, _ = select.select([client_sock], [], [], end - time.time())
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                r, _, _ = select.select([client_sock], [], [], min(0.5, remaining))
                 if not r:
+                    if until_marker:
+                        continue
                     break
                 chunk = client_sock.recv(65536)
                 if not chunk:
@@ -288,9 +293,10 @@ class TORNADOREVC2:
                     return ""
                 data += chunk
                 if until_marker and until_marker.encode() in data:
-                    end = time.time() + 0.5
+                    deadline = time.time() + 0.5
                     continue
-                end = time.time() + 0.3
+                if not until_marker:
+                    deadline = min(deadline, time.time() + 0.3)
             except Exception:
                 self.cleanup_client(client_sock)
                 return ""
