@@ -194,7 +194,7 @@ class PluginManager:
 
         if cmd == 'run':
             if len(cmd_parts) < 3:
-                print(f"{self._colors()['red']}Usage: run <plugin> <session_id>{self._colors()['end']}")
+                print(f"{self._colors()['red']}Usage: run <plugin> <session_id> [args...]{self._colors()['end']}")
                 return True
             plugin_name = cmd_parts[1]
             try:
@@ -238,7 +238,8 @@ class PluginManager:
     plugins unload <name>               Unload/disable a plugin
     plugins reload <name>               Reload a plugin module
     plugins info <name>                 Show plugin details
-    run <plugin> <session_id>           Execute plugin on a session
+    run <plugin> <session_id> [args...]   Execute plugin on a session
+                                          privesccheck: run privesccheck <ID> <local_script>
 
     {c['yellow']}External plugins: place modules in ./{EXTERNAL_PLUGIN_DIR}{c['end']}""")
 

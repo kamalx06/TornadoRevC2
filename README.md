@@ -74,7 +74,6 @@ tornadorevc2/
       defender.py         # Windows Defender and security products
       certificates.py     # Certificate store enumeration
 tornadorevc2.py           # Entry point
-tools/privesc/            # Operator-provided LinPEAS / WinPEAS scripts (not bundled)
 plugins/                  # Optional external plugin directory
 ```
 
@@ -120,7 +119,7 @@ def run(session: SessionContext, args):
 | `plugins unload <name>` | Unload or disable a plugin |
 | `plugins reload <name>` | Reload a plugin module |
 | `plugins info <name>` | Show plugin details |
-| `run <plugin> <session_id>` | Execute a plugin on an active session |
+| `run <plugin> <session_id> [args...]` | Execute a plugin on an active session |
 
 Plugins load dynamically — no handler restart required. The plugin registry is thread-safe.
 
@@ -173,30 +172,35 @@ Results are displayed in the terminal and saved under `logs/<session>/plugins/` 
 | Plugin | Description |
 |--------|-------------|
 | `virtualization` | Aggressive VM, container, orchestration, and cloud detection |
-| `privesccheck` | Automatic LinPEAS (Linux) or WinPEAS (Windows) privilege escalation enumeration |
+| `privesccheck` | LinPEAS / WinPEAS privilege escalation enumeration (operator-supplied local script path) |
 
 ## Privilege Escalation Enumeration (`privesccheck`)
 
-The `privesccheck` plugin automatically selects the correct PEAS tool based on session platform — operators never choose between LinPEAS and WinPEAS manually.
+The `privesccheck` plugin automatically selects **LinPEAS** on Linux/Unix sessions and **WinPEAS** on Windows sessions. You provide the local script path on the command line — nothing is bundled or hard-coded.
 
-| Target | Tool | Local path (default) |
-|--------|------|----------------------|
-| Linux / Unix | LinPEAS | `tools/privesc/linpeas.sh` |
-| Windows | WinPEAS | `tools/privesc/winPEAS.bat` or `winPEASx64.exe` |
+```bash
+# Linux target — path to your local linpeas.sh
+run privesccheck 1 ./linpeas.sh
+run privesccheck 1 /opt/peass/linpeas.sh
 
-Override paths with `TORNADOREVC2_LINPEAS`, `TORNADOREVC2_WINPEAS`, or `TORNADOREVC2_PRIVESC_DIR`.
+# Windows target — path to your local WinPEAS script or binary
+run privesccheck 2 C:\tools\winPEAS.bat
+run privesccheck 2 D:\arsenal\winPEASx64.exe
+```
+
+| Target | Expected file types | Tool run |
+|--------|---------------------|----------|
+| Linux / Unix | `.sh` shell script | LinPEAS via `bash` stdin |
+| Windows | `.bat`, `.cmd`, or `.exe` | WinPEAS via in-memory decode or staged exe |
 
 **In-memory execution:**
 
-- **Linux:** Pipes base64-decoded `linpeas.sh` directly into `bash` stdin — no script file on disk. Very large scripts fall back to `/dev/shm` staging with automatic removal after execution.
-- **Windows:** Decodes WinPEAS in PowerShell, runs via `cmd /c` or staged `.exe`, and deletes temporary artifacts immediately in a `finally` block.
+- **Linux:** Pipes base64-decoded script into `bash` stdin (no script file on target disk). Very large scripts use `/dev/shm` staging with automatic removal after execution.
+- **Windows:** Decodes `.bat` in PowerShell with temp file removed in `finally`; `.exe` uses verified transfer, execution, and immediate temp cleanup.
 
-**Output:** Live streaming to the terminal, full output saved under `logs/<session>/plugins/`, plus JSON metadata (tool, duration, exit code, success/failure). Tool contents are never logged.
+**Output:** Live streaming to the terminal, full output saved under `logs/<session>/plugins/`, plus JSON metadata (tool, duration, exit code, path used). Script contents are never logged.
 
-```bash
-# Place LinPEAS / WinPEAS in tools/privesc/ first
-run privesccheck 1
-```
+Download LinPEAS / WinPEAS from [PEASS-ng](https://github.com/carlospolop/PEASS-ng) and keep them anywhere on your operator machine — pass the path when you run the plugin.
 
 ## Aggressive Virtualization & Container Detection
 
@@ -324,7 +328,7 @@ Chunked upload/download with SHA256 verification and resume support. Remote clip
 | `kill <ID>` | Terminate a shell session |
 | `sysinfo <ID> [--stealth\|--full]` | Refresh and display host information |
 | `plugins [list\|load\|unload\|reload\|info]` | Manage plugins |
-| `run <plugin> <ID>` | Execute a plugin on a session |
+| `run <plugin> <ID> [args...]` | Execute a plugin on a session |
 | `runpy/runps/runexe/runelf <ID> <local>` | In-memory payload execution |
 | `clipboard <ID>` | Read remote clipboard |
 | `upload/download/verify` | File transfer with integrity checks |
@@ -391,8 +395,9 @@ run virtualization 1
 run secrets 1
 run systemd 1
 
-# Privilege escalation (place PEAS scripts in tools/privesc/ first)
-run privesccheck 1
+# Privilege escalation — provide your local PEAS script path
+run privesccheck 1 ./linpeas.sh
+run privesccheck 2 C:\tools\winPEAS.bat
 
 # Windows target
 run adinfo 2

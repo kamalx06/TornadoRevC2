@@ -224,6 +224,8 @@ class TORNADOREVC2:
             return sorted(p for p in self.plugins.completion_plugins() if p.startswith(text.lower()))
         if cmd == 'run' and arg_i == 2:
             return sorted(i for i in self._get_client_ids() if i.startswith(text))
+        if cmd == 'run' and arg_i >= 3 and words[1].lower() == 'privesccheck':
+            return self._complete_paths(text)
         if cmd == 'plugins' and arg_i == 1:
             subs = ('list', 'load', 'unload', 'reload', 'info', 'help')
             return sorted(s for s in subs if s.startswith(text.lower()))
