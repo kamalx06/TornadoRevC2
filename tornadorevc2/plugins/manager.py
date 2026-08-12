@@ -4,8 +4,9 @@ import os
 import threading
 from typing import List, Optional, Set
 
-from .api import SessionContext, get_registry, platform_supported
+from .api import SessionContext, get_registry
 from .loader import EXTERNAL_PLUGIN_DIR, PluginLoader
+from .shared.common import platform_supported
 
 
 class PluginManager:
