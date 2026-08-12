@@ -28,6 +28,7 @@ tornadorevc2/
   constants.py    # Shared constants and command lists
   sysinfo.py      # Host information collection and display
   session_log.py  # Per-session directory logging
+  terminal_sanitize.py  # Strip control sequences from logged/exported output
   terminal.py     # PTY/TTY, resize, and signal handling
   transfer.py     # Chunked file transfers with resume support
   payload_exec.py # In-memory payload transfer and execution
@@ -133,6 +134,7 @@ Generate clean, self-contained HTML reports for documentation or pentest deliver
 - Works for **active** and **disconnected** sessions tracked in the registry
 - Report includes session metadata and the full command/output log in chronological order
 - Saved under `exports/` as `session_<ID>_<YYYY-MM-DD>.html`
+- Command output in logs and exports is **sanitized** before being written: ANSI escape sequences, OSC sequences (terminal titles, shell integration metadata), and bracketed-paste control codes are stripped so transcripts contain only readable command output
 
 Report fields include session ID, hostname, username, OS, architecture, IP address, protocol, connection/disconnection times, and the complete transcript.
 
@@ -228,6 +230,7 @@ logs/001_user@hostname_192.168.1.10_unix_10-08-2026_143022/
 ```
 
 - Commands and output are appended to `session.log` in real time
+- Terminal control sequences (ANSI colors, OSC titles, shell integration metadata, bracketed-paste codes, etc.) are stripped from logged command output; the live interactive terminal is unaffected
 - Initial and refreshed `sysinfo` data is saved to `sysinfo.json` (identity, system, resources, network, and session fields)
 - Transfer results (complete, interrupted, hash mismatch) are logged under `transfers/`
 - Payload execution metadata (name, type, hash, runtime, success/failure) is logged under `executions/` — payload contents are not logged
@@ -323,6 +326,7 @@ openssl req -x509 -newkey rsa:2048 -sha256 -nodes \
 ```
 
 ## Changelog
+- Session Log and Export Control-Sequence Sanitization (Added)
 - Session Transcript HTML Export (Added)
 - SOCKS5 Internal Network Pivoting (Added)
 - Session Persistence and Reconnect Support (Added)

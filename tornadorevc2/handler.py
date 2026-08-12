@@ -37,6 +37,7 @@ from .payloads import get_payloads
 from .payload_exec import PayloadExecutor
 from .session_log import SessionLogger
 from .session_registry import SessionRegistry, compute_fingerprint
+from .terminal_sanitize import sanitize_terminal_output
 from .sysinfo import (
     build_collect_commands,
     extract_sysinfo,
@@ -322,7 +323,7 @@ class TORNADOREVC2:
         return h.hexdigest()
 
     def _strip_ansi(self, text):
-        return re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', text)
+        return sanitize_terminal_output(text)
 
     def _normalize_remote_path(self, path, shell_type):
         path = path.strip().strip('"').strip("'")

@@ -8,6 +8,7 @@ import re
 
 from .constants import LOGS_DIR
 from .session_log import _sanitize
+from .terminal_sanitize import sanitize_terminal_output
 
 
 EXPORTS_DIR = 'exports'
@@ -31,7 +32,8 @@ def _parse_session_log(path):
     def flush_output():
         nonlocal current, output_lines
         if current and current['kind'] == 'command' and output_lines:
-            current['output'] = '\n'.join(output_lines).strip('\n')
+            raw = '\n'.join(output_lines).strip('\n')
+            current['output'] = sanitize_terminal_output(raw)
             output_lines = []
 
     for line in raw_lines:

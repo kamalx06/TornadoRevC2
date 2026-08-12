@@ -3,10 +3,11 @@ import json
 import re
 
 from .constants import SYSINFO_MARK_END, SYSINFO_MARK_START
+from .terminal_sanitize import sanitize_terminal_output
 
 
 def _strip_ansi(text):
-    return re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', text)
+    return sanitize_terminal_output(text)
 
 
 def _extract_marked(output, start_mark, end_mark):

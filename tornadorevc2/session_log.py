@@ -4,6 +4,7 @@ import os
 import re
 
 from .constants import LOGS_DIR
+from .terminal_sanitize import sanitize_terminal_output
 
 
 def _sanitize(name):
@@ -34,7 +35,7 @@ class SessionLogger:
         with open(self.command_log, 'a', encoding='utf-8') as f:
             f.write(f"[{self._timestamp()}] $ {cmd}\n")
             if output:
-                f.write(f"{output}\n")
+                f.write(f"{sanitize_terminal_output(output)}\n")
             f.write('\n')
 
     def save_sysinfo(self, info):
