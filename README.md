@@ -164,6 +164,65 @@ Plugins extend the handler at runtime without modifying core code. Built-in plug
 | `plugins info <name>` | Show plugin details |
 | `run <plugin> <session_id> [args...]` | Execute a plugin on a session |
 
+Built-in plugins are soft-disabled with `plugins unload` (the module stays imported). External plugins are fully unloaded and unregistered. `plugins reload` unregisters stale commands before re-importing, so renamed commands do not linger in the registry.
+
+### Creating a Custom Plugin
+
+A plugin is a Python module that registers one or more commands with the `@plugin.command` decorator. Each command maps to a handler function that receives a `SessionContext` and an argument list from the operator console.
+
+**Minimal example** (`plugins/uptime_check.py` — roughly 20 lines):
+
+```python
+"""Report how long the remote host has been up."""
+import json
+from tornadorevc2.plugins import plugin, SessionContext
+from tornadorevc2.constants import PLUGIN_MARK_START, PLUGIN_MARK_END
+
+@plugin.command(
+    name="uptime_check",
+    platforms=["linux", "unix", "windows"],
+    description="Show remote system uptime",
+)
+def run(session: SessionContext, args):
+    if session.is_windows:
+        ps = (
+            f"$s='{PLUGIN_MARK_START}';$e='{PLUGIN_MARK_END}';"
+            "$up=(Get-CimInstance Win32_OperatingSystem).LastBootUpTime;"
+            "$txt='up since '+$up;"
+            "Write-Output ($s+$txt+$e)"
+        )
+        raw = session.run_marked("", ps, timeout=15.0)
+    else:
+        cmd = f"echo '{PLUGIN_MARK_START}'$(uptime -p 2>/dev/null || uptime)'{PLUGIN_MARK_END}'"
+        raw = session.run_marked(cmd, "", timeout=15.0)
+    if not raw:
+        session.print("uptime_check: no response from target", "red")
+        return 1
+    text = raw.strip()
+    session.print(f"Uptime: {text}", "cyan")
+    session.log_plugin_result("uptime_check", text)
+    return 0
+```
+
+```bash
+plugins load uptime_check    # load from ./plugins/uptime_check.py
+run uptime_check 1           # execute on session 1
+plugins reload uptime_check  # pick up edits without restarting the handler
+```
+
+**Key concepts:**
+
+| Element | Purpose |
+|---------|---------|
+| `@plugin.command(name=..., platforms=..., description=...)` | Registers the command at import time |
+| `run(session, args)` | Entry point; return `0` on success, non-zero on failure |
+| `session.run_shell(cmd)` | Run a raw shell command and capture output |
+| `session.run_marked(unix_cmd, win_ps, timeout=...)` | Run a collector that wraps output in `__T_PLUGIN_START__` / `__T_PLUGIN_END__` markers |
+| `session.print(text, color)` | Write colored output to the operator console |
+| `session.log_plugin_result(name, report, detail='')` | Persist results under `logs/<session>/plugins/` |
+
+For structured JSON collectors, use `run_collector_plugin` from `tornadorevc2.plugins.shared.runner` with platform-specific `build_command()` functions (see built-in plugins such as `services` or `virtualization`).
+
 ### SessionContext API
 
 ```python
@@ -366,10 +425,6 @@ tornadorevc2/
     manager.py            # Runtime loading and execution
     loader.py             # Module discovery
     shared/               # Cross-platform plugin entries
-      quickenum.py        # Linux and Windows collectors
-      virtualization.py
-      wiper.py
-      privesccheck.py
       common.py           # Formatting and platform helpers
       runner.py           # Collector execution and JSON parsing
     linux/                # Linux-specific collectors

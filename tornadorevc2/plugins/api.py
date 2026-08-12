@@ -27,11 +27,27 @@ class _PluginRegistry:
 
     def register(self, cmd: PluginCommand):
         with self._lock:
+            existing = self._commands.get(cmd.name)
+            if existing and existing.module != cmd.module:
+                print(
+                    f"[plugins] warning: command '{cmd.name}' re-registered "
+                    f"from {cmd.module} (was {existing.module})",
+                    file=sys.stderr,
+                )
             self._commands[cmd.name] = cmd
 
     def unregister(self, name: str):
         with self._lock:
             self._commands.pop(name, None)
+
+    def unregister_module(self, module_name: str) -> List[str]:
+        removed = []
+        with self._lock:
+            for name, cmd in list(self._commands.items()):
+                if cmd.module == module_name:
+                    self._commands.pop(name, None)
+                    removed.append(name)
+        return removed
 
     def get(self, name: str) -> Optional[PluginCommand]:
         with self._lock:

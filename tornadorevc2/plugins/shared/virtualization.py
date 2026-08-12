@@ -19,5 +19,5 @@ def run(session: SessionContext, args):
         build_linux_cmd,
         build_windows_cmd,
         format_virtualization_report,
-        timeout=50.0,
+        timeout=75.0,
     )
