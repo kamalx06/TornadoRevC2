@@ -73,7 +73,9 @@ class PluginLoader:
                     self._loaded_modules[module_path] = source
                     return True
                 return self._load_external(module_path)
-            except Exception:
+            except Exception as exc:
+                import sys
+                print(f"[plugins] failed to load {module_path}: {exc}", file=sys.stderr)
                 return False
 
     def _load_external(self, path: str) -> bool:
@@ -167,7 +169,18 @@ class PluginLoader:
         return None
 
     def builtin_path_for_name(self, plugin_name: str) -> Optional[str]:
-        for mod in BUILTIN_PLUGIN_MODULES:
-            if mod.endswith(f'.{plugin_name}') or plugin_name in mod:
+        matches = [
+            mod for mod in BUILTIN_PLUGIN_MODULES
+            if mod.endswith(f'.{plugin_name}')
+        ]
+        if not matches:
+            return None
+        cmd = get_registry().get(plugin_name)
+        if cmd and cmd.module:
+            for mod in matches:
+                if cmd.module == mod:
+                    return mod
+        for mod in matches:
+            if '.shared.' in mod:
                 return mod
-        return None
+        return matches[0]

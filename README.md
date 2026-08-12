@@ -55,12 +55,12 @@ tornadorevc2/
       common.py           # Formatting, confidence scoring, platform helpers
       runner.py           # Collector execution and JSON parsing
       virtualization.py   # Cross-platform virtualization plugin entry
-      quickenum.py        # Fast structured host assessment entry
+      quickenum.py        # QuickEnum plugin entry + Linux collector
       wiper.py            # Secure multi-pass file wipe entry
       privesccheck.py     # LinPEAS / WinPEAS privilege escalation enumeration
     linux/
       virtualization.py   # Aggressive Linux VM/container/cloud collector
-      quickenum.py        # Linux QuickEnum collector script
+      quickenum.py        # QuickEnum plugin (Linux + Windows collectors)
       secrets.py          # Credential and config artifact search
       cron.py             # Cron and scheduled execution enumeration
       systemd.py          # Systemd services, timers, failed units
@@ -68,7 +68,7 @@ tornadorevc2/
       history.py          # Shell history and login activity
     windows/
       virtualization.py   # Aggressive Windows VM/container/cloud collector
-      quickenum.py        # Windows QuickEnum collector script
+      _quickenum.py       # Windows QuickEnum collector (internal)
       shares.py           # SMB shares and mapped drives
       adinfo.py           # Active Directory and domain enumeration
       services.py         # Windows service enumeration

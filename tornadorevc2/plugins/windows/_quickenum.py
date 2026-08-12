@@ -1,4 +1,4 @@
-"""Fast Windows host assessment collector for QuickEnum."""
+"""Windows QuickEnum collector (internal — loaded by linux/quickenum plugin entry)."""
 
 from ...constants import PLUGIN_MARK_END, PLUGIN_MARK_START
 
@@ -65,7 +65,7 @@ Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct -EA 
 
 # Registry autoruns (sample)
 $autoruns=@()
-$runKeys=@('HKLM:\Software\Microsoft\Windows\CurrentVersion\Run','HKCU:\Software\Microsoft\CurrentVersion\Run')
+$runKeys=@('HKLM:\Software\Microsoft\Windows\CurrentVersion\Run','HKCU:\Software\Microsoft\Windows\CurrentVersion\Run')
 foreach($rk in $runKeys){{
   if(Test-Path $rk){{
     Get-ItemProperty $rk -EA 0|Get-Member -MemberType NoteProperty|Where-Object Name -notmatch '^PS'|ForEach-Object{{
