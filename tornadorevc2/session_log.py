@@ -20,9 +20,11 @@ class SessionLogger:
         self.sysinfo_path = os.path.join(self.session_dir, 'sysinfo.json')
         self.transfers_dir = os.path.join(self.session_dir, 'transfers')
         self.executions_dir = os.path.join(self.session_dir, 'executions')
+        self.plugins_dir = os.path.join(self.session_dir, 'plugins')
         os.makedirs(self.session_dir, exist_ok=True)
         os.makedirs(self.transfers_dir, exist_ok=True)
         os.makedirs(self.executions_dir, exist_ok=True)
+        os.makedirs(self.plugins_dir, exist_ok=True)
 
     def _timestamp(self):
         return datetime.datetime.now().isoformat(timespec='seconds')
@@ -82,6 +84,19 @@ class SessionLogger:
 
     def log_tunnel(self, message):
         self.log_event(f"Tunnel: {message}")
+
+    def log_plugin(self, plugin_name, output, detail=''):
+        stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        safe_name = re.sub(r'[^\w.\-]+', '_', plugin_name)[:48]
+        path = os.path.join(self.plugins_dir, f"{safe_name}_{stamp}.log")
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(f"Time:   {self._timestamp()}\n")
+            f.write(f"Plugin: {plugin_name}\n")
+            if output:
+                f.write(f"\n--- Report ---\n{sanitize_terminal_output(output)}\n")
+            if detail:
+                f.write(f"\n--- Raw Data ---\n{detail}\n")
+        self.log_event(f"Plugin {plugin_name}: completed")
 
     def log_reconnect(self, detail):
         self.log_event(f"Session reconnected — {detail}")

@@ -2,18 +2,25 @@
 
 import re
 
-# OSC (Operating System Command): ESC ] payload terminated by BEL or ST (ESC \).
-# Covers shell integration (633, 3008), terminal title (0;), hyperlinks, etc.
-_OSC = re.compile(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?')
-
-# CSI (Control Sequence Introducer): colors, cursor movement, bracketed paste (?2004h/l), etc.
+# CSI (Control Sequence Introducer) — safe for marker/payload parsing.
 _CSI = re.compile(r'(?:\x1b|\x9b)\[[\?0-9;]*[ -/]*[@-~]')
 
-# DCS / SOS / PM / APC sequences terminated by ST.
-_OTHER_ESC = re.compile(r'\x1b[PX^_][^\x1b]*(?:\x1b\\|$)')
+# OSC (Operating System Command): ESC ] payload terminated by BEL or ST (ESC \).
+# Covers shell integration (633, 3008), terminal title (0;), hyperlinks, etc.
+_OSC = re.compile(r'\x1b\][^\x07\x1b\\]*(?:\x07|\x1b\\)?')
+
+# DCS / SOS / PM / APC sequences terminated by ST (never to end-of-string).
+_OTHER_ESC = re.compile(r'\x1b[PX^_][^\x1b\\]*\x1b\\')
 
 # Legacy two-character ESC sequences (e.g. ESC M reverse index).
 _ESC_TWO_CHAR = re.compile(r'\x1b[@-Z\\-_]')
+
+
+def strip_csi_sequences(text):
+    """Remove CSI/ANSI color and cursor sequences (for structured output parsing)."""
+    if not text:
+        return text
+    return _CSI.sub('', text)
 
 
 def sanitize_terminal_output(text):

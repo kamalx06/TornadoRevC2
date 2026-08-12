@@ -10,6 +10,8 @@ TUNNEL_MARK_START = '__T_TUN_START__'
 TUNNEL_MARK_END = '__T_TUN_END__'
 IDENT_MARK_START = '__T_ID_START__'
 IDENT_MARK_END = '__T_ID_END__'
+PLUGIN_MARK_START = '__T_PLUGIN_START__'
+PLUGIN_MARK_END = '__T_PLUGIN_END__'
 
 CHUNK_SIZE = {'windows': 4096, 'unix': 32768, 'unknown': 8192}
 
@@ -17,7 +19,7 @@ MAIN_COMMANDS = (
     'switch', 'kill', 'status', 'ls', 'sessions', 'reconnects', 'payloads',
     'rename', 'rn', 'upload', 'download', 'verify', 'hash', 'sysinfo',
     'clear', 'cls', 'runpy', 'runps', 'runexe', 'runelf', 'clipboard',
-    'socks', 'tunnels', 'export',
+    'socks', 'tunnels', 'export', 'plugins', 'run',
     'help', 'exit', 'quit', 'e', 'q',
 )
 CLIENT_COMMANDS = (

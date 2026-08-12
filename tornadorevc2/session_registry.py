@@ -4,6 +4,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 
 from .constants import LOGS_DIR
 from .session_log import SessionLogger, _sanitize
@@ -11,6 +12,11 @@ from .session_log import SessionLogger, _sanitize
 
 REGISTRY_DIR = os.path.join(LOGS_DIR, '.registry')
 REGISTRY_FILE = os.path.join(REGISTRY_DIR, 'sessions.json')
+
+_MACHINE_ID_RE = re.compile(
+    r'([0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})',
+    re.IGNORECASE,
+)
 
 
 def _norm(value):
@@ -45,7 +51,12 @@ def _parse_hostname_from_probe(probe_output):
 
 def _norm_machine_id(value):
     value = str(value or '').strip().lower()
-    return value.replace('{', '').replace('}', '')
+    value = value.replace('{', '').replace('}', '')
+    match = _MACHINE_ID_RE.search(value)
+    if match:
+        return match.group(1).lower()
+    cleaned = re.sub(r'[^0-9a-f-]', '', value)
+    return cleaned[:36] if cleaned else ''
 
 
 def _machine_id_from_sources(sysinfo, identity):
@@ -119,14 +130,26 @@ def identities_match(incoming, stored, info=None, stored_record=None):
     return False
 
 
-def compute_fingerprint(info, probe_output=''):
+def compute_fingerprint(info, probe_output='', include_machine_id=True):
     """Stable fingerprint from hostname, username, and persistent machine ID."""
     hostname, username, shell_type, machine_id = identity_tuple(info, probe_output)
+    if not include_machine_id:
+        machine_id = ''
     parts = [hostname, username, machine_id, shell_type]
     if not any([hostname, username, machine_id]):
         parts.append(normalize_ip((info.get('addr') or ('',))[0]))
     raw = '|'.join(parts)
     return hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]
+
+
+def fingerprint_variants(info, probe_output=''):
+    """Candidate fingerprints for reconnect lookup (with/without machine ID)."""
+    variants = []
+    for include_mid in (True, False):
+        fp = compute_fingerprint(info, probe_output, include_machine_id=include_mid)
+        if fp not in variants:
+            variants.append(fp)
+    return variants
 
 
 class SessionRegistry:
@@ -222,6 +245,11 @@ class SessionRegistry:
             if rec.get('status') == 'disconnected':
                 return True
             return rec.get('status') == 'active' and sid not in live_ids
+
+        for fp in fingerprint_variants(info or {}, probe_output):
+            record = self._data['sessions'].get(fp)
+            if is_restorable(record):
+                return record
 
         if fingerprint:
             record = self._data['sessions'].get(fingerprint)

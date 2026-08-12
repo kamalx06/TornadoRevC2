@@ -36,8 +36,8 @@ from .export import SessionExporter
 from .payloads import get_payloads
 from .payload_exec import PayloadExecutor
 from .session_log import SessionLogger
-from .session_registry import SessionRegistry, compute_fingerprint
-from .terminal_sanitize import sanitize_terminal_output
+from .session_registry import SessionRegistry, _norm_machine_id, compute_fingerprint
+from .terminal_sanitize import strip_csi_sequences, sanitize_terminal_output
 from .sysinfo import (
     build_collect_commands,
     extract_sysinfo,
@@ -46,6 +46,7 @@ from .sysinfo import (
 from .terminal import TerminalManager
 from .transfer import FileTransfer
 from .tunnel import TunnelManager
+from .plugins import PluginManager
 
 
 class TORNADOREVC2:
@@ -66,6 +67,7 @@ class TORNADOREVC2:
         self.tunnels = TunnelManager(self)
         self.exporter = SessionExporter(self)
         self.registry = SessionRegistry()
+        self.plugins = PluginManager(self)
         self.colors = {
             'cyan': '\033[96m', 'green': '\033[92m', 'yellow': '\033[93m',
             'red': '\033[91m', 'bold': '\033[1m', 'end': '\033[0m', 'blue': '\033[94m',
@@ -218,6 +220,15 @@ class TORNADOREVC2:
             return sorted(c for c in MAIN_COMMANDS if c.startswith(text.lower()))
         if arg_i == 1 and cmd in ID_COMMANDS:
             return sorted(i for i in self._get_client_ids() if i.startswith(text))
+        if cmd == 'run' and arg_i == 1:
+            return sorted(p for p in self.plugins.completion_plugins() if p.startswith(text.lower()))
+        if cmd == 'run' and arg_i == 2:
+            return sorted(i for i in self._get_client_ids() if i.startswith(text))
+        if cmd == 'plugins' and arg_i == 1:
+            subs = ('list', 'load', 'unload', 'reload', 'info', 'help')
+            return sorted(s for s in subs if s.startswith(text.lower()))
+        if cmd == 'plugins' and arg_i == 2 and words[1].lower() in ('load', 'unload', 'reload', 'info'):
+            return sorted(p for p in self.plugins.completion_plugins() if p.startswith(text.lower()))
         if cmd == 'upload' and arg_i == 2:
             return self._complete_paths(text)
         if cmd == 'download' and arg_i == 3:
@@ -323,7 +334,7 @@ class TORNADOREVC2:
         return h.hexdigest()
 
     def _strip_ansi(self, text):
-        return sanitize_terminal_output(text)
+        return strip_csi_sequences(text)
 
     def _normalize_remote_path(self, path, shell_type):
         path = path.strip().strip('"').strip("'")
@@ -727,6 +738,7 @@ class TORNADOREVC2:
 
         if not payload or '|' not in payload:
             return {}
+        payload = sanitize_terminal_output(payload)
         parts = payload.split('|')
         host = parts[0].strip() if len(parts) > 0 else ''
         user = parts[1].strip().split('\\')[-1] if len(parts) > 1 else ''
@@ -734,7 +746,7 @@ class TORNADOREVC2:
         identity = {
             'hostname': host,
             'username': user,
-            'machine_id': machine_id.replace('{', '').replace('}', '').lower(),
+            'machine_id': _norm_machine_id(machine_id),
         }
         if identity['hostname'] or identity['username'] or identity['machine_id']:
             return identity
@@ -1013,6 +1025,8 @@ class TORNADOREVC2:
                         print(f"{self.colors['red']}Invalid ID{self.colors['end']}")
                 elif self.exporter.handle_command(cmd_parts):
                     pass
+                elif self.plugins.handle_command(cmd_parts):
+                    pass
                 elif self.tunnels.handle_main_command(cmd_parts):
                     pass
                 elif cmd_lower == 'upload':
@@ -1070,6 +1084,11 @@ class TORNADOREVC2:
 
     {self.colors['green']}REPORTING:{self.colors['end']}
     export <ID>                                              Export HTML session transcript
+
+    {self.colors['green']}PLUGINS:{self.colors['end']}
+    plugins / plugins list                                   List registered plugins
+    plugins load|unload|reload|info <name>                     Manage plugins at runtime
+    run <plugin> <ID>                                        Execute a plugin on a session
 
     {self.colors['green']}INTERNAL PIVOTING (SOCKS5):{self.colors['end']}
     socks <ID> <listen_port>                                 SOCKS5 proxy via session
