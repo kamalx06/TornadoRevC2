@@ -59,7 +59,7 @@ $tasks=(Get-ScheduledTask -EA 0|Where-Object State -ne Disabled).Count
 $def=@{{}}; $secProducts=@()
 try{{
   $st=Get-MpComputerStatus -EA 0
-  $def=@{realtime=$st.RealTimeProtectionEnabled;signatures=$st.AntivirusSignatureVersion;tamper=$st.IsTamperProtected}
+  $def=@{{realtime=$st.RealTimeProtectionEnabled;signatures=$st.AntivirusSignatureVersion;tamper=$st.IsTamperProtected}}
 }}catch{{}}
 Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct -EA 0|ForEach-Object{{ $secProducts+=$_.displayName }}
 
