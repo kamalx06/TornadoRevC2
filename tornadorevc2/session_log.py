@@ -86,9 +86,11 @@ class SessionLogger:
         self.log_event(f"Tunnel: {message}")
 
     def log_plugin(self, plugin_name, output, detail=''):
+        plugins_dir = getattr(self, 'plugins_dir', None) or os.path.join(self.session_dir, 'plugins')
+        os.makedirs(plugins_dir, exist_ok=True)
         stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
         safe_name = re.sub(r'[^\w.\-]+', '_', plugin_name)[:48]
-        path = os.path.join(self.plugins_dir, f"{safe_name}_{stamp}.log")
+        path = os.path.join(plugins_dir, f"{safe_name}_{stamp}.log")
         with open(path, 'w', encoding='utf-8') as f:
             f.write(f"Time:   {self._timestamp()}\n")
             f.write(f"Plugin: {plugin_name}\n")

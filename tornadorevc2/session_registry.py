@@ -7,7 +7,7 @@ import os
 import re
 
 from .constants import LOGS_DIR
-from .session_log import SessionLogger, _sanitize
+from .session_log import SessionLogger
 
 
 REGISTRY_DIR = os.path.join(LOGS_DIR, '.registry')
@@ -380,19 +380,6 @@ class SessionRegistry:
         """Reopen an existing session log directory."""
         if not log_session_id:
             return None
-        safe = _sanitize(log_session_id)
-        session_dir = os.path.join(self.base_dir, safe)
-        if os.path.isdir(session_dir):
-            logger = SessionLogger.__new__(SessionLogger)
-            logger.session_id = log_session_id
-            logger.session_dir = session_dir
-            logger.command_log = os.path.join(session_dir, 'session.log')
-            logger.sysinfo_path = os.path.join(session_dir, 'sysinfo.json')
-            logger.transfers_dir = os.path.join(session_dir, 'transfers')
-            logger.executions_dir = os.path.join(session_dir, 'executions')
-            os.makedirs(logger.transfers_dir, exist_ok=True)
-            os.makedirs(logger.executions_dir, exist_ok=True)
-            return logger
         return SessionLogger(log_session_id, base_dir=self.base_dir)
 
     def list_sessions(self, colors):

@@ -11,9 +11,14 @@ from ...sysinfo import _extract_marked
 
 
 def _parse_detection_output(raw: str) -> dict:
-    payload = _extract_marked(raw, PLUGIN_MARK_START, PLUGIN_MARK_END)
-    if not payload:
+    if not raw:
         return {}
+    payload = raw.strip()
+    # run_marked() already returns content between markers; fall back if not
+    if PLUGIN_MARK_START in payload:
+        extracted = _extract_marked(payload, PLUGIN_MARK_START, PLUGIN_MARK_END)
+        if extracted:
+            payload = extracted
     try:
         return json.loads(payload)
     except json.JSONDecodeError:
