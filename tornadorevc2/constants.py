@@ -16,19 +16,18 @@ CHUNK_SIZE = {'windows': 4096, 'unix': 32768, 'unknown': 8192}
 MAIN_COMMANDS = (
     'switch', 'kill', 'status', 'ls', 'sessions', 'reconnects', 'payloads',
     'rename', 'rn', 'upload', 'download', 'verify', 'hash', 'sysinfo',
-    'clear', 'cls', 'runpy', 'runps', 'runexe', 'runelf',
+    'clear', 'cls',
     'socks', 'tunnels', 'export', 'plugins', 'run',
     'help', 'exit', 'quit', 'e', 'q',
 )
 CLIENT_COMMANDS = (
     'upload', 'download', 'verify', 'hash', 'sysinfo', 'help',
-    'runpy', 'runps', 'runexe', 'runelf',
     'socks', 'tunnels', 'export', 'plugins', 'run',
     'exit', 'quit', 'e', 'q',
 )
 ID_COMMANDS = {
     'switch', 'kill', 'rename', 'rn', 'upload', 'download', 'verify',
-    'hash', 'sysinfo', 'runpy', 'runps', 'runexe', 'runelf',
+    'hash', 'sysinfo',
     'socks', 'export',
 }
 

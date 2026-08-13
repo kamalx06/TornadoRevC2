@@ -352,8 +352,6 @@ class PluginManager:
 
         args = args or []
 
-
-
         if name not in self._enabled:
 
             if not self.load_plugin(name):
@@ -540,13 +538,14 @@ class PluginManager:
 
     run <plugin> <session_id> [args...]   Execute plugin on a session
 
+                                          inmemory:  run inmemory <ID> <filetype> <local_file> [-- args] [--save-output <file>]
+                                                     filetypes: py, ps, exe, elf, bat, sh
+
                                           quickenum: run quickenum <ID>
 
                                           clipboard: run clipboard <ID>
 
                                           wiper:     run wiper <ID> <remote_file_path>
-
-                                          privesccheck: run privesccheck <ID> <local_script>
 
 
 

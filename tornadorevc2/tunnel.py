@@ -259,7 +259,7 @@ class TunnelManager:
     def _remote_paths(self, client_sock, shell_type, token):
         staging_name = f".tornado_agent_{token}.py"
         if shell_type == 'windows':
-            agent_path = self.h.payload_exec._resolve_staging_path(client_sock, shell_type, staging_name)
+            agent_path = self.h.inmemory.resolve_staging_path(client_sock, shell_type, staging_name)
         else:
             agent_path = f"/tmp/.tornado_agent_{token}.py"
         port_path = os.path.join(
