@@ -110,12 +110,12 @@ Write-Output ($start+(ConvertTo-Json $result -Compress)+$end)
 )
 def run(session: SessionContext, args):
     if not args:
-        session.print('Usage: run wiper <session_id> <remote_file_path>', 'red')
+        session.print('Usage: run wiper <remote_file_path>', 'red')
         return 1
 
     remote_path = ' '.join(args).strip().strip('"').strip("'")
     if not remote_path:
-        session.print('Usage: run wiper <session_id> <remote_file_path>', 'red')
+        session.print('Usage: run wiper <remote_file_path>', 'red')
         return 1
 
     session.log_event(f'Plugin wiper: started for {remote_path}')

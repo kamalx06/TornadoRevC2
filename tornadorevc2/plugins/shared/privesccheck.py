@@ -82,7 +82,7 @@ try {{
 
 def _resolve_local_path(args):
     if not args:
-        return None, 'Usage: run privesccheck <session_id> <local_script>'
+        return None, 'Usage: run privesccheck <local_script>'
     raw = ' '.join(args).strip().strip('"').strip("'")
     if not raw:
         return None, 'Local script path is required'

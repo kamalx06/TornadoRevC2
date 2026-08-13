@@ -25,7 +25,7 @@ MAIN_COMMANDS = (
 CLIENT_COMMANDS = (
     'upload', 'download', 'verify', 'hash', 'sysinfo', 'help',
     'runpy', 'runps', 'runexe', 'runelf', 'clipboard',
-    'socks', 'tunnels',
+    'socks', 'tunnels', 'export', 'plugins', 'run',
     'exit', 'quit', 'e', 'q',
 )
 ID_COMMANDS = {

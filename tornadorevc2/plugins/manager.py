@@ -424,7 +424,7 @@ class PluginManager:
 
 
 
-    def handle_command(self, cmd_parts: List[str]) -> bool:
+    def handle_command(self, cmd_parts: List[str], client_sock=None) -> bool:
 
         if not cmd_parts:
 
@@ -435,6 +435,18 @@ class PluginManager:
 
 
         if cmd == 'run':
+
+            if client_sock is not None:
+
+                if len(cmd_parts) < 2:
+
+                    print(f"{self._colors()['red']}Usage: run <plugin> [args...]{self._colors()['end']}")
+
+                    return True
+
+                return self.run_plugin(cmd_parts[1], client_sock, cmd_parts[2:])
+
+
 
             if len(cmd_parts) < 3:
 
@@ -533,6 +545,10 @@ class PluginManager:
                                           wiper:     run wiper <ID> <remote_file_path>
 
                                           privesccheck: run privesccheck <ID> <local_script>
+
+
+
+    {c['yellow']}Inside a client shell, omit session_id: run <plugin> [args...]{c['end']}
 
 
 

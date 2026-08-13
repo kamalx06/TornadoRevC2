@@ -664,9 +664,16 @@ class SessionExporter:
         print(f"{self.h.colors['cyan']}  {os.path.abspath(out_path)}{self.h.colors['end']}")
         return True
 
-    def handle_command(self, cmd_parts):
+    def handle_command(self, cmd_parts, client_sock=None):
         if not cmd_parts or cmd_parts[0].lower() != 'export':
             return False
+        if client_sock is not None:
+            info = self.h._client_info(client_sock)
+            if not info:
+                print(f"{self.h.colors['red']}Client disconnected{self.h.colors['end']}")
+                return True
+            self.export_session(info['id'])
+            return True
         if len(cmd_parts) < 2:
             print(f"{self.h.colors['red']}Usage: export <session_id>{self.h.colors['end']}")
             return True
