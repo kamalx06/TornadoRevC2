@@ -39,7 +39,28 @@ _emit(result)
 
 
 def _build_linux_command():
-    return build_linux_collector_command(_linux_collector_source())
+    mark_s = PLUGIN_MARK_START
+    mark_e = PLUGIN_MARK_END
+    py_cmd = build_linux_collector_command(_linux_collector_source())
+    if py_cmd.endswith('; true'):
+        py_cmd = py_cmd[:-6].rstrip()
+    shell_cmd = (
+        f"(T=''; "
+        f"command -v wl-paste >/dev/null 2>&1 && T=$(wl-paste --no-newline 2>/dev/null); "
+        f"[ -z \"$T\" ] && command -v wl-paste >/dev/null 2>&1 && T=$(wl-paste 2>/dev/null); "
+        f"[ -z \"$T\" ] && command -v xclip >/dev/null 2>&1 && T=$(xclip -o -selection clipboard 2>/dev/null); "
+        f"[ -z \"$T\" ] && command -v xsel >/dev/null 2>&1 && T=$(xsel -p -b 2>/dev/null); "
+        f"[ -z \"$T\" ] && command -v xsel >/dev/null 2>&1 && T=$(xsel --clipboard --output 2>/dev/null); "
+        f"printf '%s' '{mark_s}'; "
+        f"if [ -n \"$T\" ]; then "
+        f"printf '{{\"ok\":true,\"text\":\"%s\",\"tool\":\"shell\",\"reason\":\"\"}}' "
+        f"\"$(printf '%s' \"$T\" | sed 's/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g')\"; "
+        f"else "
+        f"printf '{{\"ok\":false,\"text\":\"\",\"tool\":\"\",\"reason\":\"No clipboard utility available (install wl-clipboard, xclip, or xsel)\"}}'; "
+        f"fi; "
+        f"printf '%s' '{mark_e}')"
+    )
+    return f"{py_cmd} || {shell_cmd}; true"
 
 
 def _build_windows_command():
@@ -84,6 +105,7 @@ def run(session: SessionContext, args):
         win_ps = _build_windows_command()
     elif platform in ('unix', 'linux'):
         unix_cmd = _build_linux_command()
+        platform = 'unix'
     else:
         win_ps = _build_windows_command()
         unix_cmd = _build_linux_command()
@@ -91,7 +113,7 @@ def run(session: SessionContext, args):
 
     raw = _run_collector_marked(session, unix_cmd, win_ps, platform, 20.0)
 
-    if raw is None:
+    if not raw or not raw.strip():
         session.print("Plugin 'clipboard' failed — no response from target.", 'red')
         session.log_plugin_result('clipboard', '', 'no response (timeout or missing markers)')
         return 1

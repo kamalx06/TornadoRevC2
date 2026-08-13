@@ -242,7 +242,32 @@ On Windows, plugin scripts are delivered in-process on PowerShell interactive se
 
 ### Writing a custom plugin
 
-Register a handler with the `@plugin.command` decorator:
+Plugins are plain Python modules that register one or more commands with `@plugin.command`. Each handler receives a `SessionContext` for the target session and an `args` list containing any extra tokens passed on the command line.
+
+#### Where to put plugins
+
+| Location | When to use |
+|----------|-------------|
+| `./plugins/myplugin.py` | External plugins loaded at runtime (default search path) |
+| `./plugins/myplugin/__init__.py` | External plugin packaged as a directory |
+| Custom path via `TORNADOREVC2_PLUGIN_DIR` | Shared or non-repo plugin directories |
+| `tornadorevc2/plugins/shared/` or `linux/` / `windows/` | Built-in plugins shipped with the project |
+
+Load and run an external plugin:
+
+```bash
+plugins load myplugin          # import and register commands
+plugins info myplugin          # verify name, platforms, and description
+run myplugin 1                 # execute against session 1
+run myplugin 1 --verbose       # args after the session ID are passed to the handler
+plugins reload myplugin        # re-import after editing the file
+```
+
+When attached to a session (`switch <ID>`), omit the session ID: `run myplugin`.
+
+#### Pattern 1 — Simple shell plugin
+
+Use this for quick one-off commands that do not need structured parsing. The handler runs a shell command, prints output, and logs the result.
 
 ```python
 from tornadorevc2.plugins import plugin, SessionContext
@@ -250,21 +275,189 @@ from tornadorevc2.plugins import plugin, SessionContext
 @plugin.command(
     name="myplugin",
     platforms=["linux", "windows", "unix"],
-    description="Custom enumeration plugin",
+    description="Run whoami on the remote host",
 )
 def run(session: SessionContext, args):
-    output = session.run_shell("whoami")
-    session.print(output, "cyan")
-    session.log_plugin_result("myplugin", output)
+    session.log_event("Plugin myplugin: started")
+
+    if session.is_windows:
+        cmd = "whoami"
+    else:
+        cmd = "id 2>/dev/null || whoami"
+
+    output = session.run_shell(cmd, timeout=10.0)
+    if not output.strip():
+        session.print("Plugin 'myplugin' failed — no output from target.", "red")
+        return 1
+
+    session.print(output.strip(), "cyan")
+    session.log_plugin_result("myplugin", output.strip())
+    session.log_command("run myplugin", output.strip())
     return 0
 ```
 
-Place the module in `./plugins/myplugin.py`, then:
+**Return codes:** `0` = success, non-zero = failure. The handler console displays plugin failures based on this value.
+
+#### Pattern 2 — Structured collector plugin (recommended)
+
+For enumeration plugins, collect data on the target as JSON, wrap it in marker tokens, and let the shared runner parse and format the report. This is the pattern used by built-in plugins such as `history`, `mounts`, and `services`.
+
+**Flow:**
+
+```text
+Handler                         Target host
+  │                                  │
+  ├─ flush shell buffer              │
+  ├─ send collector script ─────────►│  (Python on Linux, PowerShell on Windows)
+  │                                  ├─ gather data into a dict
+  │                                  ├─ emit __T_PLUGIN_START__ + JSON + __T_PLUGIN_END__
+  │◄─────────────────────────────────┤
+  ├─ parse JSON                      │
+  ├─ format report                   │
+  └─ write logs/plugins/<name>/        │
+```
+
+**Cross-platform example** (`plugins/processes.py`):
+
+```python
+"""Example cross-platform process enumeration plugin."""
+
+from tornadorevc2.plugins import plugin, SessionContext
+from tornadorevc2.plugins.linux._helpers import build_linux_collector_command
+from tornadorevc2.plugins.shared.common import format_generic_report
+from tornadorevc2.plugins.shared.runner import run_collector_plugin
+from tornadorevc2.constants import PLUGIN_MARK_END, PLUGIN_MARK_START
+
+
+def _linux_collector_source():
+    # Runs inside a try/except wrapper on the target. Call _emit(result) with a dict.
+    return r'''
+import subprocess
+result = {'summary': {}, 'processes': []}
+try:
+    out = subprocess.check_output(['ps', 'auxww'], stderr=subprocess.STDOUT, timeout=10)
+    text = out.decode('utf-8', errors='replace')
+    lines = [l for l in text.splitlines() if l.strip()]
+    result['summary'] = {'count': max(0, len(lines) - 1)}
+    result['processes'] = lines[1:51]
+except Exception as exc:
+    result['summary'] = {'error': str(exc)}
+_emit(result)
+'''
+
+
+def _build_linux_command():
+    return build_linux_collector_command(_linux_collector_source())
+
+
+def _build_windows_command():
+    return rf"""
+$ErrorActionPreference='SilentlyContinue'
+$start='{PLUGIN_MARK_START}'; $end='{PLUGIN_MARK_END}'
+$procs = Get-CimInstance Win32_Process -EA 0 |
+  Select-Object -First 50 ProcessId, Name, CommandLine, ExecutablePath
+$result = [ordered]@{{
+  summary = @{{ count = @($procs).Count }}
+  processes = @($procs)
+}}
+Write-Output ($start + (ConvertTo-Json $result -Depth 4 -Compress) + $end)
+"""
+
+
+@plugin.command(
+    name="processes",
+    platforms=["linux", "windows", "unix"],
+    description="List running processes on the remote host",
+)
+def run(session: SessionContext, args):
+    return run_collector_plugin(
+        session,
+        "processes",
+        _build_linux_command,      # callable — built at execution time
+        _build_windows_command,
+        format_generic_report,       # turns JSON dict into operator-facing text
+        timeout=25.0,
+    )
+```
+
+After saving the file:
 
 ```bash
-plugins load myplugin
-run myplugin 1
+plugins load processes
+run processes 1
 ```
+
+Reports appear in the handler console and under `logs/<session>/plugins/processes/`.
+
+#### Collector conventions
+
+**Linux / Unix collectors**
+
+- Write the collector body as a string returned from `_linux_collector_source()`.
+- Finish by calling `_emit(result)` with a JSON-serializable dict. Do not print markers yourself — `build_linux_collector_command()` wraps the source in a helper that catches exceptions and always emits marked JSON.
+- Prefer short, focused collectors. Very large scripts are staged to `/tmp` automatically.
+- Use `subprocess.check_output(..., timeout=N)` and trim large lists before emitting.
+
+**Windows collectors**
+
+- Return a PowerShell script string from `_build_windows_command()`.
+- Set `$start='__T_PLUGIN_START__'` and `$end='__T_PLUGIN_END__'`, build a `$result` hashtable, then:
+
+  ```powershell
+  Write-Output ($start + (ConvertTo-Json $result -Depth 5 -Compress) + $end)
+  ```
+
+- Brace-doubling (`{{` / `}}`) is required inside Python f-strings.
+- Keep scripts compact; interactive PowerShell sessions execute them in-process.
+
+**JSON payload shape**
+
+| Key | Purpose |
+|-----|---------|
+| `summary` | Counts and high-level stats shown at the top of generic reports |
+| `error` | Collector exception message — runner treats this as a hard failure |
+| `reason` | Operational failure (e.g. missing tool) — use for soft failures you format yourself |
+| Lists of dicts | Rendered as tables by `format_generic_report()` |
+| Nested dicts | Rendered as labeled sections |
+
+Custom formatters receive the parsed dict and return a string. Example:
+
+```python
+def format_process_report(data: dict) -> str:
+    if data.get("error"):
+        return f"Collection failed: {data['error']}"
+    lines = [f"Processes: {data.get('summary', {}).get('count', 0)}"]
+    for entry in data.get("processes", [])[:10]:
+        lines.append(f"  {entry}")
+    return "\n".join(lines)
+```
+
+Pass `format_process_report` instead of `format_generic_report` to `run_collector_plugin`.
+
+**Platform-specific plugins**
+
+For Windows-only plugins, pass `None` as the Linux builder:
+
+```python
+return run_collector_plugin(session, "services", None, build_command, format_generic_report)
+```
+
+For Linux-only plugins, pass `None` as the Windows builder. Set `platforms=["linux", "unix"]` on the decorator so the command is hidden on Windows sessions.
+
+#### Handling arguments
+
+Extra tokens after the session ID are passed as `args: list[str]`. Validate and use them inside the handler:
+
+```python
+def run(session: SessionContext, args):
+    if not args:
+        session.print("Usage: run wiper <ID> <remote_file_path>", "yellow")
+        return 1
+    remote_path = args[0]
+    ...
+```
+
+See the built-in `wiper` and `privesccheck` plugins for file-path and local-script argument patterns.
 
 #### SessionContext API
 
@@ -277,7 +470,17 @@ run myplugin 1
 | Host info | `collect_sysinfo()`, `get_cwd()` |
 | Output | `print(text, color)` |
 
-For structured JSON collectors, use `run_collector_plugin` from `tornadorevc2.plugins.shared.runner` with platform-specific command builders. See `tornadorevc2/plugins/shared/history.py` or `tornadorevc2/plugins/windows/services.py` for reference implementations.
+#### Reference implementations
+
+| Plugin | File | Notes |
+|--------|------|-------|
+| `history` | `tornadorevc2/plugins/shared/history.py` | Cross-platform collector with Linux Python + Windows PowerShell builders |
+| `clipboard` | `tornadorevc2/plugins/shared/clipboard.py` | Custom run handler, soft failures via `reason`, shell fallback on Linux |
+| `services` | `tornadorevc2/plugins/windows/services.py` | Windows-only collector, minimal entry point |
+| `secrets` | `tornadorevc2/plugins/linux/secrets.py` | Linux-only collector |
+| `wiper` | `tornadorevc2/plugins/shared/wiper.py` | Argument validation and destructive action pattern |
+
+For structured JSON collectors, start from `run_collector_plugin` in `tornadorevc2/plugins/shared/runner.py` and copy the layout from `history.py`.
 
 ---
 
