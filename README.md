@@ -1,11 +1,8 @@
 # TornadoRevC2
 
-**TornadoRevC2** is a Python-based reverse shell handler designed for authorized security research, red-team engagements, malware analysis, and penetration testing. It provides an operator-focused console for managing interactive sessions on Linux and Windows hosts, with built-in support for encrypted transport, file transfer, in-memory execution, network pivoting, and extensible host enumeration.
+A lightweight, modular post-exploitation framework for authorized security research, red-team operations, and penetration testing. TornadoRevC2 manages reverse shell sessions on Linux and Windows hosts through a unified operator console, extending core session handling with a cross-platform plugin architecture for host enumeration, situational awareness, and operational tasks.
 
-> **Scope:** TornadoRevC2 is a session handler—not a beacon-style command-and-control framework. It prioritizes reliable interactive shells, structured operator workflows, and on-demand enumeration through a modular plugin system.
-
-**Primary targets:** Linux and Windows  
-**Secondary support:** Generic Unix and BSD environments where applicable
+> **Important:** TornadoRevC2 is a session handler and post-exploitation framework—not a beacon-style command-and-control platform. It prioritizes reliable interactive shells, structured operator workflows, and on-demand plugin execution over persistent agent infrastructure.
 
 ---
 
@@ -17,14 +14,32 @@ Use this software only on systems you own or on systems where you have **explici
 
 ## Table of Contents
 
-- [Overview](#overview)
-- [Requirements](#requirements)
-- [Installation](#installation)
+- [Introduction](#introduction)
+- [Key Features](#key-features)
+- [Design Philosophy](#design-philosophy)
+- [Architecture](#architecture)
+- [Requirements & Installation](#requirements--installation)
 - [Quick Start](#quick-start)
 - [Operator Reference](#operator-reference)
-- [Core Capabilities](#core-capabilities)
-- [Plugin System](#plugin-system)
 - [Built-in Plugins](#built-in-plugins)
+- [Plugin Development](#plugin-development)
+  - [Plugin system overview](#plugin-system-overview)
+  - [Plugin placement](#plugin-placement)
+  - [Registration](#registration)
+  - [Execution lifecycle](#execution-lifecycle)
+  - [Pattern 1: Simple shell plugin](#pattern-1-simple-shell-plugin)
+  - [Pattern 2: Structured collector](#pattern-2-structured-collector-recommended)
+  - [Pattern 3: Custom handler](#pattern-3-custom-handler)
+  - [Linux collectors](#linux-collectors)
+  - [Windows collectors](#windows-collectors)
+  - [JSON payload conventions](#json-payload-conventions)
+  - [Custom formatters](#custom-formatters)
+  - [Platform-specific plugins](#platform-specific-plugins)
+  - [External plugins](#external-plugins)
+  - [SessionContext API](#sessioncontext-api)
+  - [Error handling & return codes](#error-handling--return-codes)
+  - [Best practices](#best-practices)
+  - [Reference implementations](#reference-implementations)
 - [Session Logging](#session-logging)
 - [Project Structure](#project-structure)
 - [TLS Configuration](#tls-configuration)
@@ -32,40 +47,94 @@ Use this software only on systems you own or on systems where you have **explici
 
 ---
 
-## Overview
+## Introduction
 
-TornadoRevC2 accepts inbound reverse shell connections over plain TCP or TLS and exposes a unified operator interface for session management, host reconnaissance, file operations, and post-exploitation tasks.
+TornadoRevC2 accepts inbound reverse shell connections over plain TCP or TLS and provides a single interface for session management, host reconnaissance, file operations, network pivoting, and post-exploitation tasks. The project evolved from a basic reverse shell handler into a modular framework where each capability—firewall enumeration, credential store metadata, network mapping, browser profiling, and more—is delivered as an independent plugin.
 
-| Capability | Status |
-|------------|--------|
-| Multi-client TCP and TLS listeners | Supported |
-| Interactive PTY/TTY sessions | Supported |
-| Chunked file transfer with resume | Supported |
-| SHA-256 file integrity verification | Supported |
-| In-memory payload execution | Supported |
-| SOCKS5 pivoting through sessions | Supported |
-| Session fingerprinting and reconnect tracking | Supported |
-| Runtime plugin loading and reload | Supported |
-| Automated persistence or task scheduling | Not supported |
+**Supported platforms:** Linux and Windows (primary); generic Unix and BSD environments where applicable.
 
 ---
 
-## Requirements
+## Key Features
 
-- **Python** 3.7 or later
-- **OpenSSL** (for TLS certificate generation)
-- **No third-party Python packages** required for the core handler
+| Category | Capabilities |
+|----------|-------------|
+| **Session handling** | Multi-client TCP/TLS listeners, interactive PTY/TTY sessions, session fingerprinting, reconnect tracking |
+| **Transfer & execution** | Chunked file transfer with resume and SHA-256 verification; in-memory payload execution (`py`, `ps`, `exe`, `elf`, `bat`, `sh`) |
+| **Network operations** | SOCKS5 pivoting through compromised sessions with automatic remote cleanup |
+| **Enumeration** | 28 built-in plugins covering host triage, network posture, credentials metadata, browsers, VPN/proxy config, and more |
+| **Operational plugins** | Secure file wiping, shell history clearing, Windows event log clearing |
+| **Extensibility** | Runtime plugin loading, reload, and external plugin support via `TORNADOREVC2_PLUGIN_DIR` |
+| **Reporting** | Per-session logging, structured plugin output, HTML transcript export |
 
-Optional on target hosts (depending on plugin and feature usage):
+**Not supported:** Automated persistence, task scheduling, or beacon-style callback infrastructure.
+
+---
+
+## Design Philosophy
+
+TornadoRevC2 is engineered for environments where deployment friction and operational footprint matter.
+
+### Dependency-light, native-command design
+
+Plugins leverage **native Windows and Linux utilities and built-in system commands** already present on the target host—`netsh`, `ss`, `iptables`, `ufw`, `firewall-cmd`, `nft`, PowerShell cmdlets, `nmcli`, `wevtutil`, and others. Collectors invoke these tools through the reverse shell channel and parse output remotely, minimizing the need to upload additional binaries or install dependencies.
+
+### No target-side artifact drops
+
+**Plugin operations execute through the existing reverse shell channel and do not require dropping binaries, executables, scripts, or temporary files onto the target system.** Enumeration tasks run as native commands or in-process collector scripts; results return as marked JSON over the shell. The only unavoidable artifact is normal command history generated by the shell itself.
+
+### Graceful degradation
+
+When an enumeration routine fails, is unavailable, or times out, the plugin does not abort entirely. The affected section is left empty or marked `N/A` while the remainder of the report continues.
+
+---
+
+## Architecture
+
+```text
+┌─────────────────────────────────────────────────────────────────┐
+│                     Operator Console (handler)                  │
+│  Sessions · Transfers · SOCKS · Plugins · Logging · Export      │
+└────────────────────────────┬────────────────────────────────────┘
+                             │ reverse shell channel (TCP/TLS)
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                        Target Host                              │
+│  Native commands · PowerShell · inline collectors               │
+│  __T_PLUGIN_START__ + JSON + __T_PLUGIN_END__                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Plugin layout
+
+```text
+tornadorevc2/plugins/
+  shared/     Cross-platform plugins with internal Windows/Linux implementations
+  linux/      Linux/Unix-only plugins and collector builders
+  windows/    Windows-only plugins (rdp, services, eventlogdel, …)
+  api.py      SessionContext and @plugin.command registration
+  manager.py  Runtime loading, execution, and platform filtering
+  loader.py   Automatic module discovery
+```
+
+**Shared plugins** (`firewall`, `ports`, `browser`, `credstore`, and others) exist as single unified modules in `shared/`. **Platform-specific plugins** such as `rdp` and `eventlogdel` reside exclusively under `windows/` or `linux/` and are not duplicated in `shared/`.
+
+Collectors emit JSON wrapped in marker tokens (`__T_PLUGIN_START__` / `__T_PLUGIN_END__`). The shared runner parses this output, formats an operator-facing report, and persists results under the session log directory.
+
+---
+
+## Requirements & Installation
+
+**Handler (operator machine):**
+
+- Python 3.7 or later
+- OpenSSL (for TLS certificate generation)
+- No third-party Python packages required
+
+**Target host (varies by plugin):**
 
 - Python 2/3, PowerShell, or standard Unix utilities for collectors
-- `wl-clipboard`, `xclip`, or `xsel` for clipboard enumeration on Linux graphical sessions
-
----
-
-## Installation
-
-Clone the repository and run the handler directly—no package installation step is required.
+- Optional: `wl-clipboard` / `xclip` / `xsel` (Linux clipboard); `import` / `scrot` / `gnome-screenshot` (Linux screenshot)
 
 ```bash
 git clone <repository-url>
@@ -77,34 +146,37 @@ python tornadorevc2.py
 
 ## Quick Start
 
-### Start the handler
+### 1. Start the handler
 
 ```bash
-# Default: TCP listener on port 4444, TLS listener on port 8443
+# Default: TCP on 4444, TLS on 8443
 python tornadorevc2.py
 
 # Custom bind address, ports, and TLS material
 python tornadorevc2.py -H 0.0.0.0 -p 4444 -tp 8443 -c server.pem -k server.key
 ```
 
-### Establish a session
+### 2. Establish a session
 
-Deploy a reverse shell payload from the built-in catalog (`payloads` command) or use your own implant. When a client connects, TornadoRevC2 assigns a session ID and begins logging activity under `logs/`.
+Deploy a reverse shell from the built-in catalog (`payloads`) or use your own implant. On connect, TornadoRevC2 assigns a session ID and begins logging under `logs/`.
 
-### Typical workflow
+### 3. Operate
 
 ```bash
 status                          # List active sessions
 switch 1                        # Attach to session 1
-sysinfo 1                       # Collect host information
+sysinfo 1                       # Collect host metadata
 run quickenum 1                 # Fast structured triage
-run history 1                   # Shell history and login activity
-run mounts 1                    # Mounts, shares, and filesystem layout
-run inmemory 1 sh ./linpeas.sh           # Shell script (e.g. LinPEAS)
-run inmemory 1 bat C:\tools\winPEAS.bat  # Batch script (e.g. WinPEAS)
+run firewall 1                  # Firewall status and rules
+run ports 1                     # Listening ports and routing
+run browser 1                   # Installed browsers and profiles
+run credstore 1                 # Credential store metadata
+run memorymap 1 1234            # Process memory maps (requires PID)
+run screenshot 1                # Desktop capture (GUI sessions)
+run inmemory 1 sh ./linpeas.sh  # In-memory script execution
 ```
 
-When attached to a session via `switch <ID>`, omit the session ID from commands that normally require one (for example, `run quickenum` instead of `run quickenum 1`). Inside a client session, plugin listings, TAB completion, and execution are limited to plugins compatible with that session's operating system (shared plugins plus Windows- or Linux-specific plugins as appropriate). The main handler console always shows and can run all registered plugins.
+When attached via `switch <ID>`, omit the session ID from subsequent commands (`run quickenum` instead of `run quickenum 1`). Plugin listings and TAB completion inside a client session are filtered to plugins compatible with that session's platform.
 
 ---
 
@@ -119,7 +191,7 @@ When attached to a session via `switch <ID>`, omit the session ID from commands 
 | `reconnects` | Display session reconnect history |
 | `switch <ID>` | Attach to an interactive session shell |
 | `kill <ID>` | Terminate a session |
-| `rename <ID> <name>` / `rn <ID> <name>` | Assign a friendly name to a session |
+| `rename <ID> <name>` / `rn <ID> <name>` | Assign a friendly name |
 | `sysinfo <ID> [--stealth\|--full]` | Collect or refresh host information |
 | `export <ID>` | Export an HTML session transcript |
 
@@ -129,33 +201,27 @@ When attached to a session via `switch <ID>`, omit the session ID from commands 
 |---------|-------------|
 | `plugins` / `plugins list` | List registered plugins |
 | `plugins list --verbose` | Show module paths and load state |
-| `plugins load <name>` | Load a plugin at runtime |
+| `plugins load <name>` | Load an external plugin at runtime |
 | `plugins unload <name>` | Disable or unload a plugin |
 | `plugins reload <name>` | Reload a plugin module |
 | `plugins info <name>` | Display plugin metadata |
 | `run <plugin> <ID> [args...]` | Execute a plugin against a session |
 
-From the main handler (`tornado>`), all registered plugins are listed, suggested by TAB completion, and runnable via `run <plugin> <ID> ...`.
-
-Inside an attached client session (`switch <ID>`), omit `<ID>` from plugin commands. Plugin listings, TAB completion, and execution are filtered to plugins compatible with that session's platform: **shared plugins** are available on both Windows and Linux/Unix sessions; **Windows-only** and **Linux/Unix-only** plugins appear only in matching sessions. The main handler is unaffected—operators can still target any session with any plugin from `tornado>`.
-
 ### File transfer
 
 | Command | Description |
 |---------|-------------|
-| `upload [--resume] <ID> <local> <remote>` | Upload a file with chunked transfer |
-| `download [--resume] <ID> <remote> <local>` | Download a file with chunked transfer |
+| `upload [--resume] <ID> <local> <remote>` | Upload with chunked transfer |
+| `download [--resume] <ID> <remote> <local>` | Download with chunked transfer |
 | `verify <ID> <remote>` / `hash <ID> <remote>` | Verify remote file size and SHA-256 |
-
-Inside an attached shell, omit `<ID>` from transfer commands.
 
 ### In-memory execution
 
 | Command | Description |
 |---------|-------------|
-| `run inmemory <ID> <filetype> <local_file> [-- args] [--save-output <file>]` | Unified in-memory execution (`py`, `ps`, `exe`, `elf`, `bat`, `sh`) |
+| `run inmemory <ID> <type> <local_file> [-- args] [--save-output <file>]` | Execute payload in memory |
 
-Inside an attached shell, omit `<ID>`: `run inmemory <filetype> <local_file> [...]`
+Supported types: `py`, `ps`, `exe`, `elf`, `bat`, `sh`
 
 ### Network pivoting
 
@@ -164,8 +230,6 @@ Inside an attached shell, omit `<ID>`: `run inmemory <filetype> <local_file> [..
 | `socks <ID> <listen_port>` | Start a SOCKS5 proxy through a session |
 | `socks stop <proxy_id>` | Stop a proxy and clean up remote artifacts |
 | `tunnels` | List active SOCKS proxies |
-
-When the last SOCKS proxy for a session is stopped, or when the session disconnects, TornadoRevC2 terminates the remote tunnel agent and removes associated staging files.
 
 ### General
 
@@ -177,184 +241,253 @@ When the last SOCKS proxy for a session is stopped, or when the session disconne
 
 ---
 
-## Core Capabilities
+## Built-in Plugins
 
-### Listeners
+TornadoRevC2 ships with **28 built-in plugins** organized by function. All enumeration plugins are read-only unless noted otherwise.
 
-Plain TCP and TLS listeners operate concurrently. The TLS listener enforces TLS 1.2 or later and accepts configurable certificate and key paths.
+### Host assessment & environment
 
-### Session management
+| Plugin | Platform | Description |
+|--------|----------|-------------|
+| `quickenum` | Cross-platform | Fast structured host triage: identity, network, environment, prioritized findings |
+| `virtualization` | Cross-platform | Virtualization, container, orchestration, and cloud environment detection |
+| `sysinfo` | Cross-platform | Host metadata collection (handler command, not a plugin) |
 
-Sessions are tracked with stable fingerprinting derived from host identity signals. Reconnecting clients can be mapped to prior session metadata, log directories, and collected sysinfo. All session state mutations are guarded for thread-safe multi-operator use.
+### Network & connectivity
 
-### Host information
+| Plugin | Platform | Description |
+|--------|----------|-------------|
+| `firewall` | Cross-platform | Firewall status, profiles/zones, policies, and notable rules (WDF, UFW, firewalld, nftables, iptables) |
+| `ports` | Cross-platform | Listening ports, established connections, owning processes, and routing |
+| `proxy` | Cross-platform | System, environment, PAC/WPAD, and browser proxy settings |
+| `vpn` | Cross-platform | VPN clients, active connections, adapters, and configuration metadata |
 
-The `sysinfo` command collects host metadata on demand. Stealth mode (default) minimizes remote footprint; `--full` expands collection breadth for deeper baseline enumeration.
+### Credentials, browsers & applications
 
-### File transfer
+| Plugin | Platform | Description |
+|--------|----------|-------------|
+| `credstore` | Cross-platform | Credential store metadata (no secret extraction): Credential Manager, keyrings, browser stores |
+| `browser` | Cross-platform | Installed browsers, profiles, extensions, bookmarks, and enterprise policies |
+| `clipboard` | Cross-platform | Remote clipboard text capture |
+| `secrets` | Linux/Unix | Configuration files, environment variables, SSH keys, and cloud credentials |
 
-Uploads and downloads use chunked I/O with SHA-256 verification. The `--resume` flag allows interrupted transfers to continue from the last confirmed offset.
+### Host internals
 
-### In-memory execution
+| Plugin | Platform | Description |
+|--------|----------|-------------|
+| `history` | Cross-platform | Shell history, package/update logs, and recent login activity |
+| `mounts` | Cross-platform | Mount points, SMB/NFS shares, mapped drives, container filesystems |
+| `memorymap` | Cross-platform | Process memory maps and loaded modules for a specified PID |
+| `screenshot` | Cross-platform | Desktop capture returned to the operator (GUI sessions; PNG saved locally) |
+| `cron` | Linux/Unix | Cron jobs, system crontabs, user crontabs, and at queues |
+| `systemd` | Linux/Unix | Services, timers, failed units, and enabled startup units |
 
-Payloads are staged and executed in memory where supported, with optional stdout/stderr capture to a local file. Windows PE payloads use process hollowing (RunPE) — the image is mapped into a suspended host process without writing a temporary executable to disk.
+### Windows domain & system
 
-All in-memory execution lives in the `inmemory` shared plugin (`tornadorevc2/plugins/shared/inmemory.py`).
+| Plugin | Platform | Description |
+|--------|----------|-------------|
+| `adinfo` | Windows | Domain membership, domain controllers, forests, trusts, and OUs |
+| `services` | Windows | Windows services, startup types, binaries, and service accounts |
+| `scheduledtasks` | Windows | Scheduled tasks, triggers, execution context, and actions |
+| `registry` | Windows | Autorun keys, startup locations, and installed software |
+| `eventlogs` | Windows | Security, System, Application, and PowerShell log summaries |
+| `defender` | Windows | Microsoft Defender status, exclusions, ASR rules, and third-party AV |
+| `certificates` | Windows | Certificate stores, code-signing, and enterprise certificates |
+| `rdp` | Windows | Remote Desktop configuration, status, recent targets, and settings |
 
-| Filetype | Method |
-|----------|--------|
-| `py` | Python — in-memory via `exec(compile(...))` on Unix and Windows |
-| `ps` | PowerShell — in-memory via `Invoke-Expression` |
-| `exe` | Windows PE — in-memory RunPE (process hollowing) with output capture |
-| `elf` | Linux ELF — `memfd_create` with `/dev/shm` fallback |
-| `sh` | Shell script — verified transfer, streams via `bash -s` |
-| `bat` | Batch script — verified transfer, streamed in-memory via `cmd.exe /Q` stdin |
+### Execution & operational
+
+| Plugin | Platform | Description |
+|--------|----------|-------------|
+| `inmemory` | Cross-platform | In-memory payload execution (`py`, `ps`, `exe`, `elf`, `bat`, `sh`) |
+| `wiper` | Cross-platform | Multi-pass secure file overwrite followed by deletion |
+| `historydel` | Cross-platform | Clear current user shell history files and related storage |
+| `eventlogdel` | Windows | Clear Windows Event Logs via native `wevtutil` / `Clear-EventLog` |
+
+### Common usage examples
 
 ```bash
-run inmemory 1 py /tools/script.py
+# Reconnaissance
+run quickenum 1
+run firewall 1
+run ports 1
+run browser 1
+run credstore 1
+run vpn 1
+run proxy 1
+
+# Deep-dive
+run virtualization 1
+run memorymap 1 1234
+run secrets 1              # Linux/Unix
+run services 1             # Windows
+run rdp 1                  # Windows
+run eventlogs 1            # Windows
+
+# Operational
+run screenshot 1
 run inmemory 1 sh ./linpeas.sh
 run inmemory 1 bat C:\tools\winPEAS.bat
-run inmemory 1 exe C:\tools\payload.exe -- --flag value
-run inmemory 1 exe beacon.exe --save-output C:\local\output.txt
+run historydel 1
+run eventlogdel 1          # Windows; Security log requires admin
+run wiper 1 /tmp/staging.dat
 ```
 
-### SOCKS5 pivoting
+**In-memory execution methods:**
 
-Route operator tooling through a compromised host to reach otherwise unreachable internal networks. Remote cleanup is performed automatically when proxies are stopped or sessions drop.
+| Type | Method |
+|------|--------|
+| `py` | Python via `exec(compile(...))` |
+| `ps` | PowerShell via `Invoke-Expression` |
+| `exe` | Windows PE via in-memory RunPE (process hollowing) |
+| `elf` | Linux ELF via `memfd_create` with `/dev/shm` fallback |
+| `sh` | Shell script streamed via `bash -s` |
+| `bat` | Batch script streamed via `cmd.exe /Q` stdin |
 
-### Session export
-
-Generate HTML transcripts of operator activity for reporting, peer review, or engagement documentation.
+PEASS-ng scripts: [github.com/carlospolop/PEASS-ng](https://github.com/carlospolop/PEASS-ng)
 
 ---
 
-## Plugin System
+## Plugin Development
 
-Plugins extend TornadoRevC2 at runtime without modifying core handler code. Built-in plugins ship under `tornadorevc2/plugins/`. External plugins may be placed in a top-level `plugins/` directory or loaded from a custom path via the `TORNADOREVC2_PLUGIN_DIR` environment variable.
+This section describes how to extend TornadoRevC2 with custom plugins. Plugins are plain Python modules that register commands with `@plugin.command` and receive a `SessionContext` for the target session. No changes to core handler code are required.
 
-### Discovery and lifecycle
+### Plugin system overview
 
-- Built-in modules are discovered automatically at handler startup.
-- External modules are loaded on demand with `plugins load <name>`.
-- Built-in plugins are **soft-disabled** by `plugins unload` (the module remains imported).
-- External plugins are **fully unloaded** and unregistered.
-- `plugins reload` removes stale command registrations before re-importing, preventing orphaned entries after renames.
+The plugin system has four layers:
 
-### Platform filtering in client sessions
+| Layer | Module | Responsibility |
+|-------|--------|----------------|
+| **Registration** | `plugins/api.py` | `@plugin.command` decorator, global command registry, `SessionContext` |
+| **Discovery** | `plugins/loader.py` | Scans `shared/`, `linux/`, `windows/`, and external directories; imports modules |
+| **Execution** | `plugins/manager.py` | Resolves platform, builds context, invokes handler, handles errors |
+| **Collectors** | `plugins/shared/runner.py` | Marker parsing, JSON extraction, report formatting, logging |
 
-Each plugin declares supported platforms via `@plugin.command(platforms=[...])`. At execution time, the handler checks compatibility with the target session's OS.
+At import time, the `@plugin.command` decorator registers each handler in a thread-safe global registry. At runtime, `PluginManager.run_plugin()` validates platform compatibility, constructs a `SessionContext`, and calls the handler with `(session, args)`.
 
-When attached to a client session (`switch <ID>`), plugin discovery is scoped to that session:
+Handlers return an integer exit code: `0` for success, non-zero for failure. The handler console displays warnings for non-zero returns.
 
-| Context | Plugin listing | TAB completion | Execution |
-|---------|----------------|----------------|-----------|
-| Main handler (`tornado>`) | All plugins | All plugins | All plugins (with per-session platform check) |
-| Client session | Shared + OS-specific only | Shared + OS-specific only | Shared + OS-specific only |
+### Plugin placement
 
-Shared plugins (for example `quickenum`, `history`, `inmemory`, `mounts`) are available in both Windows and Linux/Unix sessions. Windows-only plugins (for example `services`, `registry`) appear only in Windows sessions; Linux-only plugins (for example `cron`, `systemd`) appear only in Linux/Unix sessions.
+Choose a location based on platform scope and whether the plugin ships with the project:
 
-From the main handler, operators retain full visibility and can run any plugin against any session using `run <plugin> <ID> ...`—the existing workflow is unchanged.
+| Location | Scope | Loaded |
+|----------|-------|--------|
+| `tornadorevc2/plugins/shared/` | Cross-platform (internal Windows + Linux implementations) | Automatically at startup |
+| `tornadorevc2/plugins/linux/` | Linux/Unix only | Automatically at startup |
+| `tornadorevc2/plugins/windows/` | Windows only | Automatically at startup |
+| `./plugins/myplugin.py` | External (any scope you define) | On demand via `plugins load` |
+| `./plugins/myplugin/__init__.py` | External package | On demand via `plugins load` |
+| Path in `TORNADOREVC2_PLUGIN_DIR` | External (custom directory) | On demand via `plugins load` |
 
-### Architecture
+**Layout rules:**
 
-Cross-platform plugins follow a consistent layout:
+- Files named `common.py`, `runner.py`, and `__init__.py` under `shared/` are skipped during discovery.
+- Files starting with `_` under `linux/` or `windows/` are helper modules, not plugins.
+- **Shared plugins** must be a single module in `shared/` with internal platform branching—do not duplicate cross-platform plugins in both `shared/` and `linux/`/`windows/`.
+- **Platform-specific plugins** (e.g. `rdp`, `eventlogdel`) belong exclusively in `windows/` or `linux/`.
 
-```text
-tornadorevc2/plugins/
-  shared/          # Cross-platform entry points (history, mounts, clipboard, quickenum, …)
-  linux/           # Linux/Unix collector builders
-  windows/         # Windows collector builders
-  api.py           # SessionContext and @plugin.command registration
-  manager.py       # Runtime loading and execution
-  loader.py        # Module discovery
-```
+### Registration
 
-Collectors emit JSON wrapped in marker tokens (`__T_PLUGIN_START__` / `__T_PLUGIN_END__`). The shared runner parses this output, formats a report, and persists results under the session log directory.
-
-On Windows, plugin scripts are delivered in-process on PowerShell interactive sessions to ensure collector output returns reliably over the reverse shell channel.
-
-### Writing a custom plugin
-
-Plugins are plain Python modules that register one or more commands with `@plugin.command`. Each handler receives a `SessionContext` for the target session and an `args` list containing any extra tokens passed on the command line.
-
-#### Where to put plugins
-
-| Location | When to use |
-|----------|-------------|
-| `./plugins/myplugin.py` | External plugins loaded at runtime (default search path) |
-| `./plugins/myplugin/__init__.py` | External plugin packaged as a directory |
-| Custom path via `TORNADOREVC2_PLUGIN_DIR` | Shared or non-repo plugin directories |
-| `tornadorevc2/plugins/shared/` or `linux/` / `windows/` | Built-in plugins shipped with the project |
-
-Load and run an external plugin:
-
-```bash
-plugins load myplugin          # import and register commands
-plugins info myplugin          # verify name, platforms, and description
-run myplugin 1                 # execute against session 1
-run myplugin 1 --verbose       # args after the session ID are passed to the handler
-plugins reload myplugin        # re-import after editing the file
-```
-
-When attached to a session (`switch <ID>`), omit the session ID: `run myplugin`.
-
-#### Pattern 1 — Simple shell plugin
-
-Use this for quick one-off commands that do not need structured parsing. The handler runs a shell command, prints output, and logs the result.
+Register a command with the `@plugin.command` decorator:
 
 ```python
 from tornadorevc2.plugins import plugin, SessionContext
 
 @plugin.command(
-    name="myplugin",
-    platforms=["linux", "windows", "unix"],
-    description="Run whoami on the remote host",
+    name="myplugin",                          # Command name used with `run myplugin <ID>`
+    platforms=["linux", "windows", "unix"],   # Supported session platforms
+    description="Short description for plugins list and TAB completion",
 )
 def run(session: SessionContext, args):
-    session.log_event("Plugin myplugin: started")
+    ...
+    return 0  # 0 = success, non-zero = failure
+```
+
+**Platform values:** `linux`, `windows`, `unix`. Linux and `unix` are treated as compatible— a plugin registered for `linux` runs on both. Default if omitted: `["linux", "windows", "unix"]`.
+
+**Multiple commands per module:** A single file may register several commands by applying `@plugin.command` to multiple functions. Each gets an independent name.
+
+### Execution lifecycle
+
+When an operator runs `run myplugin 1 arg1 arg2`:
+
+```text
+1. PluginManager resolves session #1 and looks up "myplugin" in the registry
+2. Platform check: plugin.platforms vs session shell type (unix/windows)
+3. SessionContext(handler, client_socket) is constructed
+4. Handler invoked: run(ctx, ["arg1", "arg2"])
+5. Handler executes remote work via run_shell / run_marked / run_collector_plugin
+6. Output printed to operator console; results logged under logs/<session>/plugins/
+7. Exit code returned (0 = success)
+```
+
+Inside an attached session (`switch <ID>`), the session ID is omitted and args start immediately after the plugin name: `run myplugin arg1 arg2`.
+
+### Pattern 1: Simple shell plugin
+
+Use when you need a quick one-off command without structured JSON parsing. The handler runs a native shell command, prints output, and logs the result.
+
+```python
+from tornadorevc2.plugins import plugin, SessionContext
+
+@plugin.command(
+    name="whoami",
+    platforms=["linux", "windows", "unix"],
+    description="Print remote user identity",
+)
+def run(session: SessionContext, args):
+    session.log_event("Plugin whoami: started")
 
     if session.is_windows:
-        cmd = "whoami"
+        cmd = "whoami /all"
     else:
         cmd = "id 2>/dev/null || whoami"
 
     output = session.run_shell(cmd, timeout=10.0)
     if not output.strip():
-        session.print("Plugin 'myplugin' failed — no output from target.", "red")
+        session.print("Plugin 'whoami' failed — no output from target.", "red")
+        session.log_plugin_result("whoami", "", "no output")
         return 1
 
-    session.print(output.strip(), "cyan")
-    session.log_plugin_result("myplugin", output.strip())
-    session.log_command("run myplugin", output.strip())
+    report = output.strip()
+    session.print(report, "cyan")
+    session.log_plugin_result("whoami", report)
+    session.log_command("run whoami", report)
     return 0
 ```
 
-**Return codes:** `0` = success, non-zero = failure. The handler console displays plugin failures based on this value.
+**When to use:** Simple probes, one-liner enumeration, commands that do not need structured reports.
 
-#### Pattern 2 — Structured collector plugin (recommended)
+**Key methods:** `session.run_shell(cmd, timeout)`, `session.print(text, color)`, `session.log_plugin_result(name, report, detail='')`.
 
-For enumeration plugins, collect data on the target as JSON, wrap it in marker tokens, and let the shared runner parse and format the report. This is the pattern used by built-in plugins such as `history`, `mounts`, and `services`.
+### Pattern 2: Structured collector (recommended)
+
+Use for enumeration plugins that gather structured data on the target and return a formatted report. This is the pattern used by all built-in reconnaissance plugins (`firewall`, `ports`, `browser`, etc.).
 
 **Flow:**
 
 ```text
-Handler                         Target host
-  │                                  │
-  ├─ flush shell buffer              │
-  ├─ send collector script ─────────►│  (Python on Linux, PowerShell on Windows)
-  │                                  ├─ gather data into a dict
-  │                                  ├─ emit __T_PLUGIN_START__ + JSON + __T_PLUGIN_END__
-  │◄─────────────────────────────────┤
-  ├─ parse JSON                      │
-  ├─ format report                   │
-  └─ write logs/plugins/<name>/        │
+Handler                              Target host
+  │                                       │
+  ├─ session.log_event("started")         │
+  ├─ flush shell buffer                   │
+  ├─ resolve platform (unix/windows)      │
+  ├─ build collector command/script ─────►│  Linux: inline Python or native shell
+  │                                       │  Windows: PowerShell script in-process
+  │                                       ├─ invoke native OS commands
+  │                                       ├─ assemble result dict
+  │                                       └─ emit __T_PLUGIN_START__ + JSON + __T_PLUGIN_END__
+  │◄──────────────────────────────────────┤
+  ├─ parse_collector_json(raw)            │
+  ├─ formatter(data) → report string      │
+  ├─ session.print(report)                │
+  └─ session.log_plugin_result(...)       │
 ```
 
-**Cross-platform example** (`plugins/processes.py`):
+**Minimal cross-platform example:**
 
 ```python
-"""Example cross-platform process enumeration plugin."""
-
 from tornadorevc2.plugins import plugin, SessionContext
 from tornadorevc2.plugins.linux._helpers import build_linux_collector_command
 from tornadorevc2.plugins.shared.common import format_generic_report
@@ -363,14 +496,14 @@ from tornadorevc2.constants import PLUGIN_MARK_END, PLUGIN_MARK_START
 
 
 def _linux_collector_source():
-    # Runs inside a try/except wrapper on the target. Call _emit(result) with a dict.
+    # Runs inside a try/except wrapper on the target.
+    # Call _emit(result) with a JSON-serializable dict — do NOT print markers yourself.
     return r'''
 import subprocess
 result = {'summary': {}, 'processes': []}
 try:
     out = subprocess.check_output(['ps', 'auxww'], stderr=subprocess.STDOUT, timeout=10)
-    text = out.decode('utf-8', errors='replace')
-    lines = [l for l in text.splitlines() if l.strip()]
+    lines = out.decode('utf-8', errors='replace').splitlines()
     result['summary'] = {'count': max(0, len(lines) - 1)}
     result['processes'] = lines[1:51]
 except Exception as exc:
@@ -388,7 +521,7 @@ def _build_windows_command():
 $ErrorActionPreference='SilentlyContinue'
 $start='{PLUGIN_MARK_START}'; $end='{PLUGIN_MARK_END}'
 $procs = Get-CimInstance Win32_Process -EA 0 |
-  Select-Object -First 50 ProcessId, Name, CommandLine, ExecutablePath
+  Select-Object -First 50 ProcessId, Name, CommandLine
 $result = [ordered]@{{
   summary = @{{ count = @($procs).Count }}
   processes = @($procs)
@@ -406,243 +539,418 @@ def run(session: SessionContext, args):
     return run_collector_plugin(
         session,
         "processes",
-        _build_linux_command,      # callable — built at execution time
-        _build_windows_command,
-        format_generic_report,       # turns JSON dict into operator-facing text
-        timeout=25.0,
+        _build_linux_command,       # callable — built at execution time
+        _build_windows_command,     # callable — built at execution time
+        format_generic_report,      # turns parsed dict into operator-facing text
+        timeout=25.0,               # seconds to wait for marked output
     )
 ```
 
-After saving the file:
+**`run_collector_plugin` parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `session` | `SessionContext` | Target session |
+| `plugin_name` | `str` | Name used in logs and error messages |
+| `unix_builder` | `Callable[[], str]` or `None` | Returns the Unix/Linux shell command; `None` if unavailable |
+| `win_builder` | `Callable[[], str]` or `None` | Returns the PowerShell script; `None` if unavailable |
+| `formatter` | `Callable[[dict], str]` | Converts parsed JSON dict to a report string |
+| `timeout` | `float` | Maximum seconds to wait for marked output (default 30) |
+
+Pass `None` for a platform builder to mark the plugin unavailable on that OS (see [Platform-specific plugins](#platform-specific-plugins)).
+
+After saving an external plugin:
 
 ```bash
 plugins load processes
+plugins info processes
 run processes 1
 ```
 
-Reports appear in the handler console and under `logs/<session>/plugins/processes/`.
+### Pattern 3: Custom handler
 
-#### Collector conventions
+Use when you need argument validation, dynamic collector construction, post-collector processing, or operator-side file handling that `run_collector_plugin` does not cover alone.
 
-**Linux / Unix collectors**
+**Examples in the codebase:**
 
-- Write the collector body as a string returned from `_linux_collector_source()`.
-- Finish by calling `_emit(result)` with a JSON-serializable dict. Do not print markers yourself — `build_linux_collector_command()` wraps the source in a helper that catches exceptions and always emits marked JSON.
-- Prefer short, focused collectors. Very large scripts are staged to `/tmp` automatically.
-- Use `subprocess.check_output(..., timeout=N)` and trim large lists before emitting.
+| Plugin | Custom behavior |
+|--------|-----------------|
+| `memorymap` | Requires PID argument; builds collector dynamically with embedded PID |
+| `wiper` | Requires remote path; destructive action with confirmation output |
+| `screenshot` | Decodes base64 image and saves PNG locally on the operator machine |
+| `historydel` | Runs collector, then sends follow-up shell command for in-memory history cleanup |
+| `clipboard` | Custom soft-failure handling via `reason` field instead of hard `error` |
 
-**Windows collectors**
-
-- Return a PowerShell script string from `_build_windows_command()`.
-- Set `$start='__T_PLUGIN_START__'` and `$end='__T_PLUGIN_END__'`, build a `$result` hashtable, then:
-
-  ```powershell
-  Write-Output ($start + (ConvertTo-Json $result -Depth 5 -Compress) + $end)
-  ```
-
-- Brace-doubling (`{{` / `}}`) is required inside Python f-strings.
-- Keep scripts compact; interactive PowerShell sessions execute them in-process.
-
-**JSON payload shape**
-
-| Key | Purpose |
-|-----|---------|
-| `summary` | Counts and high-level stats shown at the top of generic reports |
-| `error` | Collector exception message — runner treats this as a hard failure |
-| `reason` | Operational failure (e.g. missing tool) — use for soft failures you format yourself |
-| Lists of dicts | Rendered as tables by `format_generic_report()` |
-| Nested dicts | Rendered as labeled sections |
-
-Custom formatters receive the parsed dict and return a string. Example:
+**Argument validation example** (from `memorymap`):
 
 ```python
-def format_process_report(data: dict) -> str:
-    if data.get("error"):
-        return f"Collection failed: {data['error']}"
-    lines = [f"Processes: {data.get('summary', {}).get('count', 0)}"]
-    for entry in data.get("processes", [])[:10]:
-        lines.append(f"  {entry}")
-    return "\n".join(lines)
+import re
+from tornadorevc2.plugins import plugin, SessionContext
+from tornadorevc2.plugins.shared.runner import _run_collector_marked, parse_collector_json
+
+@plugin.command(
+    name="memorymap",
+    platforms=["linux", "windows", "unix"],
+    description="Enumerate memory maps for a process (requires PID)",
+)
+def run(session: SessionContext, args):
+    if not args or not re.match(r"^\d+$", args[0].strip()):
+        session.print("Usage: run memorymap <ID> <pid>", "yellow")
+        return 1
+
+    pid = args[0].strip()
+    session.log_event(f"Plugin memorymap: started for PID {pid}")
+    session._handler._flush_shell(session._client_sock, timeout=1.0)
+
+    unix_cmd = _build_linux_command(pid)   # builder accepts runtime args
+    win_ps = _build_windows_command(pid)
+
+    raw = _run_collector_marked(session, unix_cmd, win_ps, session.platform, 45.0)
+    if raw is None:
+        session.print("Plugin 'memorymap' failed — no response from target.", "red")
+        return 1
+
+    data = parse_collector_json(raw)
+    report = format_memorymap_report(data)
+    session.print(report, "cyan")
+    session.log_plugin_result("memorymap", report, ...)
+    return 0
 ```
 
-Pass `format_process_report` instead of `format_generic_report` to `run_collector_plugin`.
-
-**Platform-specific plugins**
-
-For Windows-only plugins, pass `None` as the Linux builder and set `platforms=["windows"]` so the command is hidden on Linux/Unix sessions (listing, TAB completion, and execution inside a non-Windows client session):
-
-```python
-return run_collector_plugin(session, "services", None, build_command, format_generic_report)
-```
-
-For Linux-only plugins, pass `None` as the Windows builder. Set `platforms=["linux", "unix"]` on the decorator so the command is hidden on Windows sessions (listing, TAB completion, and execution inside a Windows client session).
-
-#### Handling arguments
-
-Extra tokens after the session ID are passed as `args: list[str]`. Validate and use them inside the handler:
+**Post-collector processing example** (from `historydel`):
 
 ```python
 def run(session: SessionContext, args):
-    if not args:
-        session.print("Usage: run wiper <ID> <remote_file_path>", "yellow")
-        return 1
-    remote_path = args[0]
-    ...
+    # ... run collector via _run_collector_marked ...
+    data = parse_collector_json(raw)
+
+    # Additional in-memory cleanup in the interactive shell
+    if session.is_unix:
+        session.run_shell("history -c 2>/dev/null; history -w 2>/dev/null; true", timeout=5.0)
+    elif session.is_windows:
+        session.run_marked("", "Clear-History -ErrorAction SilentlyContinue", timeout=5.0)
+
+    report = format_historydel_report(data)
+    session.print(report, "green" if data.get("cleared") else "yellow")
+    return 0
 ```
 
-See the built-in `wiper` plugin and `run inmemory bat` / `run inmemory sh` for local-script execution patterns.
+For direct access to marked execution without the full collector wrapper, use `_run_collector_marked` and `parse_collector_json` from `plugins/shared/runner.py`.
 
-#### SessionContext API
+### Linux collectors
 
-| Category | Methods / Properties |
-|----------|----------------------|
-| Metadata | `session_id`, `platform`, `sysinfo`, `identity`, `addr`, `tls`, `name` |
-| Execution | `run_shell()`, `run_shell_streaming()`, `run_marked()` |
-| Transfer | `upload()`, `download()`, `verify_remote()` |
-| Logging | `log_event()`, `log_command()`, `log_plugin_result()` |
-| Host info | `collect_sysinfo()`, `get_cwd()` |
-| Output | `print(text, color)` |
+Linux collectors are Python source strings executed on the target via `build_linux_collector_command()`.
 
-#### Reference implementations
+**Structure:**
 
-| Plugin | File | Notes |
-|--------|------|-------|
-| `history` | `tornadorevc2/plugins/shared/history.py` | Cross-platform collector with Linux Python + Windows PowerShell builders |
-| `clipboard` | `tornadorevc2/plugins/shared/clipboard.py` | Custom run handler, soft failures via `reason`, shell fallback on Linux |
-| `services` | `tornadorevc2/plugins/windows/services.py` | Windows-only collector, minimal entry point |
-| `secrets` | `tornadorevc2/plugins/linux/secrets.py` | Linux-only collector |
-| `wiper` | `tornadorevc2/plugins/shared/wiper.py` | Argument validation and destructive action pattern |
+1. Define `_linux_collector_source()` returning a raw string (`r'''...'''`).
+2. Write collector logic that builds a `result` dict.
+3. Call `_emit(result)` at the end — never print markers manually.
+4. Wrap with `_build_linux_command()` → `build_linux_collector_command(source)`.
 
-For structured JSON collectors, start from `run_collector_plugin` in `tornadorevc2/plugins/shared/runner.py` and copy the layout from `history.py`.
+The wrapper in `linux/_helpers.py` automatically:
 
----
+- Indents your source inside a `try/except` block
+- Defines `_emit(obj)` to write `__T_PLUGIN_START__` + JSON + `__T_PLUGIN_END__`
+- Emits `{"error": "...", "traceback": "..."}` on unhandled exceptions
+- Encodes the script for inline execution via `python3 -c` (or `python2` fallback)
+- Falls back to chunked `/tmp` staging only when the encoded payload exceeds ~4000 bytes
 
-## Built-in Plugins
+**Prefer native commands:**
 
-### Cross-platform
+```python
+def sh(cmd, timeout=5):
+    try:
+        out = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT, timeout=timeout)
+        return out.decode("utf-8", "ignore")
+    except Exception:
+        return ""
 
-| Plugin | Description |
+result = {"summary": {}, "ports": []}
+output = sh("ss -tulpn 2>/dev/null || netstat -tulpn 2>/dev/null", 10)
+for line in output.splitlines()[:60]:
+    result["ports"].append(line.strip())
+_emit(result)
+```
+
+**Guidelines:**
+
+- Use `subprocess.check_output(..., timeout=N)` for every external command.
+- Trim large lists before emitting (cap at 50–80 entries).
+- Handle missing tools gracefully—leave sections empty rather than raising.
+- Avoid embedding marker strings in output; the `history` plugin scrubs `__T_PLUGIN_*__` from collected text for this reason.
+- Keep collectors compact to stay under the inline size limit and avoid `/tmp` staging.
+
+### Windows collectors
+
+Windows collectors are PowerShell script strings returned from `_build_windows_command()`.
+
+**Structure:**
+
+```python
+from tornadorevc2.constants import PLUGIN_MARK_END, PLUGIN_MARK_START
+
+def _build_windows_command():
+    return rf"""
+$ErrorActionPreference='SilentlyContinue'
+$start='{PLUGIN_MARK_START}'; $end='{PLUGIN_MARK_END}'
+$result = [ordered]@{{
+  summary = @{{ count = 0 }}
+  items = @()
+}}
+try {{
+  Get-CimInstance Win32_Service -EA 0 | Select-Object -First 50 | ForEach-Object {{
+    $result.items += @{{ name = $_.Name; state = $_.State }}
+  }}
+  $result.summary.count = $result.items.Count
+}} catch {{
+  $result.summary.error = $_.Exception.Message
+}}
+Write-Output ($start + (ConvertTo-Json $result -Depth 5 -Compress) + $end)
+"""
+```
+
+**Guidelines:**
+
+- Always set `$ErrorActionPreference='SilentlyContinue'` at the top.
+- Use `-EA 0` (ErrorAction SilentlyContinue) on cmdlets that may fail on older systems.
+- Brace-doubling is required inside Python f-strings and raw f-strings: `{{` and `}}` for PowerShell hashtables and script blocks.
+- Use `[ordered]@{{...}}` to preserve key order in JSON output.
+- Prefer built-in cmdlets (`Get-NetTCPConnection`, `Get-Process`, `netsh`, `wevtutil`) over external tools.
+- Wrap each logical section in its own `try/catch` so one failure does not abort the entire collector.
+- On interactive PowerShell sessions, scripts are delivered in-process via `win_client.py` for reliable output capture.
+
+**Alternative:** For Windows-only plugins with minimal entry points, use a single `build_command()` function:
+
+```python
+# tornadorevc2/plugins/windows/services.py
+@plugin.command(name="services", platforms=["windows"], description="...")
+def run(session: SessionContext, args):
+    return run_collector_plugin(session, "services", None, build_command, format_generic_report, timeout=35.0)
+```
+
+### JSON payload conventions
+
+Collectors should return a JSON-serializable dict. The runner and formatters expect consistent key usage:
+
+| Key | Type | Purpose |
+|-----|------|---------|
+| `summary` | `dict` | High-level counts and stats; rendered first by `format_generic_report()` |
+| `error` | `str` | **Hard failure** — runner prints error and returns exit code 1 |
+| `traceback` | `str` | Optional; logged as detail when `error` is set |
+| `reason` | `str` | **Soft failure** — use with custom formatters (e.g. clipboard unavailable) |
+| `ok` | `bool` | Success flag for operational plugins (screenshot, clipboard) |
+| Lists of `dict` | `list` | Rendered as tables by `format_generic_report()` |
+| Lists of `str` | `list` | Rendered as bullet lists |
+| Nested `dict` | `dict` | Rendered as labeled sections |
+
+**Graceful degradation:** For multi-section enumeration, use separate dict keys per section and catch exceptions locally. Do not set top-level `error` unless the entire collector failed—partial results are preferable.
+
+```python
+result = {"summary": {}, "ufw": {}, "iptables": {}}
+# Each backend probed independently; failures leave that section empty
+```
+
+### Custom formatters
+
+Pass a custom formatter to `run_collector_plugin` instead of `format_generic_report`:
+
+```python
+from tornadorevc2.plugins.shared.common import format_section, format_list_section
+
+def format_firewall_report(data: dict) -> str:
+    sections = []
+    summary = data.get("summary") or {}
+    if summary:
+        sections.append(format_section("Summary", summary))
+    for key in ("ufw", "iptables", "windows_defender_firewall"):
+        block = data.get(key)
+        if isinstance(block, dict) and block:
+            sections.append(format_section(key.replace("_", " ").title(), block))
+    if not sections:
+        return "Firewall: no data collected."
+    return "\n\n".join(sections)
+```
+
+Reusable helpers in `plugins/shared/common.py`:
+
+| Function | Purpose |
+|----------|---------|
+| `format_generic_report(data, title='Results')` | Default table/section renderer |
+| `format_section(title, fields, width=22)` | Key-value section |
+| `format_list_section(title, items, empty='(none)')` | Bulleted list |
+| `format_table_section(title, rows, columns)` | Dict rows as columns |
+| `format_firewall_report`, `format_memorymap_report`, etc. | Plugin-specific formatters |
+
+### Platform-specific plugins
+
+**Windows-only:**
+
+```python
+@plugin.command(name="rdp", platforms=["windows"], description="...")
+def run(session: SessionContext, args):
+    return run_collector_plugin(
+        session, "rdp",
+        None,                    # no Linux builder
+        build_command,
+        format_generic_report,
+        timeout=35.0,
+    )
+```
+
+**Linux-only:**
+
+```python
+@plugin.command(name="cron", platforms=["linux", "unix"], description="...")
+def run(session: SessionContext, args):
+    return run_collector_plugin(
+        session, "cron",
+        build_linux_command,
+        None,                    # no Windows builder
+        format_generic_report,
+        timeout=30.0,
+    )
+```
+
+**Cross-platform with split builders:**
+
+Some shared plugins delegate to platform-specific builder modules (e.g. `virtualization` imports from `linux/virtualization.py` and `windows/virtualization.py`). The `@plugin.command` entry point stays in `shared/`; builder modules under `linux/` or `windows/` contain no decorator and are not registered as independent plugins.
+
+### External plugins
+
+External plugins let you extend TornadoRevC2 without modifying the repository.
+
+**Setup:**
+
+```bash
+# Default location (created automatically if missing)
+./plugins/myplugin.py
+
+# Or set a custom directory
+export TORNADOREVC2_PLUGIN_DIR=/path/to/my/plugins
+```
+
+**Workflow:**
+
+```bash
+# From the handler console
+plugins load myplugin          # import and register commands
+plugins info myplugin          # verify name, platforms, description, module path
+run myplugin 1                 # execute against session 1
+run myplugin 1 --verbose       # extra args passed to handler as args=["--verbose"]
+plugins reload myplugin        # re-import after editing (clears stale registrations)
+plugins unload myplugin        # fully unload external plugin
+```
+
+**External vs built-in lifecycle:**
+
+| Action | Built-in plugin | External plugin |
+|--------|-----------------|-----------------|
+| `plugins unload` | Soft-disabled (module stays imported) | Fully unloaded and unregistered |
+| `plugins reload` | Re-imports module, clears stale command registrations | Removes from `sys.modules`, re-imports from disk |
+| Startup | Auto-loaded | Loaded on demand |
+
+External modules are imported as `tornado_ext_plugin_<name>` to avoid namespace collisions.
+
+### SessionContext API
+
+Every handler receives a `SessionContext` wrapping the handler and client socket:
+
+**Metadata properties:**
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `session_id` | `str` | Assigned session identifier |
+| `platform` | `str` | `unix`, `windows`, or `unknown` |
+| `is_windows` / `is_unix` | `bool` | Platform convenience flags |
+| `sysinfo` | `dict` | Cached host information from `sysinfo` collection |
+| `identity` | `dict` | Session identity/fingerprint metadata |
+| `addr` | `tuple` | Remote address |
+| `tls` | `bool` | Whether session uses TLS |
+| `name` | `str` | Operator-assigned friendly name |
+| `fingerprint` | `str` | Stable host fingerprint |
+| `logger` | `SessionLogger` | Per-session log writer (may be `None`) |
+| `colors` | `dict` | Console color codes |
+| `socket` | socket | Raw client socket (advanced use) |
+
+**Execution methods:**
+
+| Method | Description |
 |--------|-------------|
-| `inmemory` | Unified in-memory payload execution (`py`, `ps`, `exe`, `elf`, `bat`, `sh`) |
-| `quickenum` | Fast structured host assessment: identity, network, environment, and prioritized findings |
-| `virtualization` | Virtualization, container, orchestration, and cloud environment detection |
-| `history` | Shell history, package/update logs, and recent login activity |
-| `mounts` | Mount points, SMB/NFS shares, mapped drives, and container-related filesystems |
-| `clipboard` | Remote clipboard text capture |
-| `wiper` | Multi-pass secure file overwrite followed by deletion |
+| `run_shell(cmd, timeout=15.0)` | Send command, wait for output, return string |
+| `run_shell_streaming(cmd, timeout, idle_timeout, on_chunk)` | Stream output with idle detection; useful for long-running commands |
+| `run_marked(unix_cmd, win_ps_script, timeout, start_mark, end_mark, strip_ws)` | Execute platform-appropriate command and extract marked payload |
+| `get_cwd()` | Return remote working directory |
+| `collect_sysinfo(mode='stealth')` | Trigger host info collection |
 
-### Linux / Unix
+**Transfer methods:**
 
-| Plugin | Description |
+| Method | Description |
 |--------|-------------|
-| `secrets` | Configuration files, environment variables, SSH keys, and cloud credentials |
-| `cron` | Cron jobs, system crontabs, user crontabs, and at queues |
-| `systemd` | Services, timers, failed units, and enabled startup units |
+| `upload(local_path, remote_path, resume=False)` | Upload file to target |
+| `download(remote_path, local_path, resume=False)` | Download file from target |
+| `verify_remote(remote_path)` | Verify remote file size and SHA-256 |
 
-### Windows
+**Logging and output:**
 
-| Plugin | Description |
+| Method | Description |
 |--------|-------------|
-| `adinfo` | Domain membership, domain controllers, forests, trusts, and OUs |
-| `services` | Windows services, startup types, binaries, and service accounts |
-| `scheduledtasks` | Scheduled tasks, triggers, execution context, and actions |
-| `registry` | Autorun keys, startup locations, and installed software |
-| `eventlogs` | Security, System, Application, and PowerShell log summaries |
-| `defender` | Microsoft Defender status, exclusions, ASR rules, and third-party AV |
-| `certificates` | Certificate stores, code-signing, and enterprise certificates |
+| `print(text, color=None)` | Print to operator console with optional color (`red`, `green`, `yellow`, `cyan`) |
+| `log_event(message)` | Append timestamped event to `session.log` |
+| `log_command(cmd, output)` | Log command and output to `session.log` |
+| `log_plugin_result(name, report, detail='')` | Write report to `logs/<session>/plugins/<name>_<timestamp>.log` |
 
----
+### Error handling & return codes
 
-## Plugin Reference
+| Return | Meaning | Handler behavior |
+|--------|---------|------------------|
+| `0` | Success | No warning displayed |
+| `1` (or any non-zero) | Failure | Yellow warning: `Plugin 'name' returned code N` |
+| Uncaught exception | Error | Red error message; logged to session log |
 
-### In-Memory Execution
+**Collector failure modes** (handled by `run_collector_plugin`):
 
-Execute local payloads on the remote host without writing persistent artifacts where supported.
+| Condition | Behavior |
+|-----------|----------|
+| Timeout / no markers in output | Exit 1, log "no response" |
+| Output not valid JSON | Exit 1, log raw output (truncated) as detail |
+| `data["error"]` present | Exit 1, print error and traceback |
+| Partial section failures | Should **not** set top-level `error`; leave section empty |
 
-```bash
-run inmemory 1 py /tools/script.py
-run inmemory 1 exe C:\tools\beacon.exe -- --flag value
-run inmemory 1 elf /tools/agent --save-output ./output.txt
-run inmemory 1 sh ./linpeas.sh
-run inmemory 1 bat C:\tools\winPEAS.bat
-```
+**Soft failures** (operational plugins): Use `reason` or `ok: false` and handle in a custom formatter or custom handler rather than relying on the runner's hard `error` check.
 
-| Filetype | Description |
-|----------|-------------|
-| `py` | Python — in-memory via `exec(compile(...))` on Unix and Windows |
-| `ps` | PowerShell — in-memory via `Invoke-Expression` |
-| `exe` | Windows PE — in-memory RunPE (process hollowing) with output capture |
-| `elf` | Linux ELF — `memfd_create` with `/dev/shm` fallback |
-| `sh` | Shell script — SHA256-verified transfer, streams via `bash -s` |
-| `bat` | Batch script — SHA256-verified transfer, streamed in-memory via `cmd.exe /Q` stdin |
+### Best practices
 
-Download LinPEAS / WinPEAS from [PEASS-ng](https://github.com/carlospolop/PEASS-ng).
+1. **Prefer native OS commands** over uploaded tooling—aligns with the framework's dependency-light design.
+2. **Do not write files on the target** for enumeration; return data over the shell channel. Operational plugins (wiper, historydel) are exceptions with clear purpose.
+3. **Degrade gracefully** — probe each backend independently; empty sections beat total failure.
+4. **Cap output size** — trim lists to 50–80 items; truncate long strings to 200–500 characters.
+5. **Set realistic timeouts** — quick probes: 15–30s; comprehensive enumeration: 45–75s.
+6. **Log consistently** — call `session.log_event()` at start, `session.log_plugin_result()` on completion, `session.log_command()` for transcript export.
+7. **Validate args early** — return 1 with usage message before sending anything to the target.
+8. **Test from both consoles** — main handler (`run plugin <ID>`) and attached session (`switch` then `run plugin`).
+9. **Use `plugins reload`** during development to pick up changes without restarting the handler.
+10. **Scrub sensitive markers** from collected output if your plugin reads arbitrary file content.
 
-### QuickEnum
+### Reference implementations
 
-Single round-trip host triage that aggregates signals from virtualization detection, credential artifacts, services, and network configuration.
+| Plugin | File | Pattern | Notes |
+|--------|------|---------|-------|
+| `firewall` | `plugins/shared/firewall.py` | Cross-platform collector | Multi-backend graceful degradation |
+| `ports` | `plugins/shared/ports.py` | Cross-platform collector | Native `ss` / `Get-NetTCPConnection` |
+| `history` | `plugins/shared/history.py` | Cross-platform collector | Linux Python + Windows PowerShell builders |
+| `memorymap` | `plugins/shared/memorymap.py` | Custom handler | PID argument, dynamic builder |
+| `screenshot` | `plugins/shared/screenshot.py` | Custom handler | Base64 in JSON; operator-side PNG save |
+| `clipboard` | `plugins/shared/clipboard.py` | Custom handler | Soft failure via `reason` field |
+| `historydel` | `plugins/shared/historydel.py` | Custom handler | Destructive; post-collector shell cleanup |
+| `wiper` | `plugins/shared/wiper.py` | Custom handler | Destructive; path argument validation |
+| `services` | `plugins/windows/services.py` | Windows-only collector | Minimal entry point |
+| `eventlogdel` | `plugins/windows/eventlogdel.py` | Windows-only collector | Destructive; per-log failure reporting |
+| `rdp` | `plugins/windows/rdp.py` | Windows-only collector | Registry and firewall enumeration |
+| `virtualization` | `plugins/shared/virtualization.py` | Shared entry + split builders | Imports `linux/` and `windows/` builders |
+| `secrets` | `plugins/linux/secrets.py` | Linux-only collector | Platform-restricted listing |
 
-```bash
-run quickenum 1
-```
-
-**Linux / Unix coverage:** hostname, user context, privilege indicators, kernel details, container and cloud metadata, network configuration, mounts, persistence mechanisms, and credential artifacts.
-
-**Windows coverage:** hostname, user and admin status, domain context, network configuration, mounts and shares, services, Defender status, autoruns, and credential artifacts.
-
-### History
-
-Collects command history and login-related activity from the target host.
-
-```bash
-run history 1
-```
-
-**Linux / Unix:** bash/zsh history files, package manager logs, and recent logins via `last`.
-
-**Windows:** PSReadLine history, Run MRU registry entries, CBS/DISM log tails, and `quser` output.
-
-### Mounts
-
-Enumerates filesystem layout, network shares, and storage-related configuration.
-
-```bash
-run mounts 1
-```
-
-**Linux / Unix:** `/proc/mounts`, NFS exports, Samba share definitions, and container-related mount points.
-
-**Windows:** logical disks, SMB mappings, local shares, and WMI share metadata.
-
-### Clipboard
-
-Reads text from the remote clipboard.
-
-```bash
-run clipboard 1
-```
-
-**Windows:** `System.Windows.Forms.Clipboard` with `Get-Clipboard` fallback.  
-**Linux / Unix:** `wl-paste`, `xclip`, or `xsel` (requires a graphical session).
-
-### Wiper
-
-Performs a three-pass overwrite (zeros, ones, random) with flush between passes, then deletes the target file.
-
-```bash
-run wiper 1 /tmp/exfil.log
-run wiper 2 C:\Users\Public\staging.dat
-```
-
-Multi-pass overwrite provides strong assurance on traditional HDDs. On SSD and NVMe media, wear leveling may retain data in remapped blocks not accessible to the operating system. For high-assurance sanitization on solid-state media, use full-disk encryption, vendor secure-erase utilities, or physical destruction.
-
-### Virtualization
-
-Multi-layer detection of virtual machines, containers, and cloud instances with weighted confidence scoring. For a condensed summary, use `run quickenum <ID>` instead.
-
-```bash
-run virtualization 1
-```
+For new enumeration plugins, start from `run_collector_plugin` in `plugins/shared/runner.py` and copy the layout from `firewall.py` or `ports.py`. For plugins with arguments or side effects, refer to `memorymap.py` or `wiper.py`.
 
 ---
 
@@ -652,14 +960,14 @@ Each session writes to an isolated directory under `logs/`:
 
 ```text
 logs/001_user@hostname_192.168.1.10_unix_10-08-2026_143022/
-  session.log         # Operator commands and console output
-  sysinfo.json        # Host information snapshot
-  transfers/          # Upload and download event logs
-  executions/         # In-memory payload execution metadata
-  plugins/            # Plugin reports and structured collector output
+  session.log           Operator commands and console output
+  sysinfo.json          Host information snapshot
+  transfers/            Upload and download event logs
+  executions/           In-memory payload execution metadata
+  plugins/              Plugin reports and collector output
       quickenum_20260812_054812.log
-      history_20260812_055130.log
-      mounts_20260812_055245.log
+      firewall_20260812_055130.log
+      screenshot_20260812_055412.png
 ```
 
 Plugin logs contain a human-readable report and, when applicable, the raw JSON payload returned by the remote collector.
@@ -670,34 +978,34 @@ Plugin logs contain a human-readable report and, when applicable, the raw JSON p
 
 ```text
 TornadoRevC2/
-├── tornadorevc2.py              # Handler entry point
+├── tornadorevc2.py                 Entry point
 ├── tornadorevc2/
-│   ├── handler.py               # Listeners, sessions, and operator console
-│   ├── sysinfo.py               # Host information collection
-│   ├── terminal.py              # PTY/TTY management and signal handling
-│   ├── transfer.py              # Chunked file transfers
-│   ├── tunnel.py                # SOCKS5 pivoting
-│   ├── win_client.py            # Windows shell detection and script delivery
-│   ├── session_registry.py      # Session persistence and reconnect logic
-│   ├── session_log.py           # Per-session directory logging
-│   ├── export.py                # HTML transcript export
-│   ├── payloads.py              # Built-in payload catalog
+│   ├── handler.py                  Listeners, sessions, operator console
+│   ├── sysinfo.py                  Host information collection
+│   ├── terminal.py                 PTY/TTY management
+│   ├── transfer.py                 Chunked file transfers
+│   ├── tunnel.py                   SOCKS5 pivoting
+│   ├── win_client.py               Windows shell detection and script delivery
+│   ├── session_registry.py         Session persistence and reconnect logic
+│   ├── session_log.py              Per-session directory logging
+│   ├── export.py                   HTML transcript export
+│   ├── payloads.py                 Built-in payload catalog
 │   └── plugins/
-│       ├── api.py               # SessionContext and plugin registration
-│       ├── manager.py           # Plugin lifecycle management
-│       ├── loader.py            # Automatic module discovery
-│       ├── shared/              # Cross-platform plugins (inmemory, history, …)
-│       ├── linux/               # Linux/Unix collector builders
-│       └── windows/             # Windows collector builders
-├── plugins/                     # Optional external plugin directory
-└── logs/                        # Session log output (created at runtime)
+│       ├── api.py                  SessionContext and plugin registration
+│       ├── manager.py              Plugin lifecycle and execution
+│       ├── loader.py               Module discovery
+│       ├── shared/                 Cross-platform plugins
+│       ├── linux/                  Linux/Unix-only plugins
+│       └── windows/                Windows-only plugins
+├── plugins/                        Optional external plugin directory
+└── logs/                           Session output (created at runtime)
 ```
 
 ---
 
 ## TLS Configuration
 
-Generate a self-signed certificate for the TLS listener:
+Generate a self-signed certificate:
 
 ```bash
 openssl req -x509 -newkey rsa:2048 -sha256 -nodes \
@@ -706,13 +1014,13 @@ openssl req -x509 -newkey rsa:2048 -sha256 -nodes \
   -out server.pem
 ```
 
-Start the handler with explicit TLS material:
+Start with explicit TLS material:
 
 ```bash
 python tornadorevc2.py -H 0.0.0.0 -p 4444 -tp 8443 -c server.pem -k server.key
 ```
 
-For production engagements, replace self-signed certificates with properly issued credentials from your organization's PKI or certificate authority.
+For production engagements, use credentials issued by your organization's PKI or certificate authority.
 
 ---
 

@@ -235,6 +235,129 @@ def format_quickenum_report(data: Dict[str, Any]) -> str:
     return '\n\n'.join(sections)
 
 
+def format_screenshot_report(data: Dict[str, Any]) -> str:
+    if not data.get('ok'):
+        reason = data.get('reason') or data.get('error') or 'unknown error'
+        return f'Screenshot capture failed: {reason}'
+    lines = [
+        'Screenshot captured successfully',
+        f"Tool:     {data.get('tool', 'unknown')}",
+        f"Size:     {data.get('width', '?')}x{data.get('height', '?')}",
+    ]
+    if data.get('saved_path'):
+        lines.append(f"Saved:    {data['saved_path']}")
+    if data.get('bytes'):
+        lines.append(f"Bytes:    {data['bytes']}")
+    return '\n'.join(lines)
+
+
+def format_memorymap_report(data: Dict[str, Any]) -> str:
+    sections = []
+    summary = data.get('summary') or {}
+    if summary:
+        sections.append(format_section('Process', summary))
+    for key in ('memory_maps', 'modules', 'loaded_libraries'):
+        block = data.get(key)
+        if isinstance(block, list) and block:
+            if isinstance(block[0], dict):
+                cols = list(block[0].keys())[:6]
+                sections.append(format_table_section(key.replace('_', ' ').title(), block, cols))
+            else:
+                sections.append(format_list_section(key.replace('_', ' ').title(), [str(v) for v in block[:60]]))
+        elif isinstance(block, str) and block.strip():
+            sections.append(format_list_section(key.replace('_', ' ').title(), block.strip().splitlines()[:60]))
+    if not sections:
+        return 'Memory map: no data collected.'
+    return '\n\n'.join(sections)
+
+
+def format_firewall_report(data: Dict[str, Any]) -> str:
+    sections = []
+    summary = data.get('summary') or {}
+    if summary:
+        sections.append(format_section('Summary', summary))
+    for key in (
+        'windows_defender_firewall', 'ufw', 'firewalld', 'nftables',
+        'iptables', 'ip6tables', 'other',
+    ):
+        block = data.get(key)
+        if isinstance(block, dict) and block:
+            sections.append(format_section(key.replace('_', ' ').title(), block))
+        elif isinstance(block, list) and block:
+            sections.append(format_list_section(key.replace('_', ' ').title(), [str(v) for v in block]))
+    rules = data.get('notable_rules') or []
+    if rules:
+        if isinstance(rules[0], dict):
+            cols = list(rules[0].keys())[:6]
+            sections.append(format_table_section('Notable Rules', rules, cols))
+        else:
+            sections.append(format_list_section('Notable Rules', [str(r) for r in rules]))
+    if not sections:
+        return 'Firewall: no data collected.'
+    return '\n\n'.join(sections)
+
+
+def format_eventlogdel_report(data: Dict[str, Any]) -> str:
+    lines = ['Event Log Clear Result', '-' * 24]
+    summary = data.get('summary') or {}
+    for key, value in summary.items():
+        if value not in (None, ''):
+            lines.append(f"{key.replace('_', ' ').title():<18}{value}")
+    cleared = data.get('cleared') or []
+    if cleared:
+        lines.append('')
+        lines.append('Cleared logs:')
+        for item in cleared:
+            lines.append(f"  - {item}")
+    failed = data.get('failed') or []
+    if failed:
+        lines.append('')
+        lines.append('Failed logs:')
+        for item in failed:
+            if isinstance(item, dict):
+                lines.append(f"  - {item.get('log', '?')}: {item.get('error', 'unknown')}")
+            else:
+                lines.append(f"  - {item}")
+    if data.get('message'):
+        lines.append('')
+        lines.append(str(data['message']))
+    if data.get('error') and not cleared:
+        lines.append(f"Error: {data['error']}")
+    return '\n'.join(lines)
+
+
+def format_historydel_report(data: Dict[str, Any]) -> str:
+    lines = ['History Clear Result', '-' * 22]
+    summary = data.get('summary') or {}
+    for key, value in summary.items():
+        if value not in (None, ''):
+            lines.append(f"{key.replace('_', ' ').title():<18}{value}")
+    cleared = data.get('cleared') or []
+    if cleared:
+        lines.append('')
+        lines.append('Cleared locations:')
+        for item in cleared:
+            lines.append(f"  - {item}")
+    failed = data.get('failed') or []
+    if failed:
+        lines.append('')
+        lines.append('Failed locations:')
+        for item in failed:
+            if isinstance(item, dict):
+                lines.append(f"  - {item.get('path', '?')}: {item.get('error', 'unknown')}")
+            else:
+                lines.append(f"  - {item}")
+    if data.get('session_cleanup'):
+        lines.append('')
+        lines.append(f"Session cleanup: {data['session_cleanup']}")
+    if data.get('message'):
+        lines.append('')
+        lines.append(str(data['message']))
+    if data.get('error') and not cleared:
+        lines.append(f"Error: {data['error']}")
+    return '\n'.join(lines)
+
+
 def format_wiper_report(data: Dict[str, Any]) -> str:
     lines = ['Secure Wipe Result', '-' * 18]
     for key in ('path', 'size', 'passes', 'method', 'verified', 'platform'):
