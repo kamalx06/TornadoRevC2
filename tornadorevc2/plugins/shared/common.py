@@ -451,12 +451,30 @@ def format_historydel_report(data: Dict[str, Any]) -> str:
 
 def format_wiper_report(data: Dict[str, Any]) -> str:
     lines = ['Secure Wipe Result', '-' * 18]
-    for key in ('path', 'size', 'passes', 'method', 'verified', 'platform'):
+    for key in ('original_path', 'path', 'size', 'profile', 'passes', 'method', 'verified', 'platform'):
         val = data.get(key)
         if val not in (None, ''):
-            lines.append(f'{key.replace("_", " ").title():<12}{val}')
+            lines.append(f'{key.replace("_", " ").title():<14}{val}')
+    steps = data.get('steps') or []
+    if steps:
+        lines.append(f"{'Steps':<14}{', '.join(steps)}")
     if data.get('message'):
-        lines.append(f"Message:     {data['message']}")
+        lines.append(f"Message:       {data['message']}")
     if data.get('error'):
-        lines.append(f"Error:       {data['error']}")
+        lines.append(f"Error:         {data['error']}")
+    return '\n'.join(lines)
+
+
+def format_nullcrypt_report(data: Dict[str, Any], wiped: Optional[bool] = None) -> str:
+    lines = ['Nullcrypt Result', '-' * 16]
+    for key in ('path', 'output', 'size', 'output_size', 'algorithm', 'sha256', 'platform'):
+        val = data.get(key)
+        if val not in (None, ''):
+            lines.append(f'{key.replace("_", " ").title():<14}{val}')
+    if wiped is not None:
+        lines.append(f"{'Original wiped':<14}{'yes' if wiped else 'no'}")
+    if data.get('message'):
+        lines.append(f"Message:       {data['message']}")
+    if data.get('error'):
+        lines.append(f"Error:         {data['error']}")
     return '\n'.join(lines)

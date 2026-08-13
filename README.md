@@ -243,7 +243,7 @@ Supported types: `py`, `ps`, `exe`, `elf`, `bat`, `sh`
 
 ## Built-in Plugins
 
-TornadoRevC2 ships with **42 built-in plugins** organized by function. All enumeration plugins are read-only unless noted otherwise.
+TornadoRevC2 ships with **43 built-in plugins** organized by function. All enumeration plugins are read-only unless noted otherwise.
 
 ### Host assessment & environment
 
@@ -314,7 +314,8 @@ TornadoRevC2 ships with **42 built-in plugins** organized by function. All enume
 | Plugin | Platform | Description |
 |--------|----------|-------------|
 | `inmemory` | Cross-platform | In-memory payload execution (`py`, `ps`, `exe`, `elf`, `bat`, `sh`) |
-| `wiper` | Cross-platform | Multi-pass secure file overwrite followed by deletion |
+| `nullcrypt` | Cross-platform | Hybrid encrypt a file (AES-GCM + RSA-wrapped key) then securely wipe the original via wiper |
+| `wiper` | Cross-platform | Configurable multi-pass secure overwrite (rename, truncate, delete); profiles: quick, standard, dod, thorough, shred |
 | `historydel` | Cross-platform | Clear current user shell history files and related storage |
 | `eventlogdel` | Windows | Clear Windows Event Logs via native `wevtutil` / `Clear-EventLog` |
 
