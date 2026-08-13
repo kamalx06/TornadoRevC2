@@ -33,6 +33,7 @@ from .constants import (
     ID_COMMANDS,
     IDENT_MARK_END,
     IDENT_MARK_START,
+    INMEMORY_FILETYPES,
     MAIN_COMMANDS,
     SYSINFO_MARK_END,
     XFER_MARK_END,
@@ -221,7 +222,7 @@ class TORNADOREVC2:
             if cmd == 'run' and arg_i == 1:
                 return sorted(p for p in self.plugins.completion_plugins() if p.startswith(text.lower()))
             if cmd == 'run' and arg_i == 2 and words[1].lower() == 'inmemory':
-                return sorted(t for t in ('py', 'ps', 'exe', 'elf', 'bat', 'sh') if t.startswith(text.lower()))
+                return sorted(t for t in INMEMORY_FILETYPES if t.startswith(text.lower()))
             if cmd == 'run' and arg_i == 3 and words[1].lower() == 'inmemory':
                 return self._complete_paths(text)
             if cmd == 'plugins' and arg_i == 1:
@@ -239,7 +240,7 @@ class TORNADOREVC2:
         if cmd == 'run' and arg_i == 2:
             return sorted(i for i in self._get_client_ids() if i.startswith(text))
         if cmd == 'run' and arg_i == 3 and words[1].lower() == 'inmemory':
-            return sorted(t for t in ('py', 'ps', 'exe', 'elf', 'bat', 'sh') if t.startswith(text.lower()))
+            return sorted(t for t in INMEMORY_FILETYPES if t.startswith(text.lower()))
         if cmd == 'run' and arg_i == 4 and words[1].lower() == 'inmemory':
             return self._complete_paths(text)
         if cmd == 'plugins' and arg_i == 1:

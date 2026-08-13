@@ -31,7 +31,34 @@ ID_COMMANDS = {
     'socks', 'export',
 }
 
+# In-memory execution (inmemory plugin)
+INMEMORY_FILETYPES = ('py', 'ps', 'exe', 'elf', 'bat', 'sh')
+INMEMORY_FILETYPE_ALIASES = {
+    'py': 'python',
+    'ps': 'powershell',
+    'exe': 'pe',
+    'elf': 'elf',
+    'bat': 'bat',
+    'cmd': 'bat',
+    'sh': 'shell',
+    'bash': 'shell',
+    'python': 'python',
+    'powershell': 'powershell',
+    'pe': 'pe',
+}
+INMEMORY_EXT_TYPES = {
+    '.py': 'python',
+    '.ps1': 'powershell',
+    '.exe': 'pe',
+    '.bat': 'bat',
+    '.cmd': 'bat',
+    '.sh': 'shell',
+    '.bash': 'shell',
+}
 PAYLOAD_EXEC_TYPES = ('python', 'powershell', 'pe', 'elf')
+STREAMING_EXEC_TYPES = ('shell', 'bat')
+STREAM_EXIT_MARK = '[exit:'
+
 SYSINFO_MODES = ('stealth', 'full')
 
 LOGS_DIR = 'logs'

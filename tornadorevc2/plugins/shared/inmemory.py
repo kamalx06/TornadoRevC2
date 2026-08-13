@@ -12,40 +12,28 @@ from ...constants import (
     CHUNK_SIZE,
     EXEC_MARK_END,
     EXEC_MARK_START,
+    INMEMORY_EXT_TYPES,
+    INMEMORY_FILETYPE_ALIASES,
+    INMEMORY_FILETYPES,
     PAYLOAD_EXEC_TYPES,
+    STREAM_EXIT_MARK,
+    STREAMING_EXEC_TYPES,
     XFER_MARK_END,
     XFER_MARK_START,
 )
 from ...sysinfo import _b64_exec_cmd
 from ..api import plugin, SessionContext
 
-FILETYPE_ALIASES = {
-    'py': 'python',
-    'ps': 'powershell',
-    'exe': 'pe',
-    'elf': 'elf',
-    'bat': 'bat',
-    'cmd': 'bat',
-    'sh': 'shell',
-    'bash': 'shell',
-    'python': 'python',
-    'powershell': 'powershell',
-    'pe': 'pe',
-}
-
-INMEMORY_FILETYPES = ('py', 'ps', 'exe', 'elf', 'bat', 'sh')
-STREAMING_FILETYPES = ('shell', 'bat')
-STREAM_EXIT_MARK = '[exit:'
 INMEMORY_USAGE = (
     'run inmemory <filetype> <local_file> [-- args] [--save-output <file>]\n'
-    '  filetype: py, ps, exe, elf, bat, sh'
+    f"  filetype: {', '.join(INMEMORY_FILETYPES)}"
 )
 
 
 class InMemoryExecutor:
     """Chunked payload delivery with SHA256 verification and in-memory execution."""
 
-    TYPE_ALIASES = FILETYPE_ALIASES
+    TYPE_ALIASES = INMEMORY_FILETYPE_ALIASES
 
     def __init__(self, handler):
         self.h = handler
@@ -135,16 +123,7 @@ class InMemoryExecutor:
         if alias:
             return alias
         ext = os.path.splitext(local_path or '')[1].lower()
-        mapping = {
-            '.py': 'python',
-            '.ps1': 'powershell',
-            '.exe': 'pe',
-            '.bat': 'bat',
-            '.cmd': 'bat',
-            '.sh': 'shell',
-            '.bash': 'shell',
-        }
-        return mapping.get(ext, 'elf')
+        return INMEMORY_EXT_TYPES.get(ext, 'elf')
 
     def _escape_for_ps(self, value):
         return value.replace("'", "''")
@@ -609,7 +588,7 @@ try {{
         if not info:
             print(f"{self.h.colors['red']}Client disconnected{self.h.colors['end']}")
             return {'success': False, 'detail': 'disconnected'}
-        if kind not in STREAMING_FILETYPES:
+        if kind not in STREAMING_EXEC_TYPES:
             print(f"{self.h.colors['red']}Unsupported privesc kind: {kind}{self.h.colors['end']}")
             return {'success': False, 'detail': 'unsupported_kind'}
 
@@ -834,7 +813,7 @@ def run(session: SessionContext, args):
 
     executor = _executor_for(session)
     payload_type = executor.resolve_type(filetype, local_path)
-    all_types = set(PAYLOAD_EXEC_TYPES) | set(STREAMING_FILETYPES)
+    all_types = set(PAYLOAD_EXEC_TYPES) | set(STREAMING_EXEC_TYPES)
     if payload_type not in all_types:
         session.print(
             f"Unknown filetype '{filetype}' — supported: {', '.join(INMEMORY_FILETYPES)}",
@@ -842,7 +821,7 @@ def run(session: SessionContext, args):
         )
         return 1
 
-    if payload_type in STREAMING_FILETYPES:
+    if payload_type in STREAMING_EXEC_TYPES:
         result = executor.execute_streaming(
             session.socket,
             local_path,
