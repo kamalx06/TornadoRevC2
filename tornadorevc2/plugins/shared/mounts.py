@@ -1,8 +1,8 @@
 """Cross-platform mount and filesystem enumeration."""
 
+from ...constants import PLUGIN_MARK_END, PLUGIN_MARK_START
 from ..api import plugin, SessionContext
 from ..linux._helpers import build_linux_collector_command
-from ..windows._helpers import wrap_ps_collector
 from .common import format_generic_report
 from .runner import run_collector_plugin
 
@@ -88,40 +88,29 @@ def _build_linux_command():
 
 
 def _build_windows_command():
-    body = r"""
+    return rf"""
+$ErrorActionPreference='SilentlyContinue'
+$start='{PLUGIN_MARK_START}'; $end='{PLUGIN_MARK_END}'
 $mounts=@(); $mapped=@(); $smb=@(); $wmi=@()
-Get-CimInstance Win32_LogicalDisk -EA 0|ForEach-Object{
-  $dt=switch([int]$_.DriveType){2{'Removable'}3{'Fixed'}4{'Network'}5{'CD-ROM'}default{'Other'}}
-  $mounts+=[PSCustomObject]@{
-    device=$_.DeviceID; mount=$_.DeviceID; fstype=($(if($_.FileSystem){$_.FileSystem}else{'unknown'}))
-    options="type=$dt;size=$($_.Size);free=$($_.FreeSpace)"; writable=$true; noexec=$false; bind=$false
-  }
-}
-try {
-  Get-SmbMapping -EA Stop|ForEach-Object{
-    $mapped+=[PSCustomObject]@{local=$_.LocalPath;remote=$_.RemotePath;status=$_.Status}
-    $mounts+=[PSCustomObject]@{
-      device=$_.RemotePath; mount=$_.LocalPath; fstype='smb'; options="status=$($_.Status)"
-      writable=$true; noexec=$false; bind=$false
-    }
-  }
-} catch {}
-try {
-  Get-SmbShare -EA Stop|ForEach-Object{
-    $smb+=[PSCustomObject]@{name=$_.Name;path=$_.Path;desc=$_.Description}
-  }
-} catch {}
-Get-CimInstance Win32_Share -EA 0|ForEach-Object{
-  $wmi+=[PSCustomObject]@{name=$_.Name;path=$_.Path;type=$_.Type}
-}
-$net=@($mounts|Where-Object{$_.fstype -eq 'smb' -or $_.options -match 'type=Network'})
-$ctr=@($mounts|Where-Object{$_.mount -match 'docker|wsl|containerd|kubelet' -or $_.device -match 'docker|wsl|containerd|kubelet'})
-$wex=@($mounts|Where-Object{$_.writable -and -not $_.noexec})
-$result=[ordered]@{
-  summary=[ordered]@{
-    total_mounts=$mounts.Count; nfs_smb=$net.Count; container_mounts=$ctr.Count; writable_exec=$wex.Count
-    local_shares=$smb.Count; mapped_drives=$mapped.Count; wmi_shares=$wmi.Count
-  }
+Get-CimInstance Win32_LogicalDisk -EA 0|ForEach-Object{{
+  $dt=switch([int]$_.DriveType){{2{{'Removable'}}3{{'Fixed'}}4{{'Network'}}5{{'CD-ROM'}}default{{'Other'}}}}
+  $mounts+=@{{device=$_.DeviceID;mount=$_.DeviceID;fstype=($(if($_.FileSystem){{$_.FileSystem}}else{{'unknown'}}));options="type=$dt;size=$($_.Size);free=$($_.FreeSpace)";writable=$true;noexec=$false;bind=$false}}
+}}
+try{{
+  Get-SmbMapping -EA Stop|ForEach-Object{{
+    $mapped+=@{{local=$_.LocalPath;remote=$_.RemotePath;status=$_.Status}}
+    $mounts+=@{{device=$_.RemotePath;mount=$_.LocalPath;fstype='smb';options="status=$($_.Status)";writable=$true;noexec=$false;bind=$false}}
+  }}
+}}catch{{}}
+try{{
+  Get-SmbShare -EA Stop|ForEach-Object{{$smb+=@{{name=$_.Name;path=$_.Path;desc=$_.Description}}}}
+}}catch{{}}
+Get-CimInstance Win32_Share -EA 0|ForEach-Object{{$wmi+=@{{name=$_.Name;path=$_.Path;type=$_.Type}}}}
+$net=@($mounts|Where-Object{{$_.fstype -eq 'smb' -or $_.options -match 'type=Network'}})
+$ctr=@($mounts|Where-Object{{$_.mount -match 'docker|wsl|containerd|kubelet' -or $_.device -match 'docker|wsl|containerd|kubelet'}})
+$wex=@($mounts|Where-Object{{$_.writable -and -not $_.noexec}})
+$result=[ordered]@{{
+  summary=@{{total_mounts=$mounts.Count;nfs_smb=$net.Count;container_mounts=$ctr.Count;writable_exec=$wex.Count;local_shares=$smb.Count;mapped_drives=$mapped.Count;wmi_shares=$wmi.Count}}
   mounts=@($mounts|Select-Object -First 80)
   network_mounts=@($net|Select-Object -First 30)
   container_related=@($ctr|Select-Object -First 30)
@@ -129,10 +118,9 @@ $result=[ordered]@{
   smb_shares=$smb
   mapped_drives=$mapped
   wmi_shares=$wmi
-}
-$json=($result|ConvertTo-Json -Depth 5 -Compress)
+}}
+Write-Output ($start+(ConvertTo-Json $result -Depth 5 -Compress)+$end)
 """
-    return wrap_ps_collector(body)
 
 
 @plugin.command(
@@ -147,5 +135,5 @@ def run(session: SessionContext, args):
         _build_linux_command,
         _build_windows_command,
         format_generic_report,
-        timeout=70.0,
+        timeout=30.0,
     )

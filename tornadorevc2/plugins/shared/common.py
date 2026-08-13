@@ -36,6 +36,15 @@ def platform_supported(cmd_platforms: List[str], session_platform: str) -> bool:
     return norm in normalized or 'unknown' in normalized
 
 
+def resolve_session_platform(session) -> str:
+    """Resolve unix/windows for collector dispatch, including unknown sessions."""
+    platform = session.platform
+    if platform and platform != 'unknown':
+        return platform
+    resolved = session._handler.resolve_shell_type(session._client_sock)
+    return resolved or platform or 'unknown'
+
+
 def format_section(title: str, fields: Dict[str, Any], width: int = 22) -> str:
     lines = [title, '-' * len(title)]
     for key, value in fields.items():

@@ -5,8 +5,7 @@ import json
 from ...constants import PLUGIN_MARK_END, PLUGIN_MARK_START
 from ..api import plugin, SessionContext
 from ..linux._helpers import build_linux_collector_command
-from ..windows._helpers import wrap_ps_collector
-from .common import format_clipboard_report
+from .common import format_clipboard_report, resolve_session_platform
 from .runner import parse_collector_json
 
 
@@ -44,28 +43,29 @@ def _build_linux_command():
 
 
 def _build_windows_command():
-    body = r"""
-$result = @{ ok = $false; text = ''; tool = 'powershell'; reason = '' }
-try {
+    return rf"""
+$ErrorActionPreference='SilentlyContinue'
+$start='{PLUGIN_MARK_START}'; $end='{PLUGIN_MARK_END}'
+$result = @{{ ok = $false; text = ''; tool = 'powershell'; reason = '' }}
+try {{
   Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
   $text = [System.Windows.Forms.Clipboard]::GetText()
-  if ($null -ne $text) {
+  if ($null -ne $text) {{
     $result.ok = $true
     $result.text = $text
-  } else {
+  }} else {{
     $result.reason = 'Clipboard empty or non-text content'
-  }
-} catch {
-  try {
+  }}
+}} catch {{
+  try {{
     $text = Get-Clipboard -Format Text -ErrorAction Stop
-    if ($text) { $result.ok = $true; $result.text = $text } else { $result.reason = 'Clipboard empty' }
-  } catch {
+    if ($text) {{ $result.ok = $true; $result.text = $text }} else {{ $result.reason = 'Clipboard empty' }}
+  }} catch {{
     $result.reason = $_.Exception.Message
-  }
-}
-$json = ($result | ConvertTo-Json -Compress)
+  }}
+}}
+Write-Output ($start+(ConvertTo-Json $result -Compress)+$end)
 """
-    return wrap_ps_collector(body)
 
 
 @plugin.command(
@@ -77,12 +77,16 @@ def run(session: SessionContext, args):
     session.log_event('Plugin clipboard: collection started')
     session._handler._flush_shell(session._client_sock, timeout=1.0)
 
-    if session.is_windows:
+    platform = resolve_session_platform(session)
+    win_ps = ''
+    unix_cmd = 'true'
+    if platform == 'windows':
         win_ps = _build_windows_command()
-        unix_cmd = 'true'
-    else:
+    elif platform in ('unix', 'linux'):
         unix_cmd = _build_linux_command()
-        win_ps = ''
+    else:
+        win_ps = _build_windows_command()
+        unix_cmd = _build_linux_command()
 
     raw = session.run_marked(
         unix_cmd,
