@@ -10,6 +10,10 @@ from .runner import run_collector_plugin
 def _linux_collector_source():
     return r'''
 import json, os, glob, subprocess
+def _scrub(s):
+    if not s:
+        return s
+    return s.replace('__T_PLUGIN_START__', '').replace('__T_PLUGIN_END__', '')
 hist_files = []
 candidates = [
     os.path.expanduser('~/.bash_history'), os.path.expanduser('~/.zsh_history'),
@@ -23,7 +27,7 @@ for p in candidates:
         try:
             with open(p, 'r', errors='ignore') as f:
                 lines = f.readlines()[-40:]
-            hist_files.append({'path': p, 'recent': [l.strip()[:200] for l in lines if l.strip()]})
+            hist_files.append({'path': p, 'recent': [_scrub(l.strip()[:200]) for l in lines if l.strip()]})
         except Exception:
             pass
 pkg_hist = []
@@ -42,8 +46,8 @@ except Exception:
 result = {
     'summary': {'history_files': len(hist_files), 'package_logs': len(pkg_hist)},
     'shell_history': hist_files[:20],
-    'package_manager_history': [{'path': x['path'], 'recent': [l.strip()[:160] for l in x['tail']]} for x in pkg_hist],
-    'recent_logins': last.splitlines()[:15] if last else [],
+    'package_manager_history': [{'path': x['path'], 'recent': [_scrub(l.strip()[:160]) for l in x['tail']]} for x in pkg_hist],
+    'recent_logins': [_scrub(l) for l in (last.splitlines()[:15] if last else [])],
 }
 _emit(result)
 '''
