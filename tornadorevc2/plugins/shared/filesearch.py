@@ -1,6 +1,7 @@
 """Cross-platform file and directory search enumeration."""
 
 import json
+import re
 
 from ...constants import PLUGIN_MARK_END, PLUGIN_MARK_START
 from ..api import plugin, SessionContext
@@ -28,16 +29,27 @@ Options (key=value):
 
 Positional shorthand (applied in order: path, name, ext):
   run filesearch /var/log passwd .conf
-  run filesearch C:\\Users keyword .ps1 -r
+  run filesearch 'C:\\Program Files' cmd.exe recursive
+  run filesearch "/opt/my app" config .yaml -r
 
 Examples:
   run filesearch /etc/passwd
   run filesearch path=/etc name=passwd
+  run filesearch path='C:\\Program Files' name=cmd.exe recursive
+  run filesearch path="/opt/my app" name=config.yaml recursive
   run filesearch path=/var/log ext=.log mtime=7 recursive
   run filesearch path=/tmp size=1m owner=root
   run filesearch path=C:\\Users\\Public ext=.txt mtime=30
   run filesearch /home backup .zip -r
 """.strip()
+
+
+def _display_val(value):
+    if isinstance(value, bool):
+        return 'N/A'
+    if value is None or value == '':
+        return 'N/A'
+    return str(value)
 
 
 def _format_filesearch_report(data):
@@ -46,13 +58,13 @@ def _format_filesearch_report(data):
     search = data.get('search') or {}
 
     criteria = {
-        'Path': summary.get('search_path') or search.get('path') or 'N/A',
-        'Recursive': summary.get('recursive', search.get('recursive', 'N/A')),
-        'Name': summary.get('name_filter') or search.get('name') or 'N/A',
-        'Extension': summary.get('extension') or search.get('ext') or 'N/A',
-        'Min Size': summary.get('min_size') or search.get('size') or 'N/A',
-        'Owner': summary.get('owner') or search.get('owner') or 'N/A',
-        'Modified (days)': summary.get('mtime_days') or search.get('mtime') or 'N/A',
+        'Path': _display_val(summary.get('search_path') or search.get('path')),
+        'Recursive': _display_val(summary.get('recursive', search.get('recursive'))),
+        'Name': _display_val(summary.get('name_filter') or search.get('name')),
+        'Extension': _display_val(summary.get('extension') or search.get('ext')),
+        'Min Size': _display_val(summary.get('min_size') or search.get('size')),
+        'Owner': _display_val(summary.get('owner') or search.get('owner')),
+        'Modified (days)': _display_val(summary.get('mtime_days') or search.get('mtime')),
         'Matches': summary.get('matches', 0),
     }
     sections.append(format_section('Search Criteria', criteria))
@@ -65,6 +77,96 @@ def _format_filesearch_report(data):
         sections.append('Matches\n-------\n(none)')
 
     return '\n\n'.join(sections)
+
+
+_FLAG_TOKENS = frozenset({'-r', 'recursive', '--recursive'})
+_KNOWN_KEYS = frozenset({'path', 'name', 'ext', 'size', 'owner', 'mtime', 'recursive'})
+
+
+def _strip_quotes(value):
+    value = (value or '').strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in '"\'':
+        return value[1:-1]
+    return value
+
+
+def _reassemble_quote_fragments(tokens):
+    """Join tokens broken by handler split() inside quoted strings."""
+    out = []
+    buf = ''
+    quote = None
+    for raw in tokens or []:
+        token = raw.strip()
+        if not token:
+            continue
+        if buf:
+            buf += ' ' + token
+            if (quote == "'" and token.endswith("'")) or (quote == '"' and token.endswith('"')):
+                out.append(_strip_quotes(buf))
+                buf = ''
+                quote = None
+            continue
+        if token[0] in '"\'' and (len(token) == 1 or token[-1] != token[0]):
+            buf = token
+            quote = token[0]
+            continue
+        if len(token) >= 2 and token[0] in '"\'' and token[-1] == token[0]:
+            out.append(_strip_quotes(token))
+            continue
+        out.append(token)
+    if buf:
+        out.append(_strip_quotes(buf))
+    return out
+
+
+def _looks_like_path_segment(token):
+    return bool(
+        re.match(r'^[A-Za-z]:', token)
+        or token.startswith(('/', '~', '.'))
+        or('\\' in token)
+        or ('/' in token)
+    )
+
+
+def _looks_like_filename(token):
+    if not token or token.lower() in _FLAG_TOKENS:
+        return False
+    if token.startswith('.'):
+        return True
+    if '/' in token or '\\' in token:
+        return False
+    if '*' in token or '?' in token:
+        return True
+    if '.' in token:
+        return True
+    return False
+
+
+def _is_complete_dir_path(token):
+    if token.startswith('/') and ' ' not in token:
+        return True
+    return False
+
+
+def _split_spaced_path_name_ext(tokens):
+    """Assign positional tokens that may include a multi-word path."""
+    if not tokens:
+        return '', '', ''
+    parts = list(tokens)
+    ext = ''
+    if parts and parts[-1].startswith('.') and len(parts[-1]) > 1 and '\\' not in parts[-1] and '/' not in parts[-1]:
+        ext = parts.pop()
+    name = ''
+    if parts and _looks_like_filename(parts[-1]):
+        name = parts.pop()
+    elif (
+        len(parts) == 2
+        and _is_complete_dir_path(parts[0])
+        and (not _looks_like_path_segment(parts[1]) or '.' in parts[1])
+    ):
+        name = parts.pop()
+    path = ' '.join(parts).strip()
+    return path, name, ext
 
 
 def _parse_search_opts(args):
@@ -80,29 +182,71 @@ def _parse_search_opts(args):
         'mtime': '',
         'recursive': False,
     }
-    for arg in args or []:
-        token = arg.strip()
-        if not token:
-            continue
-        if token in ('-r', 'recursive', '--recursive'):
+    expanded = _reassemble_quote_fragments(args)
+    positionals = []
+    i = 0
+    while i < len(expanded):
+        token = expanded[i]
+        low = token.lower()
+        if low in _FLAG_TOKENS:
             opts['recursive'] = True
+            i += 1
             continue
         if '=' in token:
             key, _, val = token.partition('=')
             key = key.lower().lstrip('-')
-            if key in opts and key != 'recursive':
-                opts[key] = val
-            elif key == 'recursive':
+            if key not in _KNOWN_KEYS:
+                positionals.append(token)
+                i += 1
+                continue
+            if key == 'recursive':
                 opts['recursive'] = val.lower() in ('1', 'true', 'yes', 'on')
-        elif not opts['path']:
-            opts['path'] = token
-        elif not opts['name']:
-            opts['name'] = token
-        elif not opts['ext']:
-            opts['ext'] = token
+                i += 1
+                continue
+            parts = [_strip_quotes(val.strip())]
+            i += 1
+            while i < len(expanded):
+                nxt = expanded[i]
+                if nxt.lower() in _FLAG_TOKENS:
+                    break
+                nxt_key = nxt.partition('=')[0].lower().lstrip('-')
+                if '=' in nxt and nxt_key in _KNOWN_KEYS:
+                    break
+                parts.append(nxt)
+                i += 1
+            opts[key] = _strip_quotes(' '.join(parts).strip())
+            continue
+        positionals.append(token)
+        i += 1
+
+    if positionals and not opts['path']:
+        path, name, ext = _split_spaced_path_name_ext(positionals)
+        if path:
+            opts['path'] = _strip_quotes(path)
+        if name and not opts['name']:
+            opts['name'] = _strip_quotes(name)
+        if ext and not opts['ext']:
+            opts['ext'] = _strip_quotes(ext)
+
+    for key in ('path', 'name', 'ext', 'size', 'owner', 'mtime'):
+        if opts.get(key):
+            opts[key] = _strip_quotes(str(opts[key]))
     if opts['ext'] and not opts['ext'].startswith('.'):
         opts['ext'] = '.' + opts['ext']
     return opts, None
+
+
+def _normalize_windows_path(path):
+    if not path:
+        return path
+    path = path.replace('/', '\\')
+    if re.match(r'^[A-Za-z]:', path):
+        drive = path[0:2]
+        rest = path[2:].lstrip('\\')
+        path = drive + '\\' + rest if rest else drive + '\\'
+    elif len(path) > 3:
+        path = path.rstrip('\\')
+    return path
 
 
 def _linux_collector_source(opts):
@@ -324,7 +468,7 @@ def _build_linux_command(opts):
 
 
 def _build_windows_command(opts):
-    path = opts.get('path') or ''
+    path = _normalize_windows_path(opts.get('path') or '')
     name = opts.get('name') or ''
     ext = opts.get('ext') or ''
     size = opts.get('size') or ''
@@ -334,10 +478,12 @@ def _build_windows_command(opts):
     return rf"""
 $ErrorActionPreference='SilentlyContinue'
 $start='{PLUGIN_MARK_START}'; $end='{PLUGIN_MARK_END}'
-$path={json.dumps(path)}
-$name={json.dumps(name)}; $ext={json.dumps(ext)}; $sizeFilter={json.dumps(size)}
-$ownerFilter={json.dumps(owner)}; $mtimeDays={json.dumps(mtime)}; $recursive='{recursive}'
+$fsPath={json.dumps(path)}
+$fsName={json.dumps(name)}; $fsExt={json.dumps(ext)}; $fsSize={json.dumps(size)}
+$fsOwner={json.dumps(owner)}; $fsMtime={json.dumps(mtime)}; $fsRecurse='{recursive}'
 $found=@(); $seen=@{{}}
+
+function Fmt([string]$v){{if([string]::IsNullOrEmpty($v)){{'N/A'}}else{{$v}}}}
 
 function Add-Match($item){{
   if(-not $item -or $seen.ContainsKey($item.FullName)){{return}}
@@ -346,10 +492,10 @@ function Add-Match($item){{
 }}
 
 function Test-SizeFilter($len){{
-  if(-not $sizeFilter){{return $true}}
+  if([string]::IsNullOrEmpty($fsSize)){{return $true}}
   $min=[int64]0
-  if($sizeFilter -match '^\d+$'){{$min=[int64]$sizeFilter}}
-  elseif($sizeFilter -match '^(\d+(?:\.\d+)?)([kmg])$'){{
+  if($fsSize -match '^\d+$'){{$min=[int64]$fsSize}}
+  elseif($fsSize -match '^(\d+(?:\.\d+)?)([kmg])$'){{
     $n=[double]$Matches[1]
     switch($Matches[2].ToLower()){{'k'{{$min=[int64]($n*1024)}}'m'{{$min=[int64]($n*1024*1024)}}'g'{{$min=[int64]($n*1024*1024*1024)}}}}
   }}
@@ -357,25 +503,25 @@ function Test-SizeFilter($len){{
 }}
 
 function Test-MtimeFilter($dt){{
-  if(-not $mtimeDays){{return $true}}
-  try{{return $dt -ge (Get-Date).AddDays(-1*[int]$mtimeDays)}}catch{{return $true}}
+  if([string]::IsNullOrEmpty($fsMtime)){{return $true}}
+  try{{return $dt -ge (Get-Date).AddDays(-1*[int]$fsMtime)}}catch{{return $true}}
 }}
 
 function Test-NameFilter($base){{
-  if(-not $name){{return $true}}
-  if($name -match '[\*\?]'){{return ($base -ilike $name)}}
-  return ($base -ieq $name)
+  if([string]::IsNullOrEmpty($fsName)){{return $true}}
+  if($fsName -match '[\*\?]'){{return ($base -ilike $fsName)}}
+  return ($base -ieq $fsName)
 }}
 
 function Test-ExtFilter($base){{
-  if(-not $ext){{return $true}}
-  $e=$ext; if($e -and $e[0] -ne '.'){{$e='.'+$e}}
+  if([string]::IsNullOrEmpty($fsExt)){{return $true}}
+  $e=$fsExt; if($e[0] -ne '.'){{$e='.'+$e}}
   return ($base -ilike ('*'+$e))
 }}
 
 function Test-OwnerFilter($full){{
-  if(-not $ownerFilter){{return $true}}
-  try{{return ((Get-Acl $full -EA 0).Owner -ilike ('*'+$ownerFilter+'*'))}}catch{{return $false}}
+  if([string]::IsNullOrEmpty($fsOwner)){{return $true}}
+  try{{return ((Get-Acl $full -EA 0).Owner -ilike ('*'+$fsOwner+'*'))}}catch{{return $false}}
 }}
 
 function Test-ItemFilters($item){{
@@ -389,35 +535,35 @@ function Test-ItemFilters($item){{
 }}
 
 function Try-AddLiteral($target){{
-  if($found.Count -ge 80){{return}}
+  if($script:found.Count -ge 80){{return}}
   if(-not (Test-Path -LiteralPath $target -EA 0)){{return}}
   $f=Get-Item -LiteralPath $target -Force -EA 0
   if($f -and (Test-ItemFilters $f)){{Add-Match $f}}
 }}
 
-if(-not $path){{$path=$env:USERPROFILE}}
+if([string]::IsNullOrEmpty($fsPath)){{$fsPath=$env:USERPROFILE}}
 
 # Absolute file path
-if(Test-Path -LiteralPath $path -PathType Leaf -EA 0){{
-  if(-not $name){{$name=[IO.Path]::GetFileName($path)}}
-  Try-AddLiteral $path
-  if($recursive -ne 'true'){{
+if(Test-Path -LiteralPath $fsPath -PathType Leaf -EA 0){{
+  if([string]::IsNullOrEmpty($fsName)){{$fsName=[IO.Path]::GetFileName($fsPath)}}
+  Try-AddLiteral $fsPath
+  if($fsRecurse -ne 'true'){{
     $result=[ordered]@{{
-      summary=@{{search_path=$path;recursive=$recursive;name_filter=($name -or 'N/A');extension=($ext -or 'N/A');owner=($ownerFilter -or 'N/A');mtime_days=($mtimeDays -or 'N/A');min_size=($sizeFilter -or 'N/A');matches=$found.Count;mode='exact_file'}}
-      search=@{{path=$path;name=$name;ext=$ext;size=$sizeFilter;owner=$ownerFilter;mtime=$mtimeDays;recursive=$recursive}}
+      summary=@{{search_path=$fsPath;recursive=$fsRecurse;name_filter=(Fmt $fsName);extension=(Fmt $fsExt);owner=(Fmt $fsOwner);mtime_days=(Fmt $fsMtime);min_size=(Fmt $fsSize);matches=$found.Count;mode='exact_file'}}
+      search=@{{path=$fsPath;name=$fsName;ext=$fsExt;size=$fsSize;owner=$fsOwner;mtime=$fsMtime;recursive=$fsRecurse}}
       matches=$found
     }}
     Write-Output ($start+(ConvertTo-Json $result -Depth 5 -Compress)+$end)
     return
   }}
-  $path=Split-Path -Parent $path
-  if(-not $path){{$path='C:\'}}
+  $fsPath=Split-Path -Parent $fsPath
+  if([string]::IsNullOrEmpty($fsPath)){{$fsPath='C:\'}}
 }}
 
-if(-not (Test-Path -LiteralPath $path -EA 0)){{
+if(-not (Test-Path -LiteralPath $fsPath -EA 0)){{
   $result=[ordered]@{{
-    summary=@{{search_path=$path;matches=0;error='path not found'}}
-    search=@{{path=$path;name=$name;ext=$ext;size=$sizeFilter;owner=$ownerFilter;mtime=$mtimeDays;recursive=$recursive}}
+    summary=@{{search_path=$fsPath;matches=0;error='path not found'}}
+    search=@{{path=$fsPath;name=$fsName;ext=$fsExt;size=$fsSize;owner=$fsOwner;mtime=$fsMtime;recursive=$fsRecurse}}
     matches=@()
   }}
   Write-Output ($start+(ConvertTo-Json $result -Depth 5 -Compress)+$end)
@@ -425,46 +571,43 @@ if(-not (Test-Path -LiteralPath $path -EA 0)){{
 }}
 
 try{{
-  $exactName=($name -and $name -notmatch '[\*\?]')
+  $exactName=(-not [string]::IsNullOrEmpty($fsName)) -and ($fsName -notmatch '[\*\?]')
 
-  # Exact name in directory root (e.g. System32\cmd.exe)
-  if($exactName){{Try-AddLiteral (Join-Path $path $name)}}
+  if($exactName){{Try-AddLiteral (Join-Path $fsPath $fsName)}}
 
-  if($found.Count -lt 80){{
-    if($exactName -and $recursive -eq 'true'){{
-      # Native recursive exact-name search — fast on large trees
-      $whereCmd='where.exe /R "'+$path.Replace('"','""')+'" '+$name
-      $whereOut=cmd /c $whereCmd 2>nul
-      if($whereOut){{
-        foreach($line in ($whereOut -split "`r?`n")){{
-          $line=$line.Trim()
-          if($line){{Try-AddLiteral $line}}
-          if($found.Count -ge 80){{break}}
-        }}
+  if($script:found.Count -lt 80 -and $exactName -and $fsRecurse -eq 'true'){{
+    $whereLines=@(& where.exe /R $fsPath $fsName 2>$null)
+    if(-not $whereLines -or $whereLines.Count -eq 0){{
+      Get-ChildItem -Path $fsPath -Filter $fsName -Recurse -Force -ErrorAction SilentlyContinue|
+        Select-Object -First 80|ForEach-Object{{Try-AddLiteral $_.FullName}}
+    }}else{{
+      foreach($line in $whereLines){{
+        $line=$line.Trim()
+        if($line){{Try-AddLiteral $line}}
+        if($script:found.Count -ge 80){{break}}
       }}
-    }}elseif(-not $exactName -or $recursive -ne 'true'){{
-      # Filtered enumeration — never scan unfiltered large directories
-      $gciFilter=$null
-      if($name){{$gciFilter=$name}}
-      elseif($ext){{
-        $e=$ext; if($e -and $e[0] -ne '.'){{$e='.'+$e}}
-        $gciFilter='*'+$e
-      }}
-      $params=@{{Path=$path;Force=$true;ErrorAction='SilentlyContinue'}}
-      if($gciFilter){{$params['Filter']=$gciFilter}}
-      if($recursive -eq 'true'){{$params['Recurse']=$true}}
-      Get-ChildItem @params|Select-Object -First 200|ForEach-Object{{
-        if($found.Count -ge 80){{return}}
-        if(-not (Test-NameFilter $_.Name)){{return}}
-        if(Test-ItemFilters $_){{Add-Match $_}}
-      }}
+    }}
+  }}elseif($script:found.Count -lt 80){{
+    $gciFilter=$null
+    if(-not [string]::IsNullOrEmpty($fsName)){{$gciFilter=$fsName}}
+    elseif(-not [string]::IsNullOrEmpty($fsExt)){{
+      $e=$fsExt; if($e[0] -ne '.'){{$e='.'+$e}}
+      $gciFilter='*'+$e
+    }}
+    $params=@{{Path=$fsPath;Force=$true;ErrorAction='SilentlyContinue'}}
+    if($gciFilter){{$params['Filter']=$gciFilter}}
+    if($fsRecurse -eq 'true'){{$params['Recurse']=$true}}
+    Get-ChildItem @params|Select-Object -First 200|ForEach-Object{{
+      if($script:found.Count -ge 80){{return}}
+      if(-not (Test-NameFilter $_.Name)){{return}}
+      if(Test-ItemFilters $_){{Add-Match $_}}
     }}
   }}
 }}catch{{}}
 
 $result=[ordered]@{{
-  summary=@{{search_path=$path;recursive=$recursive;name_filter=($name -or 'N/A');extension=($ext -or 'N/A');owner=($ownerFilter -or 'N/A');mtime_days=($mtimeDays -or 'N/A');min_size=($sizeFilter -or 'N/A');matches=$found.Count}}
-  search=@{{path=$path;name=$name;ext=$ext;size=$sizeFilter;owner=$ownerFilter;mtime=$mtimeDays;recursive=$recursive}}
+  summary=@{{search_path=$fsPath;recursive=$fsRecurse;name_filter=(Fmt $fsName);extension=(Fmt $fsExt);owner=(Fmt $fsOwner);mtime_days=(Fmt $fsMtime);min_size=(Fmt $fsSize);matches=$found.Count}}
+  search=@{{path=$fsPath;name=$fsName;ext=$fsExt;size=$fsSize;owner=$fsOwner;mtime=$fsMtime;recursive=$fsRecurse}}
   matches=$found
 }}
 Write-Output ($start+(ConvertTo-Json $result -Depth 5 -Compress)+$end)
@@ -498,7 +641,10 @@ def run(session: SessionContext, args):
         unix_cmd = _build_linux_command(opts)
         platform = 'unknown'
 
-    raw = _run_collector_marked(session, unix_cmd, win_ps, platform, 60.0 if platform == 'windows' else 45.0)
+    raw = _run_collector_marked(
+        session, unix_cmd, win_ps, platform,
+        90.0 if platform == 'windows' and opts.get('recursive') else (60.0 if platform == 'windows' else 45.0),
+    )
 
     if raw is None:
         session.print("Plugin 'filesearch' failed — no response from target.", 'red')
