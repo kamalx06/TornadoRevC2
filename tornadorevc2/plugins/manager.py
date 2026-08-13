@@ -14,7 +14,7 @@ from .api import SessionContext, get_registry
 
 from .loader import EXTERNAL_PLUGIN_DIR, PluginLoader
 
-from .shared.common import platform_supported
+from .shared.common import filter_commands_by_platform, platform_supported
 
 
 
@@ -58,23 +58,67 @@ class PluginManager:
 
 
 
-    def list_plugins(self, show_all: bool = False):
+    def _session_platform(self, client_sock) -> str:
+
+        info = self.h._client_info(client_sock)
+
+        if not info:
+
+            return 'unknown'
+
+        return self.h.resolve_shell_type(client_sock, info)
+
+
+
+    def _commands_for_session(self, client_sock):
+
+        platform = self._session_platform(client_sock)
+
+        return filter_commands_by_platform(get_registry().all_commands(), platform)
+
+
+
+    def list_plugins(self, show_all: bool = False, client_sock=None):
 
         c = self._colors()
 
         registry = get_registry()
 
-        all_cmds = registry.all_commands()
+        session_platform = None
+
+        if client_sock is not None:
+
+            session_platform = self._session_platform(client_sock)
+
+            all_cmds = filter_commands_by_platform(registry.all_commands(), session_platform)
+
+        else:
+
+            all_cmds = registry.all_commands()
 
         loaded = self._loader.loaded_modules()
 
 
 
-        print(f"\n{c['cyan']}PLUGINS | Loaded: {len(self._enabled)}{c['end']}")
+        loaded_count = sum(1 for name in all_cmds if name in self._enabled)
+
+        header = f"\n{c['cyan']}PLUGINS | Loaded: {loaded_count}{c['end']}"
+
+        if session_platform is not None:
+
+            header += f" | Platform: {session_platform}"
+
+        print(header)
 
         if not all_cmds:
 
-            print(f"{c['yellow']}No plugins registered{c['end']}")
+            if session_platform is not None:
+
+                print(f"{c['yellow']}No plugins available for this session platform{c['end']}")
+
+            else:
+
+                print(f"{c['yellow']}No plugins registered{c['end']}")
 
             return
 
@@ -126,7 +170,7 @@ class PluginManager:
 
 
 
-    def plugin_info(self, name: str) -> bool:
+    def plugin_info(self, name: str, client_sock=None) -> bool:
 
         c = self._colors()
 
@@ -137,6 +181,22 @@ class PluginManager:
             print(f"{c['red']}Plugin '{name}' not found{c['end']}")
 
             return False
+
+        if client_sock is not None:
+
+            platform = self._session_platform(client_sock)
+
+            if not platform_supported(cmd.platforms, platform):
+
+                print(
+
+                    f"{c['red']}Plugin '{name}' is not available for "
+
+                    f"{platform} sessions (supports: {', '.join(cmd.platforms)}){c['end']}"
+
+                )
+
+                return False
 
         enabled = name in self._enabled
 
@@ -486,7 +546,13 @@ class PluginManager:
 
         if sub in ('list', 'ls', ''):
 
-            self.list_plugins(show_all=(len(cmd_parts) > 2 and cmd_parts[2] == '--verbose'))
+            self.list_plugins(
+
+                show_all=(len(cmd_parts) > 2 and cmd_parts[2] == '--verbose'),
+
+                client_sock=client_sock,
+
+            )
 
         elif sub == 'load' and len(cmd_parts) >= 3:
 
@@ -502,23 +568,66 @@ class PluginManager:
 
         elif sub == 'info' and len(cmd_parts) >= 3:
 
-            self.plugin_info(cmd_parts[2])
+            self.plugin_info(cmd_parts[2], client_sock=client_sock)
 
         elif sub == 'help':
 
-            self._print_plugins_help()
+            self._print_plugins_help(client_sock=client_sock)
 
         else:
 
-            self._print_plugins_help()
+            self._print_plugins_help(client_sock=client_sock)
 
         return True
 
 
 
-    def _print_plugins_help(self):
+    def _print_plugins_help(self, client_sock=None):
 
         c = self._colors()
+
+        if client_sock is not None:
+
+            platform = self._session_platform(client_sock)
+
+            print(f"""
+
+    {c['green']}PLUGIN MANAGEMENT (session — {platform}):{c['end']}
+
+    plugins / plugins list              List plugins for this session
+
+    plugins list --verbose              Show module paths
+
+    plugins load <name>                 Load a plugin at runtime
+
+    plugins unload <name>               Unload/disable a plugin
+
+    plugins reload <name>               Reload a plugin module
+
+    plugins info <name>                 Show plugin details
+
+    run <plugin> [args...]              Execute a plugin on this session
+
+                                          inmemory:  run inmemory <filetype> <local_file> [-- args] [--save-output <file>]
+                                                     filetypes: py, ps, exe, elf, bat, sh
+
+                                          quickenum: run quickenum
+
+                                          clipboard: run clipboard
+
+                                          wiper:     run wiper <remote_file_path>
+
+
+
+    {c['yellow']}Only plugins compatible with {platform} are listed and runnable here.{c['end']}
+
+
+
+    {c['yellow']}External plugins: place modules in ./{EXTERNAL_PLUGIN_DIR}{c['end']}""")
+
+            return
+
+
 
         print(f"""
 
@@ -557,7 +666,11 @@ class PluginManager:
 
 
 
-    def completion_plugins(self) -> List[str]:
+    def completion_plugins(self, client_sock=None) -> List[str]:
 
-        return sorted(get_registry().all_commands().keys())
+        if client_sock is None:
+
+            return sorted(get_registry().all_commands().keys())
+
+        return sorted(self._commands_for_session(client_sock).keys())
 

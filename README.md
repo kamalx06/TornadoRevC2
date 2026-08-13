@@ -104,7 +104,7 @@ run inmemory 1 sh ./linpeas.sh           # Shell script (e.g. LinPEAS)
 run inmemory 1 bat C:\tools\winPEAS.bat  # Batch script (e.g. WinPEAS)
 ```
 
-When attached to a session via `switch <ID>`, omit the session ID from commands that normally require one (for example, `run quickenum` instead of `run quickenum 1`).
+When attached to a session via `switch <ID>`, omit the session ID from commands that normally require one (for example, `run quickenum` instead of `run quickenum 1`). Inside a client session, plugin listings, TAB completion, and execution are limited to plugins compatible with that session's operating system (shared plugins plus Windows- or Linux-specific plugins as appropriate). The main handler console always shows and can run all registered plugins.
 
 ---
 
@@ -134,6 +134,10 @@ When attached to a session via `switch <ID>`, omit the session ID from commands 
 | `plugins reload <name>` | Reload a plugin module |
 | `plugins info <name>` | Display plugin metadata |
 | `run <plugin> <ID> [args...]` | Execute a plugin against a session |
+
+From the main handler (`tornado>`), all registered plugins are listed, suggested by TAB completion, and runnable via `run <plugin> <ID> ...`.
+
+Inside an attached client session (`switch <ID>`), omit `<ID>` from plugin commands. Plugin listings, TAB completion, and execution are filtered to plugins compatible with that session's platform: **shared plugins** are available on both Windows and Linux/Unix sessions; **Windows-only** and **Linux/Unix-only** plugins appear only in matching sessions. The main handler is unaffected—operators can still target any session with any plugin from `tornado>`.
 
 ### File transfer
 
@@ -235,6 +239,21 @@ Plugins extend TornadoRevC2 at runtime without modifying core handler code. Buil
 - Built-in plugins are **soft-disabled** by `plugins unload` (the module remains imported).
 - External plugins are **fully unloaded** and unregistered.
 - `plugins reload` removes stale command registrations before re-importing, preventing orphaned entries after renames.
+
+### Platform filtering in client sessions
+
+Each plugin declares supported platforms via `@plugin.command(platforms=[...])`. At execution time, the handler checks compatibility with the target session's OS.
+
+When attached to a client session (`switch <ID>`), plugin discovery is scoped to that session:
+
+| Context | Plugin listing | TAB completion | Execution |
+|---------|----------------|----------------|-----------|
+| Main handler (`tornado>`) | All plugins | All plugins | All plugins (with per-session platform check) |
+| Client session | Shared + OS-specific only | Shared + OS-specific only | Shared + OS-specific only |
+
+Shared plugins (for example `quickenum`, `history`, `inmemory`, `mounts`) are available in both Windows and Linux/Unix sessions. Windows-only plugins (for example `services`, `registry`) appear only in Windows sessions; Linux-only plugins (for example `cron`, `systemd`) appear only in Linux/Unix sessions.
+
+From the main handler, operators retain full visibility and can run any plugin against any session using `run <plugin> <ID> ...`—the existing workflow is unchanged.
 
 ### Architecture
 
@@ -450,13 +469,13 @@ Pass `format_process_report` instead of `format_generic_report` to `run_collecto
 
 **Platform-specific plugins**
 
-For Windows-only plugins, pass `None` as the Linux builder:
+For Windows-only plugins, pass `None` as the Linux builder and set `platforms=["windows"]` so the command is hidden on Linux/Unix sessions (listing, TAB completion, and execution inside a non-Windows client session):
 
 ```python
 return run_collector_plugin(session, "services", None, build_command, format_generic_report)
 ```
 
-For Linux-only plugins, pass `None` as the Windows builder. Set `platforms=["linux", "unix"]` on the decorator so the command is hidden on Windows sessions.
+For Linux-only plugins, pass `None` as the Windows builder. Set `platforms=["linux", "unix"]` on the decorator so the command is hidden on Windows sessions (listing, TAB completion, and execution inside a Windows client session).
 
 #### Handling arguments
 

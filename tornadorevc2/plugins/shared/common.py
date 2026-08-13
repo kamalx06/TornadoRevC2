@@ -36,6 +36,15 @@ def platform_supported(cmd_platforms: List[str], session_platform: str) -> bool:
     return norm in normalized or 'unknown' in normalized
 
 
+def filter_commands_by_platform(commands, session_platform: str):
+    """Return only commands compatible with the given session platform."""
+    return {
+        name: cmd
+        for name, cmd in commands.items()
+        if platform_supported(cmd.platforms, session_platform)
+    }
+
+
 def resolve_session_platform(session) -> str:
     """Resolve unix/windows for collector dispatch, including unknown sessions."""
     platform = session.platform

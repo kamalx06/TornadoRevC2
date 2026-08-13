@@ -212,6 +212,7 @@ class TORNADOREVC2:
         words = readline.get_line_buffer().split()
         cmd = words[0].lower() if words else ''
         mode = getattr(self, '_completer_mode', 'main')
+        session_sock = self.current_client if mode == 'client' else None
         if mode == 'client':
             if arg_i == 0:
                 return sorted(c for c in CLIENT_COMMANDS if c.startswith(text.lower()))
@@ -220,7 +221,7 @@ class TORNADOREVC2:
             if cmd == 'download' and arg_i == 2:
                 return self._complete_paths(text)
             if cmd == 'run' and arg_i == 1:
-                return sorted(p for p in self.plugins.completion_plugins() if p.startswith(text.lower()))
+                return sorted(p for p in self.plugins.completion_plugins(session_sock) if p.startswith(text.lower()))
             if cmd == 'run' and arg_i == 2 and words[1].lower() == 'inmemory':
                 return sorted(t for t in INMEMORY_FILETYPES if t.startswith(text.lower()))
             if cmd == 'run' and arg_i == 3 and words[1].lower() == 'inmemory':
@@ -229,7 +230,7 @@ class TORNADOREVC2:
                 subs = ('list', 'load', 'unload', 'reload', 'info', 'help')
                 return sorted(s for s in subs if s.startswith(text.lower()))
             if cmd == 'plugins' and arg_i == 2 and words[1].lower() in ('load', 'unload', 'reload', 'info'):
-                return sorted(p for p in self.plugins.completion_plugins() if p.startswith(text.lower()))
+                return sorted(p for p in self.plugins.completion_plugins(session_sock) if p.startswith(text.lower()))
             return []
         if arg_i == 0:
             return sorted(c for c in MAIN_COMMANDS if c.startswith(text.lower()))
