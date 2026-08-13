@@ -500,86 +500,76 @@ try {{
     $cs = Get-CimInstance Win32_ComputerSystem -EA 0
     $proc = Get-CimInstance Win32_Processor -EA 0 | Select-Object -First 1
 
-    $uptimeText = ''
-    if ($os -and $os.LastBootUpTime) {{
-        $uptimeSpan = (Get-Date) - $os.LastBootUpTime
-        $uptime = @()
-        if ($uptimeSpan.Days) {{ $uptime += "$($uptimeSpan.Days)d" }}
-        if ($uptimeSpan.Hours) {{ $uptime += "$($uptimeSpan.Hours)h" }}
-        $uptime += "$($uptimeSpan.Minutes)m"
-        $uptimeText = ($uptime -join ' ')
+    $info = [ordered]@{{ collection_mode = 'full' }}
+    $info.hostname = $env:COMPUTERNAME
+    $info.username = $env:USERNAME
+    $info.domain = $env:USERDOMAIN
+    $info.home = $env:USERPROFILE
+    $info.architecture = $env:PROCESSOR_ARCHITECTURE
+    $info.platform = [System.Environment]::OSVersion.VersionString
+    $info.cpu_count = $env:NUMBER_OF_PROCESSORS
+    $info.cwd = (Get-Location).Path
+    $info.pid = $PID
+    $info.powershell = $PSVersionTable.PSVersion.ToString()
+    $info.timezone = [System.TimeZoneInfo]::Local.DisplayName
+    $info.locale = [System.Globalization.CultureInfo]::CurrentCulture.Name
+
+    $info.fqdn = $env:COMPUTERNAME
+    try {{ $info.fqdn = [System.Net.Dns]::GetHostEntry($env:COMPUTERNAME).HostName }} catch {{}}
+
+    $info.is_admin = $false
+    try {{
+        $info.is_admin = [bool](([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))
+    }} catch {{}}
+
+    if ($os) {{
+        $info.os = $os.Caption
+        $info.os_release = $os.Version
+        $info.os_version = $os.BuildNumber
+        $info.kernel = $os.Version
+        $info.system_directory = $os.SystemDirectory
+        if ($os.LastBootUpTime) {{
+            $span = (Get-Date) - $os.LastBootUpTime
+            $parts = @()
+            if ($span.Days) {{ $parts += "$($span.Days)d" }}
+            if ($span.Hours) {{ $parts += "$($span.Hours)h" }}
+            $parts += "$($span.Minutes)m"
+            $info.uptime = ($parts -join ' ')
+        }}
+        if ($os.FreePhysicalMemory -and $cs -and $cs.TotalPhysicalMemory) {{
+            $freeMb = [math]::Round($os.FreePhysicalMemory / 1KB, 0)
+            $totalGb = [math]::Round($cs.TotalPhysicalMemory / 1GB, 1)
+            $info.memory = "$freeMb MB free / $totalGb GB total"
+        }}
+    }} else {{
+        $info.os = [System.Environment]::OSVersion.VersionString
     }}
 
-    $memory = ''
-    if ($cs -and $cs.TotalPhysicalMemory -and $os) {{
-        $totalMemGb = [math]::Round($cs.TotalPhysicalMemory / 1GB, 1)
-        $freeMemMb = [math]::Round($os.FreePhysicalMemory / 1KB, 0)
-        $memory = "$freeMemMb MB free / $totalMemGb GB total"
+    if ($proc) {{ $info.cpu = $proc.Name }}
+    if ($cs) {{
+        $info.manufacturer = $cs.Manufacturer
+        $info.model = $cs.Model
+        $info.logged_on_user = $cs.UserName
+        $info.domain_joined = [bool]$cs.PartOfDomain
     }}
 
-    $diskText = ''
     try {{
         $loc = Get-Location
-        if ($loc -and $loc.Drive -and $loc.Drive.Name) {{
-            $driveName = $loc.Drive.Name
-            $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$driveName`:'" -EA 0
+        if ($loc.Drive -and $loc.Drive.Name) {{
+            $disk = Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='{{0}}:'" -f $loc.Drive.Name) -EA 0
             if ($disk -and $disk.Size) {{
-                $diskText = "{{0:N1}} GB free / {{1:N1}} GB total" -f ($disk.FreeSpace / 1GB), ($disk.Size / 1GB)
+                $info.disk = "{{0:N1}} GB free / {{1:N1}} GB total" -f ($disk.FreeSpace / 1GB), ($disk.Size / 1GB)
             }}
         }}
     }} catch {{}}
 
-    $ipText = ''
     try {{
-        $ips = @(
-            [System.Net.Dns]::GetHostAddresses($env:COMPUTERNAME) |
+        $ips = [System.Net.Dns]::GetHostAddresses($env:COMPUTERNAME) |
             Where-Object {{ $_.AddressFamily -eq 'InterNetwork' -and $_.IPAddressToString -notlike '127.*' }} |
             ForEach-Object {{ $_.IPAddressToString }}
-        )
-        $ipText = ($ips | Sort-Object -Unique) -join ', '
+        $info.ip_addresses = ($ips | Sort-Object -Unique) -join ', '
     }} catch {{}}
 
-    $fqdn = $env:COMPUTERNAME
-    try {{ $fqdn = [System.Net.Dns]::GetHostEntry($env:COMPUTERNAME).HostName }} catch {{}}
-
-    $isAdmin = $false
-    try {{
-        $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
-            [Security.Principal.WindowsBuiltInRole]::Administrator
-        )
-    }} catch {{}}
-
-    $info = @{{
-        collection_mode = 'full'
-        hostname = $env:COMPUTERNAME
-        fqdn = $fqdn
-        username = $env:USERNAME
-        domain = $env:USERDOMAIN
-        home = $env:USERPROFILE
-        is_admin = [bool]$isAdmin
-        os = $(if ($os) {{ $os.Caption }} else {{ [System.Environment]::OSVersion.VersionString }})
-        os_release = $(if ($os) {{ $os.Version }} else {{ '' }})
-        os_version = $(if ($os) {{ $os.BuildNumber }} else {{ '' }})
-        kernel = $(if ($os) {{ $os.Version }} else {{ '' }})
-        architecture = $env:PROCESSOR_ARCHITECTURE
-        platform = [System.Environment]::OSVersion.VersionString
-        cpu_count = $env:NUMBER_OF_PROCESSORS
-        cpu = $(if ($proc) {{ $proc.Name }} else {{ '' }})
-        memory = $memory
-        disk = $diskText
-        uptime = $uptimeText
-        timezone = [System.TimeZoneInfo]::Local.DisplayName
-        locale = [System.Globalization.CultureInfo]::CurrentCulture.Name
-        ip_addresses = $ipText
-        manufacturer = $(if ($cs) {{ $cs.Manufacturer }} else {{ '' }})
-        model = $(if ($cs) {{ $cs.Model }} else {{ '' }})
-        logged_on_user = $(if ($cs) {{ $cs.UserName }} else {{ '' }})
-        domain_joined = $(if ($cs) {{ [bool]$cs.PartOfDomain }} else {{ $false }})
-        system_directory = $(if ($os) {{ $os.SystemDirectory }} else {{ '' }})
-        cwd = (Get-Location).Path
-        pid = $PID
-        powershell = $PSVersionTable.PSVersion.ToString()
-    }}
     Write-Output ($start + (ConvertTo-Json -Compress $info) + $end)
 }} catch {{
     $err = @{{ collection_mode = 'full'; error = $_.Exception.Message }}

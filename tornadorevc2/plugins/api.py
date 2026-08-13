@@ -107,6 +107,9 @@ class SessionContext:
     @property
     def platform(self):
         """Shell type: unix, windows, or unknown."""
+        resolved = self._handler.resolve_shell_type(self._client_sock, self._info)
+        if resolved != 'unknown':
+            return resolved
         return self._info.get('type', 'unknown')
 
     @property
@@ -222,16 +225,13 @@ class SessionContext:
     ) -> Optional[str]:
         shell_type = self.platform
         if shell_type == 'unknown':
-            for st in ('unix', 'windows'):
+            for st in ('windows', 'unix'):
                 payload = self._handler._run_marked(
                     self._client_sock, unix_cmd, win_ps_script, st,
                     timeout=timeout, start_mark=start_mark, end_mark=end_mark, strip_ws=strip_ws,
                 )
                 if payload is not None:
-                    with self._handler.client_lock:
-                        info = self._handler.revshell_clients.get(self._client_sock)
-                        if info:
-                            info['type'] = st
+                    self._handler._pin_shell_type(self._client_sock, st)
                     self._info = self._handler._client_info(self._client_sock) or self._info
                     return payload
             return None
