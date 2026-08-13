@@ -19,5 +19,5 @@ def run(session: SessionContext, args):
         build_linux_cmd,
         build_windows_cmd,
         format_generic_report,
-        timeout=30.0,
+        timeout=70.0,
     )
