@@ -22,6 +22,36 @@ def parse_collector_json(raw: Optional[str]) -> dict:
         return {}
 
 
+def _run_collector_marked(session, unix_cmd: str, win_ps: str, platform: str, timeout: float) -> Optional[str]:
+    handler = session._handler
+    sock = session._client_sock
+    kwargs = dict(
+        timeout=timeout,
+        start_mark=PLUGIN_MARK_START,
+        end_mark=PLUGIN_MARK_END,
+        strip_ws=False,
+    )
+
+    if platform == 'unknown':
+        for shell_type in ('windows', 'unix'):
+            if shell_type == 'windows' and not win_ps:
+                continue
+            if shell_type == 'unix' and not unix_cmd:
+                continue
+            payload = handler._run_marked(
+                sock,
+                unix_cmd if shell_type == 'unix' else 'true',
+                win_ps if shell_type == 'windows' else '',
+                shell_type,
+                **kwargs,
+            )
+            if payload is not None:
+                return payload
+        return None
+
+    return handler._run_marked(sock, unix_cmd, win_ps, platform, **kwargs)
+
+
 def run_collector_plugin(
     session,
     plugin_name: str,
@@ -55,15 +85,9 @@ def run_collector_plugin(
             win_ps = win_builder()
         if unix_builder:
             unix_cmd = unix_builder()
+        platform = 'unknown'
 
-    raw = session.run_marked(
-        unix_cmd,
-        win_ps,
-        timeout=timeout,
-        start_mark=PLUGIN_MARK_START,
-        end_mark=PLUGIN_MARK_END,
-        strip_ws=False,
-    )
+    raw = _run_collector_marked(session, unix_cmd, win_ps, platform, timeout)
 
     if raw is None:
         session.print(f"Plugin '{plugin_name}' failed — no response from target.", 'red')

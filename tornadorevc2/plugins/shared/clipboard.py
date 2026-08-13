@@ -6,7 +6,7 @@ from ...constants import PLUGIN_MARK_END, PLUGIN_MARK_START
 from ..api import plugin, SessionContext
 from ..linux._helpers import build_linux_collector_command
 from .common import format_clipboard_report, resolve_session_platform
-from .runner import parse_collector_json
+from .runner import _run_collector_marked, parse_collector_json
 
 
 def _linux_collector_source():
@@ -87,15 +87,9 @@ def run(session: SessionContext, args):
     else:
         win_ps = _build_windows_command()
         unix_cmd = _build_linux_command()
+        platform = 'unknown'
 
-    raw = session.run_marked(
-        unix_cmd,
-        win_ps,
-        timeout=20.0,
-        start_mark=PLUGIN_MARK_START,
-        end_mark=PLUGIN_MARK_END,
-        strip_ws=False,
-    )
+    raw = _run_collector_marked(session, unix_cmd, win_ps, platform, 20.0)
 
     if raw is None:
         session.print("Plugin 'clipboard' failed — no response from target.", 'red')

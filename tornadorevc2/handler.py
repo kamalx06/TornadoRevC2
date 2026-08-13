@@ -445,6 +445,9 @@ class TORNADOREVC2:
             return None
         output = self.recv_output(client_sock, timeout=timeout, until_marker=end_mark)
         payload = self._extract_marked(output, start_mark, end_mark, strip_ws)
+        if payload is None and output and end_mark in output:
+            output += self.recv_output(client_sock, timeout=min(3.0, timeout), until_marker=end_mark)
+            payload = self._extract_marked(output, start_mark, end_mark, strip_ws)
         if payload is not None and shell_type in ('windows', 'unix'):
             self._pin_shell_type(client_sock, shell_type)
         return payload
