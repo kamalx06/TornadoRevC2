@@ -89,7 +89,6 @@ run privesccheck 1 ./linpeas.sh # Privilege escalation scan (operator-supplied s
 | `plugins [list\|load\|unload\|reload\|info]` | Manage plugins |
 | `run <plugin> <ID> [args...]` | Execute a plugin on a session |
 | `runpy` / `runps` / `runexe` / `runelf <ID> <local>` | In-memory payload execution |
-| `clipboard <ID>` | Read remote clipboard |
 | `upload` / `download` / `verify` | File transfer with integrity checks |
 | `socks <ID> <port>` | Start SOCKS5 pivot through a session |
 | `socks stop <proxy_id>` | Stop SOCKS proxy and clean up remote artifacts |
@@ -142,9 +141,9 @@ Route operator tools through a compromised host to reach internal networks.
 
 When the last SOCKS proxy for a session is stopped, TornadoRevC2 terminates the remote tunnel agent, removes uploaded scripts and marker files, and logs cleanup status. Session disconnect triggers the same remote cleanup path.
 
-### Export and Clipboard
+### Export
 
-Generate HTML session transcripts and read the remote clipboard from the handler console.
+Generate HTML session transcripts from the handler console.
 
 ---
 
@@ -284,6 +283,7 @@ Plugin output is displayed in the terminal and written to `logs/<session>/plugin
 | `wiper` | Secure multi-pass file overwrite (zeros → ones → random) then delete |
 | `mounts` | Mounts, SMB/NFS shares, mapped drives, bind mounts, container filesystems |
 | `history` | Shell history, package/update logs, recent login activity |
+| `clipboard` | Read remote clipboard text (Windows Forms / wl-clipboard / xclip / xsel) |
 
 ### Linux / Unix
 
@@ -343,6 +343,20 @@ Findings
 - .env file found
 
 Collection time: 4.2s
+```
+
+### Clipboard
+
+Read the remote session's clipboard contents. On Windows, uses `System.Windows.Forms` or `Get-Clipboard`. On Linux/Unix, tries `wl-paste`, `xclip`, and `xsel`.
+
+```bash
+run clipboard 1
+```
+
+Inside an attached shell:
+
+```bash
+run clipboard
 ```
 
 ### Wiper
@@ -424,6 +438,9 @@ tornadorevc2/
     manager.py            # Runtime loading and execution
     loader.py             # Module discovery
     shared/               # Cross-platform plugin entries
+      clipboard.py        # Remote clipboard read
+      history.py          # Shell history and login activity
+      mounts.py           # Mounts, shares, and filesystem enumeration
       common.py           # Formatting and platform helpers
       runner.py           # Collector execution and JSON parsing
     linux/                # Linux-specific collectors

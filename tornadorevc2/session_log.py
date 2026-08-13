@@ -78,10 +78,6 @@ class SessionLogger:
             f"({record.get('type')}, {record.get('runtime_ms', 0)} ms)"
         )
 
-    def log_clipboard(self, action, success, detail=''):
-        status = 'success' if success else 'failed'
-        self.log_event(f"Clipboard {action}: {status}" + (f" ({detail})" if detail else ''))
-
     def log_tunnel(self, message):
         self.log_event(f"Tunnel: {message}")
 

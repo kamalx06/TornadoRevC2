@@ -169,6 +169,19 @@ def format_generic_report(data: Dict[str, Any], title: str = 'Results') -> str:
     return '\n\n'.join(sections)
 
 
+def format_clipboard_report(data: Dict[str, Any]) -> str:
+    if not data.get('ok'):
+        reason = data.get('reason') or data.get('error') or 'unknown error'
+        return f'Clipboard read failed: {reason}'
+    text = data.get('text', '')
+    tool = data.get('tool', 'unknown')
+    preview = text if len(text) <= 200 else text[:200] + '...'
+    lines = [f'Clipboard ({tool}):', preview]
+    if len(text) > 200:
+        lines.append(f'({len(text)} characters total)')
+    return '\n'.join(lines)
+
+
 def format_quickenum_report(data: Dict[str, Any]) -> str:
     sections = []
     host = data.get('host_summary') or {}

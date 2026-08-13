@@ -542,6 +542,8 @@ class PluginManager:
 
                                           quickenum: run quickenum <ID>
 
+                                          clipboard: run clipboard <ID>
+
                                           wiper:     run wiper <ID> <remote_file_path>
 
                                           privesccheck: run privesccheck <ID> <local_script>
