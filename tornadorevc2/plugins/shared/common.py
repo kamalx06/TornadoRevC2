@@ -473,6 +473,11 @@ def format_nullcrypt_report(data: Dict[str, Any], wiped: Optional[bool] = None) 
             lines.append(f'{key.replace("_", " ").title():<14}{val}')
     if wiped is not None:
         lines.append(f"{'Original wiped':<14}{'yes' if wiped else 'no'}")
+    wipe_steps = data.get('wipe_steps') or []
+    if wipe_steps:
+        lines.append(f"{'Wipe steps':<14}{', '.join(wipe_steps)}")
+    if data.get('wipe_detail'):
+        lines.append(f"{'Wipe detail':<14}{data['wipe_detail']}")
     if data.get('message'):
         lines.append(f"Message:       {data['message']}")
     if data.get('error'):
