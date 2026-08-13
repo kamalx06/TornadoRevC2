@@ -1,8 +1,8 @@
 """Cross-platform installed software and package manager enumeration."""
 
-from ...constants import PLUGIN_MARK_END, PLUGIN_MARK_START
 from ..api import plugin, SessionContext
 from ..linux._helpers import build_linux_collector_command
+from ..windows._helpers import wrap_ps_collector
 from .common import format_generic_report
 from .runner import run_collector_plugin
 
@@ -115,72 +115,87 @@ def _build_linux_command():
 
 
 def _build_windows_command():
-    return rf"""
-$ErrorActionPreference='SilentlyContinue'
-$start='{PLUGIN_MARK_START}'; $end='{PLUGIN_MARK_END}'
-$managers=@{{}}; $recent=@(); $repos=@(); $names=@(); $packages=@()
+    body = r"""
+function Invoke-Timed([scriptblock]$Block,[int]$Sec=10,[object[]]$ArgList=@()){
+  $job=Start-Job -ScriptBlock $Block -ArgumentList $ArgList
+  $done=Wait-Job $job -Timeout $Sec
+  if($done){$out=Receive-Job $job;Remove-Job $job -Force -EA 0;return $out}
+  Stop-Job $job -EA 0;Remove-Job $job -Force -EA 0;return $null
+}
 
-try{{
-  Get-Package -EA 0|Select-Object -First 60 Name,Version,ProviderName|ForEach-Object{{
-    $packages+=@{{name=$_.Name;version=$_.Version;provider=$_.ProviderName}}
-  }}
-  if($packages){{$managers['Get-Package']=@{{count=$packages.Count;sample=$packages}}; $names+='Get-Package'}}
-}}catch{{}}
+$managers=@{}; $recent=@(); $repos=@(); $names=@()
+
+$packages=@()
+try{
+  $pkgOut=Invoke-Timed { Get-Package -EA 0|Select-Object -First 40 Name,Version,ProviderName } 12
+  if($pkgOut){
+    @($pkgOut)|ForEach-Object{$packages+=@{name=$_.Name;version=$_.Version;provider=$_.ProviderName}}
+    if($packages){$managers['Get-Package']=@{count=$packages.Count;sample=$packages}; $names+='Get-Package'}
+  }
+}catch{}
 
 $uninstall=@()
-try{{
+try{
   $paths=@(
     'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
     'HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
     'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
   )
-  foreach($p in $paths){{
-    Get-ItemProperty $p -EA 0|Where-Object{{$_.DisplayName}}|Select-Object -First 40 DisplayName,DisplayVersion,Publisher,InstallDate,InstallLocation|ForEach-Object{{
-      $uninstall+=@{{name=$_.DisplayName;version=$_.DisplayVersion;publisher=$_.Publisher;date=$_.InstallDate;path=$_.InstallLocation}}
-    }}
-  }}
-  if($uninstall){{$names+='registry'}}
-}}catch{{}}
+  foreach($p in $paths){
+    Get-ItemProperty $p -EA 0|Where-Object{$_.DisplayName}|Select-Object -First 25 DisplayName,DisplayVersion,Publisher,InstallDate,InstallLocation|ForEach-Object{
+      $uninstall+=@{name=$_.DisplayName;version=$_.DisplayVersion;publisher=$_.Publisher;date=$_.InstallDate;path=$_.InstallLocation}
+    }
+    if($uninstall.Count -ge 60){break}
+  }
+  if($uninstall){$names+='registry'}
+}catch{}
+$managers['registry_uninstall']=@{count=$uninstall.Count;sample=@($uninstall|Select-Object -First 60)}
 
-$winget=@()
-try{{
-  $w=winget list 2>$null
-  if($LASTEXITCODE -eq 0 -or $w){{
-    $winget=@($w|Select-Object -Skip 2|Select-Object -First 40)
+$winget=@{}
+try{
+  if(Get-Command winget -EA 0){
     $names+='winget'
-  }}
-}}catch{{}}
-$managers['registry_uninstall']=@{{count=$uninstall.Count;sample=$uninstall|Select-Object -First 60}}
-$managers['winget']=@{{output=$winget}}
+    $winget.version=(Invoke-Timed { winget --version 2>$null } 5)
+    $wingetList=Invoke-Timed { winget list --accept-source-agreements --disable-interactivity 2>$null|Select-Object -Skip 2 -First 25 } 15
+    if($wingetList){$winget.output=@($wingetList)}
+  }
+}catch{}
+$managers['winget']=$winget
 
-$choco=@()
-try{{
-  if(Get-Command choco -EA 0){{
-    $choco=@((choco list -l 2>$null)|Select-Object -First 40)
+$choco=@{}
+try{
+  if(Get-Command choco -EA 0){
     $names+='choco'
-    $managers['choco']=@{{output=$choco}}
-  }}
-}}catch{{}}
+    $choco.version=(Invoke-Timed { choco --version 2>$null } 5)
+    $chocoList=Invoke-Timed { choco list -l -r 2>$null|Select-Object -First 30 } 12
+    if($chocoList){$choco.output=@($chocoList)}
+    $managers['choco']=$choco
+  }
+}catch{}
 
-try{{
-  $recentEvents=Get-WinEvent -FilterHashtable @{{LogName='Application';ProviderName='MsiInstaller';StartTime=(Get-Date).AddDays(-30)}} -MaxEvents 20 -EA 0|
-    Select-Object TimeCreated,Id,Message|ForEach-Object{{@{{time=$_.TimeCreated.ToString('s');id=$_.Id;msg=($_.Message -replace '\s+',' ').Substring(0,[Math]::Min(160,$_.Message.Length))}}}}
-  if($recentEvents){{$recent+=@{{source='MsiInstaller';events=$recentEvents}}}}
-}}catch{{}}
+try{
+  $recentEvents=Get-WinEvent -FilterHashtable @{LogName='Application';ProviderName='MsiInstaller';StartTime=(Get-Date).AddDays(-30)} -MaxEvents 15 -EA 0|
+    Select-Object TimeCreated,Id,Message|ForEach-Object{
+      $msg=$_.Message
+      if($msg){$msg=($msg -replace '\s+',' ').Substring(0,[Math]::Min(160,$msg.Length))}
+      @{time=$_.TimeCreated.ToString('s');id=$_.Id;msg=$msg}
+    }
+  if($recentEvents){$recent+=@{source='MsiInstaller';events=@($recentEvents)}}
+}catch{}
 
-try{{
+try{
   $repoPath='HKLM:\Software\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products'
-  if(Test-Path $repoPath){{$repos+=@{{type='installer_cache';path=$repoPath}}}}
-}}catch{{}}
+  if(Test-Path $repoPath){$repos+=@{type='installer_cache';path=$repoPath}}
+}catch{}
 
-$result=[ordered]@{{
-  summary=@{{package_managers=($names -join ', ');registry_entries=$uninstall.Count;winget_lines=$winget.Count;choco_lines=$choco.Count}}
+$json=(ConvertTo-Json ([ordered]@{
+  summary=@{package_managers=($names -join ', ');registry_entries=$uninstall.Count;winget_available=($winget.Count -gt 0);choco_available=($choco.Count -gt 0)}
   managers=$managers
   recent=$recent
   repositories=$repos
-}}
-Write-Output ($start+(ConvertTo-Json $result -Depth 6 -Compress)+$end)
+}) -Depth 5 -Compress)
 """
+    return wrap_ps_collector(body)
 
 
 @plugin.command(
@@ -195,5 +210,5 @@ def run(session: SessionContext, args):
         _build_linux_command,
         _build_windows_command,
         format_generic_report,
-        timeout=50.0,
+        timeout=65.0,
     )

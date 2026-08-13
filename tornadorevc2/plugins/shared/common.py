@@ -166,6 +166,97 @@ def format_virtualization_report(data: Dict[str, Any]) -> str:
     return '\n\n'.join(sections)
 
 
+def format_containers_report(data: Dict[str, Any]) -> str:
+    sections = []
+    summary = data.get('summary') or {}
+    if summary:
+        sections.append(format_section('Summary', summary))
+
+    sockets = data.get('runtime_sockets') or []
+    if sockets:
+        sock_lines = []
+        for s in sockets:
+            if isinstance(s, dict):
+                sock_lines.append(f"{s.get('path', '?')} (mode={s.get('mode', 'N/A')})")
+            else:
+                sock_lines.append(str(s))
+        sections.append(format_list_section('Runtime Sockets', sock_lines))
+
+    runtimes = data.get('runtimes') or {}
+    if runtimes:
+        rt_fields = {}
+        for name, meta in runtimes.items():
+            if name == 'data_dirs' or not isinstance(meta, dict):
+                continue
+            parts = []
+            for key in ('version', 'client', 'rootless', 'storage_driver', 'cgroup_driver', 'swarm', 'service'):
+                val = meta.get(key)
+                if val not in (None, '', 'N/A'):
+                    parts.append(f'{key}={val}')
+            rt_fields[name] = '; '.join(parts) if parts else 'detected'
+        if rt_fields:
+            sections.append(format_section('Runtimes', rt_fields))
+
+    data_dirs = runtimes.get('data_dirs') if isinstance(runtimes, dict) else None
+    if data_dirs:
+        sections.append(format_table_section('Data Directories', data_dirs, ['runtime', 'path', 'entries']))
+
+    for title, key, cols in (
+        ('Containers', 'containers', ['runtime', 'name', 'image', 'state', 'status', 'ports']),
+        ('Images', 'images', ['runtime', 'name', 'repository', 'tag', 'size']),
+        ('Networks', 'networks', ['runtime', 'name', 'driver', 'scope']),
+        ('Volumes', 'volumes', ['runtime', 'name', 'driver']),
+        ('Pods', 'pods', ['runtime', 'name', 'namespace', 'status', 'state']),
+        ('Compose Projects', 'compose_projects', ['runtime', 'name', 'status', 'line']),
+    ):
+        block = data.get(key) or []
+        if block:
+            if isinstance(block[0], dict):
+                sections.append(format_table_section(title, block, cols))
+            else:
+                sections.append(format_list_section(title, [str(v) for v in block]))
+
+    k8s = data.get('kubernetes') or {}
+    if k8s:
+        k8s_summary = {}
+        for label, key in (
+            ('Client', 'client_version'),
+            ('Context', 'context'),
+            ('Cluster', 'cluster'),
+            ('API Server', 'api_server'),
+            ('K3s', 'k3s'),
+            ('MicroK8s', 'microk8s'),
+        ):
+            val = k8s.get(key)
+            if val not in (None, '', [], {}):
+                k8s_summary[label] = val if not isinstance(val, list) else f'{len(val)} entries'
+        if k8s_summary:
+            sections.append(format_section('Kubernetes', k8s_summary))
+        for title, key in (
+            ('K8s Nodes', 'nodes'),
+            ('K8s Namespaces', 'namespaces'),
+            ('K8s Pods', 'pods'),
+            ('K8s Deployments', 'deployments'),
+            ('K8s Services', 'services'),
+            ('Helm Releases', 'helm_releases'),
+        ):
+            block = k8s.get(key) or []
+            if block:
+                sections.append(format_list_section(title, [str(v) for v in block[:40]]))
+
+    units = data.get('systemd_units') or []
+    if units:
+        sections.append(format_table_section('Container Systemd Units', units, ['unit', 'active', 'sub', 'desc']))
+
+    procs = data.get('container_processes') or []
+    if procs:
+        sections.append(format_table_section('Container Processes', procs, ['pid', 'user', 'cmd']))
+
+    if not sections:
+        return 'Containers: no container runtime data collected.'
+    return '\n\n'.join(sections)
+
+
 def format_generic_report(data: Dict[str, Any], title: str = 'Results') -> str:
     sections = []
     summary = data.get('summary') or {}

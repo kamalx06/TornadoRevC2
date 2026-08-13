@@ -253,7 +253,7 @@ TornadoRevC2 ships with **42 built-in plugins** organized by function. All enume
 | `virtualization` | Cross-platform | Virtualization, container, orchestration, and cloud environment detection |
 | `kernel` | Cross-platform | Kernel version, loaded modules/drivers, security mitigations, and kernel configuration |
 | `integrity` | Cross-platform | Secure Boot, BitLocker/LUKS, code-signing enforcement, kernel lockdown, and integrity protections |
-| `filesearch` | Cross-platform | Search files and directories by name, extension, path, size, owner, and modification time |
+| `filesearch` | Cross-platform | Search files by path, name, ext, size, owner, mtime (`run filesearch help` for options) |
 | `packages` | Cross-platform | Installed software, package managers, repository configuration, and recent installs |
 | `sysinfo` | Cross-platform | Host metadata collection (handler command, not a plugin) |
 
