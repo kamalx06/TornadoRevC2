@@ -262,6 +262,43 @@ class TORNADOREVC2:
                 print(f"  {self.colors['green']}{name}{self.colors['end']} {self.colors['yellow']}{payload}")
             print()
 
+    def _openssl_executable(self):
+        return 'openssl.exe' if os.name == 'nt' else 'openssl'
+
+    def ensure_tls_certificates(self):
+        if os.path.exists(self.certfile) and os.path.exists(self.keyfile):
+            return
+
+        openssl = self._openssl_executable()
+        cmd = [
+            openssl, 'req', '-x509', '-newkey', 'rsa:2048', '-sha256', '-nodes',
+            '-days', '3650',
+            '-keyout', self.keyfile,
+            '-out', self.certfile,
+            '-subj', '/CN=localhost',
+        ]
+        print(
+            f"{self.colors['yellow']}TLS certificate not found; generating "
+            f"{self.certfile} and {self.keyfile}...{self.colors['end']}"
+        )
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        except FileNotFoundError:
+            print(
+                f"{self.colors['red']}Failed to automatically generate self-signed TLS certificate: "
+                f"{openssl} not found. Install OpenSSL and ensure it is on PATH.{self.colors['end']}"
+            )
+            sys.exit(1)
+
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or 'unknown error').strip()
+            print(f"{self.colors['red']}Failed to generate TLS certificate:{self.colors['end']}")
+            if detail:
+                print(detail)
+            sys.exit(1)
+
+        print(f"{self.colors['green']}TLS certificate generated successfully.{self.colors['end']}")
+
     def create_tls_context(self):
         if not os.path.exists(self.certfile):
             raise FileNotFoundError(f"Certificate not found: {self.certfile}")
@@ -1309,6 +1346,7 @@ class TORNADOREVC2:
 
     def start(self):
         self.print_banner()
+        self.ensure_tls_certificates()
         tcp_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         tcp_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         tcp_server.bind((self.host, self.revshell_port))
