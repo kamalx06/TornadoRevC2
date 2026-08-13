@@ -3,7 +3,7 @@ import json
 import os
 import time
 
-from .constants import CHUNK_SIZE, XFER_MARK_END, XFER_MARK_START, XFER_STATE_SUFFIX
+from .constants import XFER_MARK_END, XFER_MARK_START, XFER_STATE_SUFFIX
 
 
 class FileTransfer:
@@ -11,9 +11,6 @@ class FileTransfer:
 
     def __init__(self, handler):
         self.h = handler
-
-    def _chunk_size_for(self, shell_type):
-        return CHUNK_SIZE.get(shell_type, CHUNK_SIZE['unknown'])
 
     def _state_path(self, local_path, remote_path, direction):
         key = f"{direction}|{os.path.abspath(local_path)}|{remote_path}"
@@ -67,7 +64,7 @@ class FileTransfer:
 
         total = os.path.getsize(local_path)
         local_hash = self.h._sha256_file(local_path)
-        chunk_size = self._chunk_size_for(shell_type)
+        chunk_size = self.h._write_chunk_size(remote_path, shell_type)
         state_path = self._state_path(local_path, remote_path, 'upload')
         state = self._load_state(state_path)
         transferred = 0
@@ -124,7 +121,7 @@ class FileTransfer:
                     if not data:
                         break
                     if not self.h._remote_write_chunk(
-                        client_sock, remote_path, data, shell_type, truncate=first
+                        client_sock, remote_path, data, shell_type, truncate=first, skip_flush=not first
                     ):
                         self._save_state(state_path, {
                             'direction': 'upload',
@@ -190,7 +187,7 @@ class FileTransfer:
             print(f"{self.h.colors['red']}Remote file not found or unreadable: {remote_path}{self.h.colors['end']}")
             return False
 
-        chunk_size = self._chunk_size_for(shell_type)
+        chunk_size = self.h._write_chunk_size(remote_path, shell_type)
         state_path = self._state_path(local_path, remote_path, 'download')
         state = self._load_state(state_path)
         transferred = 0

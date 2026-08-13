@@ -10,7 +10,6 @@ import sys
 import time
 
 from ...constants import (
-    CHUNK_SIZE,
     EXEC_MARK_END,
     EXEC_MARK_START,
     INMEMORY_EXT_TYPES,
@@ -42,9 +41,6 @@ class InMemoryExecutor:
 
     def __init__(self, handler):
         self.h = handler
-
-    def _chunk_size_for(self, shell_type):
-        return CHUNK_SIZE.get(shell_type, CHUNK_SIZE['unknown'])
 
     def staging_path(self, shell_type, token=None):
         token = token or secrets.token_hex(6)
@@ -146,7 +142,7 @@ class InMemoryExecutor:
 
         total = os.path.getsize(local_path)
         local_hash = self.h._sha256_file(local_path)
-        chunk_size = self._chunk_size_for(shell_type)
+        chunk_size = self.h._write_chunk_size(remote_path, shell_type)
 
         print(
             f"{self.h.colors['yellow']}Transferring payload {os.path.basename(local_path)} "
@@ -170,7 +166,7 @@ class InMemoryExecutor:
                     if not data:
                         break
                     if not self.h._remote_write_chunk(
-                        client_sock, remote_path, data, shell_type, truncate=first
+                        client_sock, remote_path, data, shell_type, truncate=first, skip_flush=not first
                     ):
                         print(
                             f"\n{self.h.colors['red']}Payload transfer failed at "

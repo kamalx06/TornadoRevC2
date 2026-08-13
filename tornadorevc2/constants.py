@@ -12,7 +12,10 @@ IDENT_MARK_END = '__T_ID_END__'
 PLUGIN_MARK_START = '__T_PLUGIN_START__'
 PLUGIN_MARK_END = '__T_PLUGIN_END__'
 
-CHUNK_SIZE = {'windows': 4096, 'unix': 32768, 'unknown': 8192}
+# Shell-based transfers send one revshell command per chunk (base64 decode + file write).
+# Windows is capped by the ~8190-char cmd.exe / inline PowerShell limit; Unix can use
+# much larger payloads per round trip (ARG_MAX is typically ~2 MB).
+CHUNK_SIZE = {'windows': 5632, 'unix': 262144, 'unknown': 65536}
 
 MAIN_COMMANDS = (
     'switch', 'kill', 'status', 'ls', 'sessions', 'reconnects', 'payloads',
