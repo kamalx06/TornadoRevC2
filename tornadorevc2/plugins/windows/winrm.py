@@ -8,122 +8,190 @@ from ._helpers import wrap_ps_collector
 
 def build_command():
     body = r"""
-$config=@{}; $listeners=@(); $auth=@{}; $firewall=@(); $service=@{}; $client=@{}
+$ConfirmPreference='None'
+$ProgressPreference='SilentlyContinue'
 
-# WinRM service
-try{
-  $svc=Get-Service WinRM -EA 0
-  if($svc){$service=@{name=$svc.Name;status=$svc.Status;start=$svc.StartType}}
-}catch{}
+function Invoke-Timed([scriptblock]$Block,[int]$Sec=10,[object[]]$ArgList=@()){
+  $job=Start-Job -ScriptBlock $Block -ArgumentList $ArgList
+  $done=Wait-Job $job -Timeout $Sec
+  if($done){$out=Receive-Job $job;Remove-Job $job -Force -EA 0;return $out}
+  Stop-Job $job -EA 0;Remove-Job $job -Force -EA 0;return $null
+}
 
-# winrm config (native)
-try{
-  $winrmOut=winrm get winrm/config 2>$null
-  if($winrmOut){$config['winrm_config']=@($winrmOut|Select-Object -First 40)}
-}catch{}
-
-# Listeners via WSMan provider
-try{
-  Get-ChildItem WSMan:\localhost\Listener -EA 0|ForEach-Object{
-    $props=Get-ChildItem $_.PSPath -EA 0
-    $entry=@{address=$_.PSChildName}
-    foreach($p in $props){$entry[$p.PSChildName]=$p.Value}
-    $listeners+=@($entry)
-  }
-}catch{}
-
-# Service config via CIM
-try{
-  Get-CimInstance -ClassName Win32_Service -Filter "Name='WinRM'" -EA 0|ForEach-Object{
-    $service['path']=$_.PathName
-    $service['account']=$_.StartName
-    $service['state']=$_.State
-  }
-}catch{}
-
-# Authentication settings
-try{
-  $svcAuth=Get-Item WSMan:\localhost\Service\Auth -EA 0
-  if($svcAuth){
-    Get-ChildItem WSMan:\localhost\Service\Auth -EA 0|ForEach-Object{
-      $auth[$_.Name]=$_.Value
-    }
-  }
-  $clientAuth=Get-Item WSMan:\localhost\Client\Auth -EA 0
-  if($clientAuth){
-    Get-ChildItem WSMan:\localhost\Client\Auth -EA 0|ForEach-Object{
-      $auth['client_'+$_.Name]=$_.Value
-    }
-  }
-}catch{}
-
-# Client trusted hosts
-try{
-  $client['trusted_hosts']=(Get-Item WSMan:\localhost\Client\TrustedHosts -EA 0).Value
-  $client['allow_unencrypted']=(Get-Item WSMan:\localhost\Client\AllowUnencrypted -EA 0).Value
-}catch{}
-
-# Firewall rules for WinRM
-try{
-  Get-NetFirewallRule -EA 0|Where-Object{
-    $_.DisplayName -match 'Windows Remote Management|WinRM'
-  }|Select-Object -First 15|ForEach-Object{
-    $fw=Get-NetFirewallPortFilter -AssociatedNetFirewallRule $_ -EA 0
-    $firewall+=@{
-      name=$_.DisplayName
-      enabled=$_.Enabled
-      direction=$_.Direction
-      action=$_.Action
-      profile=$_.Profile -join ','
-      ports=($fw.LocalPort -join ',')
-    }
-  }
-}catch{
+function Test-TcpPort([string]$HostName,[int]$Port,[int]$Ms=1500){
+  $client=$null
   try{
-    $fwOut=netsh advfirewall firewall show rule name="Windows Remote Management (HTTP-In)" 2>$null
-    if($fwOut){$firewall+=@{netsh_http=$fwOut|Select-Object -First 10}}
-    $fwOut2=netsh advfirewall firewall show rule name="Windows Remote Management (HTTPS-In)" 2>$null
-    if($fwOut2){$firewall+=@{netsh_https=$fwOut2|Select-Object -First 10}}
-  }catch{}
+    $client=New-Object Net.Sockets.TcpClient
+    $iar=$client.BeginConnect($HostName,$Port,$null,$null)
+    if(-not $iar.AsyncWaitHandle.WaitOne($Ms,$false)){return $false}
+    $client.EndConnect($iar)|Out-Null
+    return $true
+  }catch{return $false}
+  finally{if($client){try{$client.Close()}catch{}}}
 }
 
-# Remoting status
-$remotingEnabled=$false
-try{
-  $remotingEnabled=(Get-PSSessionConfiguration -EA 0|Where-Object{$_.Enabled -eq $true}).Count -gt 0
-}catch{}
-try{
-  if(-not $remotingEnabled){$remotingEnabled=((Get-Service WinRM -EA 0).Status -eq 'Running')}
-}catch{}
-
-# Quick connectivity self-test
-$wsmanTest='N/A'
-try{
-  Test-WSMan -ComputerName localhost -EA 0|Out-Null
-  $wsmanTest='localhost reachable'
-}catch{
-  $wsmanTest='localhost not reachable'
+$service=@{}
+$svc=$null
+try{ $svc=Get-Service WinRM -EA 0 }catch{}
+if($svc){
+  $service=@{name=$svc.Name;status=[string]$svc.Status;start=[string]$svc.StartType}
+}else{
+  $service=@{name='WinRM';status='NotInstalled';start='N/A'}
 }
 
-$result=[ordered]@{
-  summary=@{
-    winrm_service=($service.status)
-    listeners=$listeners.Count
-    remoting_enabled=$remotingEnabled
-    firewall_rules=$firewall.Count
-    wsman_test=$wsmanTest
+try{
+  Get-CimInstance -ClassName Win32_Service -Filter "Name='WinRM'" -EA 0|
+    Select-Object -First 1|ForEach-Object{
+      $service['path']=[string]$_.PathName
+      $service['account']=[string]$_.StartName
+      $service['state']=[string]$_.State
+    }
+}catch{}
+
+$winrmRunning=($svc -and $svc.Status -eq 'Running')
+
+if(-not $winrmRunning){
+  $statusText=[string]$service.status
+  $result=[ordered]@{
+    summary=@{
+      winrm_enabled=$false
+      winrm_service=$statusText
+      listeners=0
+      remoting_enabled=$false
+      firewall_rules=0
+      message='WinRM service is not running; extended enumeration skipped (read-only check only)'
+    }
+    service=$service
+    note='Start the WinRM service locally to collect listeners, authentication, and remoting settings.'
   }
-  service=$service
-  winrm_config=$config
-  listeners=$listeners
-  authentication=$auth
-  client_settings=$client
-  firewall_rules=@($firewall|Select-Object -First 15)
-  remoting_configurations=@(
-    Get-PSSessionConfiguration -EA 0|Select-Object Name,Enabled,Permission,RunAsVirtualAccount|Select-Object -First 10
-  )
+  $json=($result|ConvertTo-Json -Depth 5 -Compress)
+}else{
+  $config=@{}; $listeners=@(); $auth=@{}; $firewall=@(); $client=@{}
+  $remoting=@(); $remotingEnabled=$false; $wsmanTest='N/A'
+
+  try{
+    $winrmOut=Invoke-Timed { winrm get winrm/config 2>$null } 8
+    if($winrmOut){
+      $config['winrm_config']=@($winrmOut|Select-Object -First 40|ForEach-Object{[string]$_})
+    }
+  }catch{}
+
+  try{
+    Get-ChildItem WSMan:\localhost\Listener -EA 0|ForEach-Object{
+      $entry=@{address=$_.PSChildName}
+      Get-ChildItem $_.PSPath -EA 0|ForEach-Object{ $entry[$_.PSChildName]=[string]$_.Value }
+      $listeners+=@($entry)
+    }
+  }catch{}
+
+  try{
+    Get-ChildItem WSMan:\localhost\Service\Auth -EA 0|ForEach-Object{
+      $auth[$_.Name]=[string]$_.Value
+    }
+    Get-ChildItem WSMan:\localhost\Client\Auth -EA 0|ForEach-Object{
+      $auth['client_'+$_.Name]=[string]$_.Value
+    }
+  }catch{}
+
+  try{
+    $client['trusted_hosts']=[string](Get-Item WSMan:\localhost\Client\TrustedHosts -EA 0).Value
+    $client['allow_unencrypted']=[string](Get-Item WSMan:\localhost\Client\AllowUnencrypted -EA 0).Value
+  }catch{}
+
+  try{
+    foreach($ruleName in @(
+      'Windows Remote Management (HTTP-In)',
+      'Windows Remote Management (HTTPS-In)'
+    )){
+      $fwOut=netsh advfirewall firewall show rule name="$ruleName" 2>$null
+      if($fwOut){
+        $firewall+=@{
+          name=$ruleName
+          source='netsh'
+          preview=@($fwOut|Select-Object -First 12|ForEach-Object{[string]$_})
+        }
+      }
+    }
+  }catch{}
+  if($firewall.Count -lt 2){
+    try{
+      $fwRules=Invoke-Timed {
+        Get-NetFirewallRule -EA 0|
+          Where-Object{ $_.DisplayName -like '*Windows Remote Management*' -or $_.DisplayName -like '*WinRM*' }|
+          Select-Object -First 12 DisplayName,Enabled,Direction,Action,Profile
+      } 12
+      if($fwRules){
+        foreach($rule in $fwRules){
+          $ports=''
+          try{
+            $pf=Get-NetFirewallPortFilter -AssociatedNetFirewallRule $rule -EA 0
+            if($pf){$ports=($pf.LocalPort -join ',')}
+          }catch{}
+          $firewall+=@{
+            name=[string]$rule.DisplayName
+            enabled=[string]$rule.Enabled
+            direction=[string]$rule.Direction
+            action=[string]$rule.Action
+            profile=([string]$rule.Profile -join ',')
+            ports=$ports
+            source='Get-NetFirewallRule'
+          }
+        }
+      }
+    }catch{}
+  }
+
+  try{
+    $sessCfg=Invoke-Timed {
+      Get-PSSessionConfiguration -EA 0|Select-Object -First 10 Name,Enabled,RunAsVirtualAccount
+    } 10
+    if($sessCfg){
+      foreach($cfg in $sessCfg){
+        $remoting+=@{
+          name=[string]$cfg.Name
+          enabled=[string]$cfg.Enabled
+          run_as_virtual_account=[string]$cfg.RunAsVirtualAccount
+        }
+      }
+      $remotingEnabled=($remoting|Where-Object{ $_.enabled -eq 'True' }).Count -gt 0
+    }
+  }catch{}
+  if(-not $remotingEnabled){ $remotingEnabled=$true }
+
+  try{
+    $open=@()
+    if(Test-TcpPort '127.0.0.1' 5985){$open+='5985'}
+    if(Test-TcpPort '127.0.0.1' 5986){$open+='5986'}
+    if($open.Count -gt 0){
+      $wsmanTest='local ports open: '+($open -join ',')
+    }elseif($listeners.Count -gt 0){
+      $wsmanTest="$($listeners.Count) listener(s) configured"
+    }else{
+      $wsmanTest='service running; no listeners or open ports detected'
+    }
+  }catch{
+    $wsmanTest='N/A'
+  }
+
+  $result=[ordered]@{
+    summary=@{
+      winrm_enabled=$true
+      winrm_service='Running'
+      listeners=$listeners.Count
+      remoting_enabled=$remotingEnabled
+      firewall_rules=$firewall.Count
+      wsman_test=$wsmanTest
+    }
+    service=$service
+    winrm_config=$config
+    listeners=$listeners
+    authentication=$auth
+    client_settings=$client
+    firewall_rules=@($firewall|Select-Object -First 15)
+    remoting_configurations=$remoting
+  }
+  $json=($result|ConvertTo-Json -Depth 5 -Compress)
 }
-$json=($result|ConvertTo-Json -Depth 6 -Compress)
 """
     return wrap_ps_collector(body)
 
@@ -131,7 +199,7 @@ $json=($result|ConvertTo-Json -Depth 6 -Compress)
 @plugin.command(
     name='winrm',
     platforms=['windows'],
-    description='Detect WinRM configuration, listeners, authentication, firewall, and remoting status',
+    description='Read-only WinRM enumeration; skips WSMan probes when the WinRM service is not running',
 )
 def run(session: SessionContext, args):
-    return run_collector_plugin(session, 'winrm', None, build_command, format_generic_report, timeout=35.0)
+    return run_collector_plugin(session, 'winrm', None, build_command, format_generic_report, timeout=55.0)
