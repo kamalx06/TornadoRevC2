@@ -312,35 +312,6 @@ TornadoRevC2 ships with **36 built-in plugins** organized by function. All enume
 | `historydel` | Cross-platform | Clear current user shell history files and related storage |
 | `eventlogdel` | Windows | Clear Windows Event Logs via native `wevtutil` / `Clear-EventLog` |
 
-### Common usage examples
-
-```bash
-# Reconnaissance
-run quickenum 1
-run firewall 1
-run ports 1
-run browser 1
-run credstore 1
-run vpn 1
-run proxy 1
-
-# Deep-dive
-run virtualization 1
-run memorymap 1 1234
-run secrets 1              # Linux/Unix
-run services 1             # Windows
-run rdp 1                  # Windows
-run eventlogs 1            # Windows
-
-# Operational
-run screenshot 1
-run inmemory 1 sh ./linpeas.sh
-run inmemory 1 bat C:\tools\winPEAS.bat
-run historydel 1
-run eventlogdel 1          # Windows; Security log requires admin
-run wiper 1 /tmp/staging.dat
-```
-
 **In-memory execution methods:**
 
 | Type | Method |
@@ -352,7 +323,7 @@ run wiper 1 /tmp/staging.dat
 | `sh` | Shell script streamed via `bash -s` |
 | `bat` | Batch script streamed via `cmd.exe /Q` stdin |
 
-PEASS-ng scripts: [github.com/carlospolop/PEASS-ng](https://github.com/carlospolop/PEASS-ng)
+PEASS-ng scripts for in-memory privesccheck: [github.com/carlospolop/PEASS-ng](https://github.com/carlospolop/PEASS-ng)
 
 ---
 

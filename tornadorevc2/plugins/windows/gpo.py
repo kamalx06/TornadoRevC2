@@ -8,31 +8,50 @@ from ._helpers import wrap_ps_collector
 
 def build_command():
     body = r"""
+function Invoke-Timed([scriptblock]$Block,[int]$Sec=12,[object[]]$ArgList=@()){
+  $job=Start-Job -ScriptBlock $Block -ArgumentList $ArgList
+  $done=Wait-Job $job -Timeout $Sec
+  if($done){$out=Receive-Job $job;Remove-Job $job -Force -EA 0;return $out}
+  Stop-Job $job -EA 0;Remove-Job $job -Force -EA 0;return $null
+}
+
 $gpos=@(); $localPolicy=@{}; $applocker=@{}; $wdac=@{}; $srp=@{}; $scripts=@(); $inheritance=@()
 
-# Applied GPO summary via gpresult
+# Applied GPOs from registry (fast)
 try{
-  $gpOut=gpresult /Scope Computer /R 2>$null
+  $hist='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\History'
+  if(Test-Path $hist){
+    Get-ChildItem $hist -EA 0|ForEach-Object{
+      $p=Get-ItemProperty $_.PSPath -EA 0
+      $name=$p.DisplayName
+      if($name){$gpos+=@{name=$name;id=$_.PSChildName;version=$p.Version;extensions=$p.Extensions}}
+    }
+  }
+  $state='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\State\Machine\GPO-List'
+  if(Test-Path $state){
+    Get-ChildItem $state -EA 0|ForEach-Object{
+      $p=Get-ItemProperty $_.PSPath -EA 0
+      $inheritance+=@{id=$_.PSChildName;name=$p.DisplayName;enabled=$p.Enabled;version=$p.Version}
+    }
+  }
+}catch{}
+
+# gpresult summary (timed fallback)
+try{
+  $gpOut=Invoke-Timed { gpresult /Scope Computer /R 2>$null } 15
   if($gpOut){
-    $inheritance=@($gpOut|Where-Object{$_ -match 'Applied Group Policy|Group Policy was applied|Last time Group Policy|Domain Name|Site Name'}|ForEach-Object{$_.Trim()})
-    $gpos=@($gpOut|Where-Object{$_ -match '^\s{4}\S' -and $_ -notmatch 'Applied Group Policy|Group Policy was applied'}|ForEach-Object{$_.Trim()}|Select-Object -First 30)
+    $lines=@($gpOut|Where-Object{$_ -match 'Applied Group Policy|Group Policy was applied|Last time Group Policy|Domain Name|Site Name|OS Configuration'}|ForEach-Object{$_.Trim()})
+    foreach($ln in $lines){if($inheritance -notcontains $ln){$inheritance+=@{line=$ln}}}
   }
 }catch{}
 
-# RSOP / WMI GPO objects
-try{
-  Get-CimInstance -Namespace root\CIMV2 -ClassName Win32_GroupPolicy -EA 0|ForEach-Object{
-    $gpos+=@($_.Name,$_.Description)|Where-Object{$_}|Select-Object -First 1
-  }
-}catch{}
-
-# Local security policy export
+# Local security policy export (timed)
 try{
   $secFile=Join-Path $env:TEMP ('secpol_'+[guid]::NewGuid().ToString('N').Substring(0,8)+'.inf')
-  secedit /export /cfg $secFile /quiet 2>$null
-  if(Test-Path $secFile){
+  $exported=Invoke-Timed { param($f) secedit /export /cfg $f /quiet 2>$null; Test-Path $f } 12 @($secFile)
+  if($exported -and (Test-Path $secFile)){
     $lines=Get-Content $secFile -EA 0|Select-Object -First 80
-    $localPolicy=@{exported=$secFile;preview=@($lines|ForEach-Object{$_.Trim()}|Where-Object{$_})}
+    $localPolicy=@{preview=@($lines|ForEach-Object{$_.Trim()}|Where-Object{$_})}
     Remove-Item $secFile -Force -EA 0
   }
 }catch{}
@@ -41,13 +60,14 @@ try{
 try{
   $alPolicy=Get-AppLockerPolicy -Local -EA 0
   if($alPolicy){
-    $rules=@($alPolicy.RuleCollections|ForEach-Object{
-      @($_.Rules|ForEach-Object{@{
-        collection=$_.GetType().Name
-        name=$_.Name
-        action=$_.Action
-        user=$_.UserOrGroupSid
-      }})}|Select-Object -First 40)
+    $rules=@()
+    foreach($rc in $alPolicy.RuleCollections){
+      foreach($rule in $rc.Rules){
+        $rules+=@{collection=$rc.GetType().Name;name=$rule.Name;action=$rule.Action;user=$rule.UserOrGroupSid}
+        if($rules.Count -ge 40){break}
+      }
+      if($rules.Count -ge 40){break}
+    }
     $applocker=@{enabled=$true;rule_count=$rules.Count;rules=$rules}
   }else{$applocker=@{enabled=$false}}
 }catch{
@@ -60,7 +80,7 @@ try{
   if(Test-Path $ciPath){
     $ciProps=Get-ItemProperty $ciPath -EA 0
     $wdac=@{registry_present=$true;policy_info=$ciProps.PolicyInfo;upgraded=$ciProps.Upgraded}
-  }
+  }else{$wdac=@{registry_present=$false}}
   $ciState=Get-CimInstance -ClassName Win32_DeviceGuard -EA 0
   if($ciState){
     $wdac['code_integrity_policy_enforcement_status']=$ciState.CodeIntegrityPolicyEnforcementStatus
@@ -69,7 +89,7 @@ try{
   $cipol=Get-ChildItem 'C:\Windows\System32\CodeIntegrity\CiPolicies\Active\' -EA 0|Select-Object Name,Length,LastWriteTime
   if($cipol){$wdac['active_policies']=@($cipol|ForEach-Object{"$($_.Name) ($($_.Length) bytes)"})}
 }catch{
-  if(-not $wdac.Count){$wdac=@{status='N/A'}}
+  if(-not $wdac -or $wdac.Count -eq 0){$wdac=@{status='N/A'}}
 }
 
 # Software Restriction Policies (SRP)
@@ -77,16 +97,14 @@ try{
   $srpKey='HKLM:\SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers'
   if(Test-Path $srpKey){
     $srpProps=Get-ItemProperty $srpKey -EA 0
-    $srp=@{enabled=$true;default_level=$srpProps.DefaultLevel;authenticode_enabled=$srpProps.AuthenticodeEnabled}
-    $rules=@()
-    Get-ChildItem $srpKey -Recurse -EA 0|Where-Object{$_.PSChildName -match '^\{'}|ForEach-Object{
+    $srp=@{enabled=$true;default_level=$srpProps.DefaultLevel;authenticode_enabled=$srpProps.AuthenticodeEnabled;rules=@()}
+    Get-ChildItem $srpKey -EA 0|Where-Object{$_.PSChildName -match '^\{'}|Select-Object -First 30|ForEach-Object{
       $p=Get-ItemProperty $_.PSPath -EA 0
-      $rules+=@{id=$_.PSChildName;item_data=$p.ItemData;description=$p.Description;safer_flags=$p.SaferFlags}
+      $srp.rules+=@{id=$_.PSChildName;item_data=$p.ItemData;description=$p.Description;safer_flags=$p.SaferFlags}
     }
-    $srp['rules']=@($rules|Select-Object -First 30)
-  }else{$srp=@{enabled=$false}}
+  }else{$srp=@{enabled=$false;rules=@()}}
 }catch{
-  $srp=@{status='N/A'}
+  $srp=@{status='N/A';rules=@()}
 }
 
 # Startup / logon scripts
@@ -107,26 +125,34 @@ try{
   }
 }catch{}
 
-# Domain GPO links (if domain-joined)
+# Domain GPO links (timed, if domain-joined)
 try{
-  Import-Module GroupPolicy -EA 0
   $dom=(Get-CimInstance Win32_ComputerSystem -EA 0).Domain
   if($dom -and $dom -ne 'WORKGROUP'){
-    Get-GPO -All -EA 0|Select-Object -First 25|ForEach-Object{
-      $gpos+=@{'GPO: '+$_.DisplayName+' (id='+$_.Id+')'}
+    $fromGpo=Invoke-Timed {
+      Import-Module GroupPolicy -EA 0
+      Get-GPO -All -EA 0|Select-Object -First 25 DisplayName,Id,GpoStatus,CreationTime,ModificationTime
+    } 20
+    if($fromGpo){
+      foreach($g in $fromGpo){
+        $gpos+=@{name=$g.DisplayName;id=$g.Id;status=$g.GpoStatus;source='Get-GPO'}
+      }
     }
   }
 }catch{}
+
+$srpRuleCount=0
+if($srp.rules){$srpRuleCount=@($srp.rules).Count}
 
 $result=[ordered]@{
   summary=@{
     applied_gpos=$gpos.Count
     applocker_rules=($applocker.rule_count)
-    srp_rules=($srp.rules.Count)
+    srp_rules=$srpRuleCount
     startup_logon_scripts=$scripts.Count
   }
-  applied_gpos=@($gpos|Select-Object -Unique -First 30)
-  gpo_inheritance=@($inheritance|Select-Object -First 15)
+  applied_gpos=@($gpos|Select-Object -First 30)
+  gpo_inheritance=@($inheritance|Select-Object -First 20)
   local_security_policy=$localPolicy
   applocker=$applocker
   wdac=$wdac
@@ -144,4 +170,4 @@ $json=($result|ConvertTo-Json -Depth 6 -Compress)
     description='Enumerate applied GPOs, security policies, AppLocker, WDAC, SRP, and GPO scripts',
 )
 def run(session: SessionContext, args):
-    return run_collector_plugin(session, 'gpo', None, build_command, format_generic_report, timeout=45.0)
+    return run_collector_plugin(session, 'gpo', None, build_command, format_generic_report, timeout=60.0)
