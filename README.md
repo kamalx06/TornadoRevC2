@@ -243,7 +243,7 @@ Supported types: `py`, `ps`, `exe`, `elf`, `bat`, `sh`
 
 ## Built-in Plugins
 
-TornadoRevC2 ships with **36 built-in plugins** organized by function. All enumeration plugins are read-only unless noted otherwise.
+TornadoRevC2 ships with **42 built-in plugins** organized by function. All enumeration plugins are read-only unless noted otherwise.
 
 ### Host assessment & environment
 
@@ -253,6 +253,8 @@ TornadoRevC2 ships with **36 built-in plugins** organized by function. All enume
 | `virtualization` | Cross-platform | Virtualization, container, orchestration, and cloud environment detection |
 | `kernel` | Cross-platform | Kernel version, loaded modules/drivers, security mitigations, and kernel configuration |
 | `integrity` | Cross-platform | Secure Boot, BitLocker/LUKS, code-signing enforcement, kernel lockdown, and integrity protections |
+| `filesearch` | Cross-platform | Search files and directories by name, extension, path, size, owner, and modification time |
+| `packages` | Cross-platform | Installed software, package managers, repository configuration, and recent installs |
 | `sysinfo` | Cross-platform | Host metadata collection (handler command, not a plugin) |
 
 ### Network & connectivity
@@ -285,6 +287,8 @@ TornadoRevC2 ships with **36 built-in plugins** organized by function. All enume
 | `systemd` | Linux/Unix | Services, timers, failed units, and enabled startup units |
 | `privbins` | Linux/Unix | SUID/SGID binaries, file capabilities, and privilege-escalation-relevant executables |
 | `lsm` | Linux/Unix | SELinux, AppArmor, and other Linux Security Modules: enforcement mode, policies, and configuration |
+| `journal` | Linux/Unix | Structured journalctl summaries: authentication, kernel, service failures, and recent events |
+| `containers` | Linux/Unix | Container runtimes and workloads: Docker, Podman, containerd, CRI-O, LXC/LXD, and Kubernetes indicators |
 | `usersessions` | Cross-platform | Active local, remote, SSH, RDP, console, and service sessions with login/source metadata |
 
 ### Windows domain & system
@@ -302,6 +306,8 @@ TornadoRevC2 ships with **36 built-in plugins** organized by function. All enume
 | `gpo` | Windows | Applied GPOs, local/domain security policies, AppLocker, WDAC, SRP, and GPO scripts |
 | `winrm` | Windows | WinRM configuration, listeners, authentication methods, firewall integration, and remoting status |
 | `drivers` | Windows | Installed drivers and kernel modules, signed/unsigned status, startup type, and notable security/VM drivers |
+| `powershell` | Windows | PowerShell version, execution policy, logging, modules, remoting settings, and profile paths |
+| `lsa` | Windows | LSA protection, Credential Guard, virtualization-based security, and credential security configuration |
 
 ### Execution & operational
 
