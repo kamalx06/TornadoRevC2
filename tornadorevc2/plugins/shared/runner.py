@@ -9,7 +9,7 @@ from .common import resolve_session_platform
 
 
 def parse_collector_json(raw: Optional[str]) -> dict:
-    if not raw or not raw.strip():
+    if not raw:
         return {}
     payload = raw.strip()
     if PLUGIN_MARK_START in payload:
@@ -19,11 +19,7 @@ def parse_collector_json(raw: Optional[str]) -> dict:
     try:
         return json.loads(payload)
     except json.JSONDecodeError:
-        try:
-            obj, _ = json.JSONDecoder().raw_decode(payload.lstrip())
-            return obj if isinstance(obj, dict) else {}
-        except json.JSONDecodeError:
-            return {}
+        return {}
 
 
 def _run_collector_marked(session, unix_cmd: str, win_ps: str, platform: str, timeout: float) -> Optional[str]:
@@ -37,7 +33,7 @@ def _run_collector_marked(session, unix_cmd: str, win_ps: str, platform: str, ti
     )
 
     if platform == 'unknown':
-        for shell_type in ('unix', 'windows'):
+        for shell_type in ('windows', 'unix'):
             if shell_type == 'windows' and not win_ps:
                 continue
             if shell_type == 'unix' and not unix_cmd:
@@ -49,7 +45,7 @@ def _run_collector_marked(session, unix_cmd: str, win_ps: str, platform: str, ti
                 shell_type,
                 **kwargs,
             )
-            if payload and parse_collector_json(payload):
+            if payload is not None:
                 return payload
         return None
 
@@ -81,7 +77,6 @@ def run_collector_plugin(
             session.print(f"Plugin '{plugin_name}' is not available on Linux/Unix.", 'red')
             return 1
         unix_cmd = unix_builder()
-        platform = 'unix'
     else:
         if not win_builder and not unix_builder:
             session.print(f"Plugin '{plugin_name}' is not available on this platform.", 'red')
@@ -94,7 +89,7 @@ def run_collector_plugin(
 
     raw = _run_collector_marked(session, unix_cmd, win_ps, platform, timeout)
 
-    if not raw or not raw.strip():
+    if raw is None:
         session.print(f"Plugin '{plugin_name}' failed — no response from target.", 'red')
         session.log_plugin_result(plugin_name, '', 'no response (timeout or missing markers)')
         return 1

@@ -407,7 +407,7 @@ class TORNADOREVC2:
         start = output.rfind(start_mark)
         if start == -1:
             return None
-        end = output.rfind(end_mark, start + len(start_mark))
+        end = output.find(end_mark, start + len(start_mark))
         if end == -1:
             return None
         payload = output[start + len(start_mark):end]

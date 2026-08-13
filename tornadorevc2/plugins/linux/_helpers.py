@@ -2,13 +2,11 @@
 
 import base64
 import hashlib
-import json
 
 from ...constants import PLUGIN_MARK_END, PLUGIN_MARK_START
 from ...sysinfo import _b64_exec_cmd
 
 _INLINE_LIMIT = 4000
-_INLINE_JSON_LIMIT = 3000
 _CHUNK_SIZE = 400
 
 
@@ -57,17 +55,8 @@ def _chunked_command(source: str) -> str:
     return ' ; '.join(parts)
 
 
-def _inline_json_command(wrapped: str) -> str:
-    """Run a short collector via python -c (more reliable than base64 on shells)."""
-    script = json.dumps(wrapped)
-    parts = [f"{name} -c {script} 2>/dev/null" for name in ('python3', 'python', 'python2')]
-    return f"({' || '.join(parts)}) 2>/dev/null; true"
-
-
 def build_linux_collector_command(source: str) -> str:
     wrapped = _wrap_collector(source)
-    if len(json.dumps(wrapped)) <= _INLINE_JSON_LIMIT:
-        return _inline_json_command(wrapped)
     encoded_len = len(base64.b64encode(wrapped.encode('utf-8')))
     if encoded_len > _INLINE_LIMIT:
         return _chunked_command(wrapped)
