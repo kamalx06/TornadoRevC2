@@ -243,7 +243,7 @@ Supported types: `py`, `ps`, `exe`, `elf`, `bat`, `sh`
 
 ## Built-in Plugins
 
-TornadoRevC2 ships with **28 built-in plugins** organized by function. All enumeration plugins are read-only unless noted otherwise.
+TornadoRevC2 ships with **36 built-in plugins** organized by function. All enumeration plugins are read-only unless noted otherwise.
 
 ### Host assessment & environment
 
@@ -251,6 +251,8 @@ TornadoRevC2 ships with **28 built-in plugins** organized by function. All enume
 |--------|----------|-------------|
 | `quickenum` | Cross-platform | Fast structured host triage: identity, network, environment, prioritized findings |
 | `virtualization` | Cross-platform | Virtualization, container, orchestration, and cloud environment detection |
+| `kernel` | Cross-platform | Kernel version, loaded modules/drivers, security mitigations, and kernel configuration |
+| `integrity` | Cross-platform | Secure Boot, BitLocker/LUKS, code-signing enforcement, kernel lockdown, and integrity protections |
 | `sysinfo` | Cross-platform | Host metadata collection (handler command, not a plugin) |
 
 ### Network & connectivity
@@ -281,6 +283,9 @@ TornadoRevC2 ships with **28 built-in plugins** organized by function. All enume
 | `screenshot` | Cross-platform | Desktop capture returned to the operator (GUI sessions; PNG saved locally) |
 | `cron` | Linux/Unix | Cron jobs, system crontabs, user crontabs, and at queues |
 | `systemd` | Linux/Unix | Services, timers, failed units, and enabled startup units |
+| `privbins` | Linux/Unix | SUID/SGID binaries, file capabilities, and privilege-escalation-relevant executables |
+| `lsm` | Linux/Unix | SELinux, AppArmor, and other Linux Security Modules: enforcement mode, policies, and configuration |
+| `usersessions` | Cross-platform | Active local, remote, SSH, RDP, console, and service sessions with login/source metadata |
 
 ### Windows domain & system
 
@@ -294,6 +299,9 @@ TornadoRevC2 ships with **28 built-in plugins** organized by function. All enume
 | `defender` | Windows | Microsoft Defender status, exclusions, ASR rules, and third-party AV |
 | `certificates` | Windows | Certificate stores, code-signing, and enterprise certificates |
 | `rdp` | Windows | Remote Desktop configuration, status, recent targets, and settings |
+| `gpo` | Windows | Applied GPOs, local/domain security policies, AppLocker, WDAC, SRP, and GPO scripts |
+| `winrm` | Windows | WinRM configuration, listeners, authentication methods, firewall integration, and remoting status |
+| `drivers` | Windows | Installed drivers and kernel modules, signed/unsigned status, startup type, and notable security/VM drivers |
 
 ### Execution & operational
 
