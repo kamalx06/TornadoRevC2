@@ -282,6 +282,8 @@ Plugin output is displayed in the terminal and written to `logs/<session>/plugin
 | `virtualization` | VM, container, orchestration, and cloud environment detection |
 | `privesccheck` | LinPEAS / WinPEAS privilege escalation enumeration (operator-supplied local script) |
 | `wiper` | Secure multi-pass file overwrite (zeros → ones → random) then delete |
+| `mounts` | Mounts, SMB/NFS shares, mapped drives, bind mounts, container filesystems |
+| `history` | Shell history, package/update logs, recent login activity |
 
 ### Linux / Unix
 
@@ -290,14 +292,11 @@ Plugin output is displayed in the terminal and written to `logs/<session>/plugin
 | `secrets` | Config files, environment variables, SSH keys, cloud credentials, tokens |
 | `cron` | Cron jobs, system cron directories, user crontabs, at queues |
 | `systemd` | Services, timers, failed units, enabled startup units |
-| `mounts` | Mounts, bind mounts, NFS/SMB, writable and executable mount points |
-| `history` | Shell history, package manager logs, recent login activity |
 
 ### Windows
 
 | Plugin | Description |
 |--------|-------------|
-| `shares` | SMB shares, administrative shares, mapped drives |
 | `adinfo` | Domain membership, domain controllers, forest/trusts, OUs |
 | `services` | Services, startup types, binaries, service accounts |
 | `scheduledtasks` | Scheduled tasks, triggers, execution context, actions |
@@ -320,7 +319,7 @@ run quickenum 1
 
 **Linux / Unix:** hostname, user, sudo, kernel, containers, cloud metadata, network, mounts, systemd/cron, credential artifacts.
 
-**Windows:** hostname, user, admin status, domain, network, shares, services, Defender, autoruns, credential artifacts.
+**Windows:** hostname, user, admin status, domain, network, mounts/shares, services, Defender, autoruns, credential artifacts.
 
 Example output:
 
