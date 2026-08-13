@@ -1286,7 +1286,12 @@ class TORNADOREVC2:
         if prior:
             fingerprint = prior.get('fingerprint') or fingerprint
             previous_id = prior.get('session_id')
-            client_id = prior.get('session_id', self.client_counter + 1)
+            client_id = prior.get('session_id')
+            if not isinstance(client_id, int) or client_id < 1:
+                self.client_counter += 1
+                client_id = self.client_counter
+            elif client_id > self.client_counter:
+                self.client_counter = client_id
             client_info['id'] = client_id
             client_info['name'] = prior.get('name')
             client_info['sysinfo'] = prior.get('sysinfo')
@@ -1306,8 +1311,6 @@ class TORNADOREVC2:
             client_info['logger'] = logger
             self.registry.log_reconnect(previous_id, client_id, fingerprint, addr)
             client_info['connect_count'] = self.registry.get_connect_count(fingerprint)
-            if client_id > self.client_counter:
-                self.client_counter = client_id
             if logger:
                 detail = f"from {addr[0]}:{addr[1]} (connect #{client_info['connect_count']})"
                 logger.log_reconnect(detail)

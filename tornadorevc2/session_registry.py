@@ -200,6 +200,8 @@ class SessionRegistry:
 
     def register_active(self, info, fingerprint, probe_output=''):
         """Record or update metadata for an active session."""
+        if info.get('id') is None:
+            return fingerprint or compute_fingerprint(info, probe_output)
         fp = fingerprint or compute_fingerprint(info, probe_output)
         info['fingerprint'] = fp
         record = {
