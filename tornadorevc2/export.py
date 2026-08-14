@@ -29,10 +29,6 @@ def _parse_session_log(path):
     current = None
     output_lines = []
 
-    entries = []
-    current = None
-    output_lines = []
-
     def flush_output():
         nonlocal current, output_lines
         if current and current['kind'] == 'command' and output_lines:
