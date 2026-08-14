@@ -1022,7 +1022,9 @@ class TORNADOREVC2:
       filetype: py, ps, exe, elf, bat, sh
 
     {self.colors['green']}INTERNAL PIVOTING (SOCKS5):{self.colors['end']}
-    socks <listen_port>                               SOCKS5 proxy via session
+    socks <listen_port>                               Start SOCKS5 proxy via session
+    socks test <host> <port>                          Test internal TCP reachability
+    socks reset                                       Reset tunnel streams/buffers
     tunnels                                           List active SOCKS proxies
     socks stop <proxy_id>                             Stop a SOCKS proxy
 
@@ -1218,7 +1220,9 @@ class TORNADOREVC2:
     run <plugin> <ID>                                        Execute a plugin on a session
 
     {self.colors['green']}INTERNAL PIVOTING (SOCKS5):{self.colors['end']}
-    socks <ID> <listen_port>                                 SOCKS5 proxy via session
+    socks <ID> <listen_port>                                 Start SOCKS5 proxy via session
+    socks <ID> test <host> <port>                            Test internal TCP reachability
+    socks <ID> reset                                           Reset tunnel streams/buffers
     tunnels                                                  List active SOCKS proxies
     socks stop <proxy_id>                                    Stop a SOCKS proxy
 

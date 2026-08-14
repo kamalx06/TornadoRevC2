@@ -225,11 +225,13 @@ Supported types: `py`, `ps`, `exe`, `elf`, `bat`, `sh`
 
 ### Network pivoting
 
-| Command | Description |
-|---------|-------------|
-| `socks <ID> <listen_port>` | Start a SOCKS5 proxy through a session |
-| `socks stop <proxy_id>` | Stop a proxy and clean up remote artifacts |
-| `tunnels` | List active SOCKS proxies |
+| Command | In-session form | Description |
+|---------|-----------------|-------------|
+| `socks <ID> <listen_port>` | `socks <listen_port>` | Start a SOCKS5 proxy through a session (local listener on `127.0.0.1:<listen_port>`) |
+| `socks <ID> test <host> <port>` | `socks test <host> <port>` | Test TCP reachability to an internal host through the tunnel agent |
+| `socks <ID> reset` | `socks reset` | Reset tunnel agent streams and discard buffered data (does not stop active SOCKS listeners) |
+| `socks stop <proxy_id>` | `socks stop <proxy_id>` | Stop a SOCKS proxy and clean up remote tunnel artifacts when no other proxy uses the session |
+| `tunnels` | `tunnels` | List active SOCKS proxies, channel count, and status |
 
 ### General
 
