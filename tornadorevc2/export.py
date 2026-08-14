@@ -29,6 +29,10 @@ def _parse_session_log(path):
     current = None
     output_lines = []
 
+    entries = []
+    current = None
+    output_lines = []
+
     def flush_output():
         nonlocal current, output_lines
         if current and current['kind'] == 'command' and output_lines:
@@ -36,39 +40,44 @@ def _parse_session_log(path):
             current['output'] = sanitize_terminal_output(raw)
             output_lines = []
 
-    for line in raw_lines:
-        match = _LOG_LINE.match(line)
-        if match:
-            flush_output()
-            timestamp, body = match.group(1), match.group(2)
-            cmd_match = _CMD_LINE.match(body)
-            event_match = _EVENT_LINE.match(body)
-            if cmd_match:
-                current = {
-                    'kind': 'command',
-                    'timestamp': timestamp,
-                    'command': cmd_match.group(1),
-                    'output': '',
-                }
-                entries.append(current)
-            elif event_match:
-                current = {
-                    'kind': 'event',
-                    'timestamp': timestamp,
-                    'message': event_match.group(1),
-                }
-                entries.append(current)
-            else:
-                current = {
-                    'kind': 'event',
-                    'timestamp': timestamp,
-                    'message': body,
-                }
-                entries.append(current)
-            continue
+    with open(path, 'r', encoding='utf-8', errors='replace') as fh:
+        for line in fh:
+            line = line.rstrip('\n')
 
-        if current and current['kind'] == 'command':
-            output_lines.append(line)
+            match = _LOG_LINE.match(line)
+            if match:
+                flush_output()
+                timestamp, body = match.group(1), match.group(2)
+
+                cmd_match = _CMD_LINE.match(body)
+                event_match = _EVENT_LINE.match(body)
+
+                if cmd_match:
+                    current = {
+                        'kind': 'command',
+                        'timestamp': timestamp,
+                        'command': cmd_match.group(1),
+                        'output': '',
+                    }
+                    entries.append(current)
+                elif event_match:
+                    current = {
+                        'kind': 'event',
+                        'timestamp': timestamp,
+                        'message': event_match.group(1),
+                    }
+                    entries.append(current)
+                else:
+                    current = {
+                        'kind': 'event',
+                        'timestamp': timestamp,
+                        'message': body,
+                    }
+                    entries.append(current)
+                continue
+
+            if current and current['kind'] == 'command':
+                output_lines.append(line)
 
     flush_output()
     return entries
