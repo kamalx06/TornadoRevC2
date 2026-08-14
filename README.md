@@ -12,6 +12,18 @@ Use this software only on systems you own or on systems where you have **explici
 
 ---
 
+## Demo
+
+<p align="center">
+  <img src="demo/TornadoRevC2-Demo.GIF" alt="TornadoRevC2 Demo" width="900">
+</p>
+
+<p align="center">
+  <strong>Quick demo:</strong> session management, plugin execution, SOCKS5 pivoting.
+</p>
+
+---
+
 ## Table of Contents
 
 - [Introduction](#introduction)
