@@ -49,11 +49,9 @@ Use this software only on systems you own or on systems where you have **explici
 
 ## Introduction
 
-TornadoRevC2 accepts inbound reverse shell connections over plain TCP or TLS and provides a single operator console for session management, host reconnaissance, chunked file transfer, in-memory execution, SOCKS5 pivoting, plugin-driven post-exploitation, and structured reporting. The project evolved from a basic reverse shell handler into a modular framework where each capability—firewall enumeration, credential store metadata, network mapping, browser profiling, and more—is delivered as an independent plugin.
+TornadoRevC2 is a modular reverse shell management framework that accepts inbound connections over both plain TCP and TLS, providing a unified operator console for session management, host reconnaissance, chunked file transfer, in-memory payload execution, SOCKS5 pivoting, plugin-driven post-exploitation, structured reporting, and a built-in `update` command for automatic Git-based updates and seamless handler restarts. Originally developed as a lightweight reverse shell handler, the project has evolved into an extensible framework in which capabilities such as firewall enumeration, credential store metadata collection, network mapping, browser profiling, and additional post-exploitation functionality are implemented as independent, modular plugins.
 
-For Git-based installations, the built-in `update` command pulls the latest release from the [official repository](https://github.com/kamalx06/TornadoRevC2/) and restarts the handler automatically after a successful fast-forward pull.
-
-**Supported platforms:** Linux and Windows (primary); generic Unix and BSD environments where applicable.
+**Supported platforms:** Linux and Windows (primary), with compatibility for generic Unix and BSD environments where applicable.
 
 ---
 
