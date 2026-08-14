@@ -54,6 +54,7 @@ from .sysinfo import (
 from .terminal import TerminalManager
 from .transfer import FileTransfer
 from .tunnel import TunnelManager
+from .updater import Updater
 from .plugins import PluginManager
 
 
@@ -75,6 +76,9 @@ class TORNADOREVC2:
         self.exporter = SessionExporter(self)
         self.registry = SessionRegistry()
         self.plugins = PluginManager(self)
+        self.updater = Updater(self)
+        self._tcp_server = None
+        self._tls_server = None
         self.colors = {
             'cyan': '\033[96m', 'green': '\033[92m', 'yellow': '\033[93m',
             'red': '\033[91m', 'bold': '\033[1m', 'end': '\033[0m', 'blue': '\033[94m',
@@ -1116,6 +1120,8 @@ class TORNADOREVC2:
                     print(f"\n{self.colors['red']}Shutting down server{self.colors['end']}")
                     self.running = False
                     break
+                elif self.updater.handle_command(cmd_parts):
+                    pass
                 elif cmd_lower in ('clear', 'cls'):
                     os.system('cls' if os.name == 'nt' else 'clear')
                     self.print_banner()
@@ -1208,6 +1214,7 @@ class TORNADOREVC2:
     rename/rn <ID> <name>   Rename session
     payloads                Show payloads list
     clear/cls               Clear screen
+    update                  Pull latest release from GitHub and restart
     help                    This help menu
     exit/quit               Shutdown server
 
@@ -1257,6 +1264,40 @@ class TORNADOREVC2:
         self.registry.mark_disconnected(info)
         print(f"{self.colors['red']}\n{display} {info['addr'][0]}:{info['addr'][1]} disconnected{self.colors['end']}")
         print(f"{self.colors['yellow']}Session metadata preserved — will restore on reconnect (fingerprint: {info.get('fingerprint', '?')}){self.colors['end']}")
+
+    def _close_listener(self, server):
+        if server is None:
+            return
+        try:
+            server.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            server.close()
+        except OSError:
+            pass
+
+    def shutdown_for_restart(self):
+        """Release listeners, tunnels, and sessions before replacing this process."""
+        self.running = False
+        self._close_listener(self._tcp_server)
+        self._close_listener(self._tls_server)
+        self.tunnels.shutdown_for_restart()
+        with self.client_lock:
+            clients = list(self.revshell_clients.keys())
+        for client_sock in clients:
+            try:
+                client_sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                client_sock.close()
+            except OSError:
+                pass
+        with self.client_lock:
+            self.revshell_clients.clear()
+        sys.stdout.flush()
+        sys.stderr.flush()
 
     def handle_client(self, client_sock, addr):
         client_info = {
@@ -1387,6 +1428,8 @@ class TORNADOREVC2:
         tls_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         tls_server.bind((self.host, self.tls_port))
         tls_server.listen(100)
+        self._tcp_server = tcp_server
+        self._tls_server = tls_server
         self.running = True
         threading.Thread(target=self.listener, args=(tcp_server, False), daemon=True).start()
         threading.Thread(target=self.listener, args=(tls_server, True, tls_context), daemon=True).start()

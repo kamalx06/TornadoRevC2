@@ -49,7 +49,9 @@ Use this software only on systems you own or on systems where you have **explici
 
 ## Introduction
 
-TornadoRevC2 accepts inbound reverse shell connections over plain TCP or TLS and provides a single interface for session management, host reconnaissance, file operations, network pivoting, and post-exploitation tasks. The project evolved from a basic reverse shell handler into a modular framework where each capability—firewall enumeration, credential store metadata, network mapping, browser profiling, and more—is delivered as an independent plugin.
+TornadoRevC2 accepts inbound reverse shell connections over plain TCP or TLS and provides a single operator console for session management, host reconnaissance, chunked file transfer, in-memory execution, SOCKS5 pivoting, plugin-driven post-exploitation, and structured reporting. The project evolved from a basic reverse shell handler into a modular framework where each capability—firewall enumeration, credential store metadata, network mapping, browser profiling, and more—is delivered as an independent plugin.
+
+For Git-based installations, the built-in `update` command pulls the latest release from the [official repository](https://github.com/kamalx06/TornadoRevC2/) and restarts the handler automatically after a successful fast-forward pull.
 
 **Supported platforms:** Linux and Windows (primary); generic Unix and BSD environments where applicable.
 
@@ -62,10 +64,11 @@ TornadoRevC2 accepts inbound reverse shell connections over plain TCP or TLS and
 | **Session handling** | Multi-client TCP/TLS listeners, interactive PTY/TTY sessions, session fingerprinting, reconnect tracking |
 | **Transfer & execution** | Chunked file transfer with resume and SHA-256 verification; in-memory payload execution (`py`, `ps`, `exe`, `elf`, `bat`, `sh`) |
 | **Network operations** | SOCKS5 pivoting through compromised sessions with automatic remote cleanup |
-| **Enumeration** | 28 built-in plugins covering host triage, network posture, credentials metadata, browsers, VPN/proxy config, and more |
+| **Enumeration** | 43 built-in plugins covering host triage, network posture, credentials metadata, browsers, VPN/proxy config, and more |
 | **Operational plugins** | Secure file wiping, shell history clearing, Windows event log clearing |
 | **Extensibility** | Runtime plugin loading, reload, and external plugin support via `TORNADOREVC2_PLUGIN_DIR` |
 | **Reporting** | Per-session logging, structured plugin output, HTML transcript export |
+| **Self-update** | `update` operator command: Git availability check, repository verification, remote fetch, fast-forward pull, and automatic handler restart |
 
 **Not supported:** Automated persistence, task scheduling, or beacon-style callback infrastructure.
 
@@ -87,6 +90,10 @@ Plugins leverage **native Windows and Linux utilities and built-in system comman
 
 When an enumeration routine fails, is unavailable, or times out, the plugin does not abort entirely. The affected section is left empty or marked `N/A` while the remainder of the report continues.
 
+### Operator-side maintenance
+
+Handler updates are delivered through Git on the operator machine. The `update` command uses bounded subprocess timeouts, non-interactive Git settings, and a fast local shutdown path so the handler can restart reliably without blocking on remote session cleanup.
+
 ---
 
 ## Architecture
@@ -94,7 +101,8 @@ When an enumeration routine fails, is unavailable, or times out, the plugin does
 ```text
 ┌─────────────────────────────────────────────────────────────────┐
 │                     Operator Console (handler)                  │
-│  Sessions · Transfers · SOCKS · Plugins · Logging · Export      │
+│  Sessions · Transfers · SOCKS · Plugins · Logging · Export ·    │
+│  update                                                         │
 └────────────────────────────┬────────────────────────────────────┘
                              │ reverse shell channel (TCP/TLS)
                              ▼
@@ -129,6 +137,7 @@ Collectors emit JSON wrapped in marker tokens (`__T_PLUGIN_START__` / `__T_PLUGI
 
 - Python 3.7 or later
 - OpenSSL (for TLS certificate generation)
+- Git (optional; required for the `update` operator command)
 - No third-party Python packages required
 
 **Target host (varies by plugin):**
@@ -137,7 +146,7 @@ Collectors emit JSON wrapped in marker tokens (`__T_PLUGIN_START__` / `__T_PLUGI
 - Optional: `wl-clipboard` / `xclip` / `xsel` (Linux clipboard); `import` / `scrot` / `gnome-screenshot` (Linux screenshot)
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/kamalx06/TornadoRevC2.git
 cd TornadoRevC2
 python tornadorevc2.py
 ```
@@ -174,9 +183,12 @@ run credstore 1                 # Credential store metadata
 run memorymap 1 1234            # Process memory maps (requires PID)
 run screenshot 1                # Desktop capture (GUI sessions)
 run inmemory 1 sh ./linpeas.sh  # In-memory script execution
+update                          # Pull latest from GitHub and restart (Git installs)
 ```
 
 When attached via `switch <ID>`, omit the session ID from subsequent commands (`run quickenum` instead of `run quickenum 1`). Plugin listings and TAB completion inside a client session are filtered to plugins compatible with that session's platform.
+
+The `update` command is available from the main handler prompt only. It verifies that Git is installed, confirms the installation is a Git working tree, fetches from the configured remote, fast-forward pulls when updates exist, and restarts the handler with the same executable and arguments. If the installation is already current, it prints `TornadoRevC2 is already running the latest version.` and leaves the server running.
 
 ---
 
@@ -238,6 +250,7 @@ Supported types: `py`, `ps`, `exe`, `elf`, `bat`, `sh`
 | Command | Description |
 |---------|-------------|
 | `payloads` | Display the built-in payload reference |
+| `update` | Check for updates from the official GitHub repository and restart after a successful fast-forward pull (requires Git; main menu only) |
 | `help` | Show the command reference |
 | `exit` / `quit` | Shut down the handler |
 
@@ -969,10 +982,12 @@ TornadoRevC2/
 ├── tornadorevc2.py                 Entry point
 ├── tornadorevc2/
 │   ├── handler.py                  Listeners, sessions, operator console
+│   ├── updater.py                  Git-based self-update and restart
 │   ├── sysinfo.py                  Host information collection
 │   ├── terminal.py                 PTY/TTY management
 │   ├── transfer.py                 Chunked file transfers
 │   ├── tunnel.py                   SOCKS5 pivoting
+│   ├── remote_exec.py              Remote command builders
 │   ├── win_client.py               Windows shell detection and script delivery
 │   ├── session_registry.py         Session persistence and reconnect logic
 │   ├── session_log.py              Per-session directory logging

