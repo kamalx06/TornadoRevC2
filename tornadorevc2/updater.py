@@ -173,6 +173,23 @@ class Updater:
                 print(f"{colors['green']}{UP_TO_DATE_MSG}{colors['end']}")
                 return
 
+            print(f"{colors['yellow']}An update is available for TornadoRevC2.{colors['end']}")
+            print(
+                f"{colors['yellow']}Updating will restart TornadoRevC2 and terminate all active sessions, "
+                f"SOCKS proxies, tunnels, and other runtime state.{colors['end']}"
+            )
+
+            try:
+                answer = input(f"{colors['cyan']}Continue with the update? [y/N]: {colors['end']}").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                print(f"{colors['yellow']}Update cancelled.{colors['end']}")
+                return
+
+            if answer not in ('y', 'yes'):
+                print(f"{colors['yellow']}Update cancelled.{colors['end']}")
+                return
+
             print(f"{colors['cyan']}Applying update (fast-forward only)...{colors['end']}")
             pull = _run_git('pull', '--ff-only', '--quiet', cwd=repo_root, timeout=GIT_TIMEOUT_PULL)
             if pull.returncode != 0:
@@ -181,7 +198,10 @@ class Updater:
 
             print(f"{colors['green']}{UPDATE_SUCCESS_MSG}{colors['end']}")
             sys.stdout.flush()
-            self.h.shutdown_for_restart()
-            _restart_process()
+            try:
+                self.h.shutdown_for_restart()
+                _restart_process()
+            except Exception as exc:
+                print(f"{colors['red']}Failed to restart TornadoRevC2: {exc}{colors['end']}")
         finally:
             self._busy = False
