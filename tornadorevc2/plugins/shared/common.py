@@ -388,6 +388,195 @@ def format_firewall_report(data: Dict[str, Any]) -> str:
     return '\n\n'.join(sections)
 
 
+def _sshaudit_flag(val: Any) -> str:
+    if isinstance(val, bool):
+        return 'yes' if val else 'no'
+    if val in (None, ''):
+        return '-'
+    return str(val)
+
+
+def _sshaudit_basename(path: str) -> str:
+    if not path:
+        return ''
+    if path.startswith('('):
+        return path.strip('()')
+    return path.rsplit('/', 1)[-1]
+
+
+def _sshaudit_source(item: Dict[str, Any]) -> str:
+    file_path = item.get('file') or ''
+    line = item.get('line')
+    if file_path in ('(default)', '(unset)', '(unknown)'):
+        return 'default'
+    if file_path == 'sshd -T':
+        return 'sshd -T'
+    name = _sshaudit_basename(file_path)
+    if line:
+        return f'{name}:{line}'
+    return name or '?'
+
+
+def _sshaudit_notes_by_interest(notes: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    grouped = {'high': [], 'medium': [], 'low': []}
+    for item in notes:
+        level = (item.get('interest') or 'low').lower()
+        if level not in grouped:
+            level = 'low'
+        grouped[level].append(item)
+    return grouped
+
+
+def _format_sshaudit_interest_block(title: str, notes: List[Dict[str, Any]]) -> str:
+    if not notes:
+        return ''
+    lines = [title, '-' * len(title)]
+    for item in notes[:40]:
+        param = item.get('parameter', '?')
+        value = item.get('value', '')
+        source = _sshaudit_source(item)
+        lines.append(f'  {param} = {value}  [{source}]')
+        note = item.get('note')
+        if note:
+            lines.append(f'    -> {note}')
+    if len(notes) > 40:
+        lines.append(f'  ... and {len(notes) - 40} more')
+    return '\n'.join(lines)
+
+
+def format_sshaudit_report(data: Dict[str, Any]) -> str:
+    sections = []
+    summary = data.get('summary') or {}
+    auth = summary.get('auth_surface') or {}
+    pivot = summary.get('pivot_surface') or {}
+    ssh_ver = data.get('ssh_version') or {}
+
+    header = ['SSH Enumeration', '=' * 15]
+    version = summary.get('sshd_version') or ssh_ver.get('version') or '?'
+    listen = summary.get('listen') or '?'
+    config_count = summary.get('config_files', 0)
+    ca_status = summary.get('ca_status') or 'unknown'
+    header.append(
+        f"OpenSSH {version}  |  listen {listen}  |  {config_count} config file(s)  |  CA: {ca_status}"
+    )
+    if ssh_ver.get('raw'):
+        header.append(str(ssh_ver.get('raw', '').splitlines()[0]))
+    high = summary.get('high_interest', 0)
+    medium = summary.get('medium_interest', 0)
+    low = summary.get('low_interest', 0)
+    header.append(f"Notes: {high} high, {medium} medium, {low} low")
+    sections.append('\n'.join(header))
+
+    auth_lines = ['Auth']
+    for label, key in (
+        ('PermitRootLogin', 'root_login'),
+        ('PasswordAuthentication', 'password_auth'),
+        ('PubkeyAuthentication', 'pubkey_auth'),
+        ('PermitEmptyPasswords', 'empty_passwords'),
+    ):
+        val = auth.get(key)
+        if key == 'root_login':
+            display = val if val not in (None, '') else '?'
+        else:
+            display = _sshaudit_flag(val)
+        auth_lines.append(f'  {label}: {display}')
+
+    pivot_lines = ['Pivot']
+    for label, key in (
+        ('AllowTcpForwarding', 'tcp_forwarding'),
+        ('AllowAgentForwarding', 'agent_forwarding'),
+        ('GatewayPorts', 'gateway_ports'),
+        ('PermitTunnel', 'tunnel'),
+    ):
+        pivot_lines.append(f'  {label}: {_sshaudit_flag(pivot.get(key))}')
+
+    sections.append('\n'.join(auth_lines + [''] + pivot_lines))
+
+    all_notes = (
+        (data.get('authentication_notes') or [])
+        + (data.get('access_notes') or [])
+        + (data.get('cryptography_notes') or [])
+        + (data.get('file_notes') or [])
+        + (data.get('configuration_notes') or [])
+        + (data.get('protocol_notes') or [])
+        + (data.get('certificate_authority_notes') or [])
+    )
+    grouped = _sshaudit_notes_by_interest(all_notes)
+    for title, level in (
+        ('High Interest', 'high'),
+        ('Medium Interest', 'medium'),
+        ('Low Interest', 'low'),
+    ):
+        block = _format_sshaudit_interest_block(title, grouped.get(level) or [])
+        if block:
+            sections.append(block)
+
+    config_files = data.get('configuration_files') or []
+    if config_files:
+        lines = ['Config Sources', '-' * 14]
+        for item in config_files[:20]:
+            path = item.get('path', '?')
+            mode = item.get('mode', '')
+            flags = []
+            if item.get('writable'):
+                flags.append('writable')
+            suffix = f" ({', '.join(flags)})" if flags else ''
+            lines.append(f'  {path}  {mode}{suffix}')
+        sections.append('\n'.join(lines))
+
+    ca = data.get('certificate_authority') or {}
+    if ca and ca.get('status') not in (None, '', 'not configured'):
+        ca_lines = ['CA Trust', '-' * 8, f"  status: {ca.get('status')}"]
+        for label, key in (
+            ('principals file', 'authorized_principals_file'),
+            ('principals cmd', 'authorized_principals_command'),
+            ('sig algorithms', 'ca_signature_algorithms'),
+        ):
+            val = ca.get(key)
+            if val:
+                ca_lines.append(f'  {label}: {val}')
+        tuca = ca.get('trusted_user_ca_keys') or []
+        for entry in tuca[:8]:
+            ca_lines.append(f"  trusted CA: {entry.get('path', '?')}")
+        sections.append('\n'.join(ca_lines))
+
+    host_keys = data.get('host_keys') or []
+    if host_keys:
+        lines = ['Host Keys', '-' * 9]
+        for item in host_keys[:20]:
+            path = item.get('path', '?')
+            bits = item.get('bits')
+            extra = f" {bits}-bit" if bits else ''
+            lines.append(f"  {path}{extra}  {item.get('mode', '')}")
+        sections.append('\n'.join(lines))
+
+    auth_keys = data.get('authorized_keys') or []
+    if auth_keys:
+        lines = ['Authorized Keys', '-' * 15]
+        for item in auth_keys[:20]:
+            path = item.get('path', '?')
+            flags = []
+            if item.get('writable'):
+                flags.append('writable')
+            suffix = f" ({', '.join(flags)})" if flags else ''
+            lines.append(f"  {path}  {item.get('keys', 0)} key(s){suffix}")
+        sections.append('\n'.join(lines))
+
+    overrides = data.get('configuration_overrides') or []
+    if overrides:
+        lines = ['Config Overrides', '-' * 16]
+        for item in overrides[:20]:
+            param = item.get('parameter', '?')
+            prev = f"{_sshaudit_basename(item.get('previous_file', ''))}:{item.get('previous_line', '')}={item.get('previous_value', '')}"
+            curr = f"{_sshaudit_basename(item.get('current_file', ''))}:{item.get('current_line', '')}={item.get('current_value', '')}"
+            lines.append(f'  {param}: {prev} -> {curr}')
+        sections.append('\n'.join(lines))
+
+    if not sections:
+        return 'SSH enumeration: no data collected.'
+    return '\n\n'.join(sections)
+
+
 def format_eventlogdel_report(data: Dict[str, Any]) -> str:
     lines = ['Event Log Clear Result', '-' * 24]
     summary = data.get('summary') or {}

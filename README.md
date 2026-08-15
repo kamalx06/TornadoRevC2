@@ -74,7 +74,7 @@ TornadoRevC2 is a modular reverse shell management framework that accepts inboun
 | **Session handling** | Multi-client TCP/TLS listeners, interactive PTY/TTY sessions, session fingerprinting, reconnect tracking |
 | **Transfer & execution** | Chunked file transfer with resume and SHA-256 verification; in-memory payload execution (`py`, `ps`, `exe`, `elf`, `bat`, `sh`) |
 | **Network operations** | SOCKS5 pivoting through compromised sessions with automatic remote cleanup |
-| **Enumeration** | 43 built-in plugins covering host triage, network posture, credentials metadata, browsers, VPN/proxy config, and more |
+| **Enumeration** | 44 built-in plugins covering host triage, network posture, credentials metadata, browsers, VPN/proxy config, and more |
 | **Operational plugins** | Secure file wiping, shell history clearing, Windows event log clearing |
 | **Extensibility** | Runtime plugin loading, reload, and external plugin support via `TORNADOREVC2_PLUGIN_DIR` |
 | **Reporting** | Per-session logging, structured plugin output, HTML transcript export |
@@ -185,13 +185,8 @@ Deploy a reverse shell from the built-in catalog (`payloads`) or use your own im
 status                          # List active sessions
 switch 1                        # Attach to session 1
 sysinfo 1                       # Collect host metadata
-run quickenum 1                 # Fast structured triage
-run firewall 1                  # Firewall status and rules
-run ports 1                     # Listening ports and routing
-run browser 1                   # Installed browsers and profiles
 run credstore 1                 # Credential store metadata
 run memorymap 1 1234            # Process memory maps (requires PID)
-run screenshot 1                # Desktop capture (GUI sessions)
 run inmemory 1 sh ./linpeas.sh  # In-memory script execution
 update                          # Pull latest from GitHub and restart (Git installs)
 ```
@@ -268,7 +263,7 @@ Supported types: `py`, `ps`, `exe`, `elf`, `bat`, `sh`
 
 ## Built-in Plugins
 
-TornadoRevC2 ships with **43 built-in plugins** organized by function. All enumeration plugins are read-only unless noted otherwise.
+TornadoRevC2 ships with **44 built-in plugins** organized by function. All enumeration plugins are read-only unless noted otherwise.
 
 ### Host assessment & environment
 
@@ -313,6 +308,7 @@ TornadoRevC2 ships with **43 built-in plugins** organized by function. All enume
 | `privbins` | Linux/Unix | SUID/SGID binaries, file capabilities, and privilege-escalation-relevant executables |
 | `lsm` | Linux/Unix | SELinux, AppArmor, and other Linux Security Modules: enforcement mode, policies, and configuration |
 | `journal` | Linux/Unix | Structured journalctl summaries: authentication, kernel, service failures, and recent events |
+| `sshaudit` | Linux/Unix | SSH server enumeration: effective sshd config, auth surface, pivoting options, host keys, authorized_keys, and CA trust |
 | `containers` | Linux/Unix | Container runtimes and workloads: Docker, Podman, containerd, CRI-O, LXC/LXD, and Kubernetes indicators |
 | `usersessions` | Cross-platform | Active local, remote, SSH, RDP, console, and service sessions with login/source metadata |
 
