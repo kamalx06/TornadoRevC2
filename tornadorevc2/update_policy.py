@@ -1,0 +1,160 @@
+"""Official repository and branch policy for secure self-updates."""
+
+import os
+import re
+from urllib.parse import urlparse
+
+OFFICIAL_REPO_OWNER = 'kamalx06'
+OFFICIAL_REPO_NAME = 'TornadoRevC2'
+OFFICIAL_REPO_URL = 'https://github.com/kamalx06/TornadoRevC2/'
+OFFICIAL_BRANCH = 'main'
+
+# Accepted SSH remote for the official repository (explicit allow-list).
+OFFICIAL_SSH_REMOTE = f'git@github.com:{OFFICIAL_REPO_OWNER}/{OFFICIAL_REPO_NAME}.git'
+OFFICIAL_SSH_REMOTE_ALT = f'ssh://git@github.com/{OFFICIAL_REPO_OWNER}/{OFFICIAL_REPO_NAME}.git'
+
+
+def parse_remote_url(url):
+    """Parse a Git remote URL into (host, owner, repo) or None if unrecognized."""
+    if not url:
+        return None
+    url = url.strip()
+    if not url:
+        return None
+
+    # SCP-style: git@github.com:owner/repo.git
+    scp_match = re.match(
+        r'^(?:ssh://)?(?:git@)?([^:/]+):([^/]+)/(.+?)(?:\.git)?/?$',
+        url,
+    )
+    if scp_match and '@' in url.split(':')[0]:
+        host, owner, repo = scp_match.groups()
+        return host.lower(), owner.lower(), repo.removesuffix('.git').lower()
+
+    # SSH URL: ssh://git@github.com/owner/repo.git
+    if url.startswith('ssh://'):
+        parsed = urlparse(url)
+        path = parsed.path.lstrip('/')
+        parts = path.split('/')
+        if len(parts) >= 2 and parsed.hostname:
+            owner, repo = parts[0], parts[1]
+            return parsed.hostname.lower(), owner.lower(), repo.removesuffix('.git').lower()
+        return None
+
+    # HTTPS / git:// / file URLs
+    if '://' in url:
+        parsed = urlparse(url)
+        if not parsed.hostname:
+            return None
+        path = parsed.path.lstrip('/')
+        parts = path.split('/')
+        if len(parts) >= 2:
+            owner, repo = parts[0], parts[1]
+            return parsed.hostname.lower(), owner.lower(), repo.removesuffix('.git').lower()
+        return None
+
+    return None
+
+
+def is_official_remote(url):
+    """Return True when *url* resolves to the official TornadoRevC2 repository."""
+    parsed = parse_remote_url(url)
+    if not parsed:
+        return False
+    host, owner, repo = parsed
+    if host != 'github.com':
+        return False
+    return owner == OFFICIAL_REPO_OWNER.lower() and repo == OFFICIAL_REPO_NAME.lower()
+
+
+def get_origin_url(repo_root, run_git):
+    """Return the configured origin remote URL or None."""
+    result = run_git('remote', 'get-url', 'origin', cwd=repo_root)
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def verify_origin_remote(repo_root, run_git):
+    """Verify origin points to the official repository.
+
+    Returns (ok, expected_url, actual_url).
+    """
+    actual = get_origin_url(repo_root, run_git)
+    if not actual:
+        return False, OFFICIAL_REPO_URL.rstrip('/'), ''
+    ok = is_official_remote(actual)
+    expected = OFFICIAL_REPO_URL.rstrip('/')
+    return ok, expected, actual
+
+
+def get_current_branch(repo_root, run_git):
+    """Return the current branch name or None when detached/unknown."""
+    result = run_git('rev-parse', '--abbrev-ref', 'HEAD', cwd=repo_root)
+    if result.returncode != 0:
+        return None
+    branch = result.stdout.strip()
+    if branch == 'HEAD':
+        return None
+    return branch
+
+
+def verify_trusted_branch(repo_root, run_git):
+    """Verify the repository is on the configured trusted branch.
+
+    Returns (ok, current_branch).
+    """
+    branch = get_current_branch(repo_root, run_git)
+    if not branch:
+        return False, branch or 'HEAD'
+    return branch == OFFICIAL_BRANCH, branch
+
+
+def check_working_tree(repo_root, run_git):
+    """Inspect the working tree for local modifications.
+
+    Returns (clean, status_lines) where status_lines is porcelain output split
+    into non-empty lines.
+    """
+    result = run_git('status', '--porcelain', cwd=repo_root)
+    if result.returncode != 0:
+        return False, [result.stderr.strip() or 'git status failed']
+
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    if lines:
+        return False, lines
+
+    # Detect merge/cherry-pick/rebase conflict states.
+    git_dir_result = run_git('rev-parse', '--git-dir', cwd=repo_root)
+    if git_dir_result.returncode != 0:
+        return False, ['Unable to locate .git directory']
+    git_dir = git_dir_result.stdout.strip()
+    if not os.path.isabs(git_dir):
+        git_dir = os.path.join(repo_root, git_dir)
+
+    conflict_markers = (
+        'MERGE_HEAD',
+        'CHERRY_PICK_HEAD',
+        'REVERT_HEAD',
+        'BISECT_LOG',
+    )
+    for marker in conflict_markers:
+        if os.path.exists(os.path.join(git_dir, marker)):
+            return False, [f'Repository is in an incomplete {marker.replace("_HEAD", "").lower()} state']
+
+    rebase_dir = os.path.join(git_dir, 'rebase-merge')
+    rebase_apply = os.path.join(git_dir, 'rebase-apply')
+    if os.path.isdir(rebase_dir) or os.path.isdir(rebase_apply):
+        return False, ['Repository is in the middle of a rebase']
+
+    return True, []
+
+
+def get_trusted_branch_tip(repo_root, run_git):
+    """Return the commit SHA at origin/<trusted branch>, or None if unavailable."""
+    branch_ref = f'origin/{OFFICIAL_BRANCH}'
+    result = run_git('rev-parse', branch_ref, cwd=repo_root)
+    if result.returncode != 0:
+        return None
+    commit = result.stdout.strip()
+    return commit or None

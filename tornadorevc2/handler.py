@@ -1214,7 +1214,7 @@ class TORNADOREVC2:
     rename/rn <ID> <name>   Rename session
     payloads                Show payloads list
     clear/cls               Clear screen
-    update                  Pull latest release from GitHub and restart
+    update                  Pull latest from the official repository branch and restart
     help                    This help menu
     exit/quit               Shutdown server
 
