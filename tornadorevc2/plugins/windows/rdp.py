@@ -25,6 +25,7 @@ Examples:
   run rdp adduser newuser StrongPasswordHere
 """.strip()
 
+PLUGIN_INFO = RDP_USAGE
 
 def build_command():
     return rf"""
