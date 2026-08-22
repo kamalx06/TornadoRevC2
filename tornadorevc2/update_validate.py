@@ -2,8 +2,8 @@
 
 import ast
 import compileall
-import importlib.util
 import os
+import subprocess
 import sys
 
 
@@ -48,24 +48,40 @@ def validate_required_files(repo_root):
     return True, ''
 
 
-def validate_handler_import(repo_root):
-    handler_path = os.path.join(repo_root, 'tornadorevc2', 'handler.py')
-    spec = importlib.util.spec_from_file_location('tornadorevc2_update_validate_handler', handler_path)
-    if spec is None or spec.loader is None:
-        return False, 'Unable to load handler module spec'
+def _import_error_detail(result):
+    output = (result.stderr or result.stdout or 'unknown error').strip()
+    if not output:
+        return 'unknown error'
+    for line in reversed(output.splitlines()):
+        stripped = line.strip()
+        if stripped.startswith(('ImportError', 'ModuleNotFoundError', 'SyntaxError', 'Exception')):
+            return stripped
+    return output.splitlines()[-1].strip()
 
-    module = importlib.util.module_from_spec(spec)
-    previous_path = list(sys.path)
-    inserted = repo_root not in sys.path
-    if inserted:
-        sys.path.insert(0, repo_root)
+
+def validate_handler_import(repo_root):
+    """Import handler in a child process so package-relative imports resolve."""
+    snippet = (
+        'import sys; '
+        f'sys.path.insert(0, {repo_root!r}); '
+        'import tornadorevc2.handler'
+    )
     try:
-        spec.loader.exec_module(module)
-    except Exception as exc:
+        result = subprocess.run(
+            [sys.executable, '-c', snippet],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'},
+        )
+    except subprocess.TimeoutExpired:
+        return False, 'Handler import timed out'
+    except OSError as exc:
         return False, f'Handler import failed: {exc}'
-    finally:
-        if inserted:
-            sys.path[:] = previous_path
+
+    if result.returncode != 0:
+        return False, f'Handler import failed: {_import_error_detail(result)}'
     return True, ''
 
 
