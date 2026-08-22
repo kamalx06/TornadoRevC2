@@ -43,6 +43,7 @@ Examples:
   run filesearch /home backup .zip -r
 """.strip()
 
+PLUGIN_INFO = FILESEARCH_USAGE
 
 def _display_val(value):
     if isinstance(value, bool):
