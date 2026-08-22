@@ -672,3 +672,234 @@ def format_nullcrypt_report(data: Dict[str, Any], wiped: Optional[bool] = None) 
     if data.get('error'):
         lines.append(f"Error:         {data['error']}")
     return '\n'.join(lines)
+
+def format_certificate_report(
+    data: Dict[str, Any],
+    title: str = 'Certificate Enumeration',
+) -> str:
+    sections = []
+
+    summary = data.get('summary') or {}
+
+    if summary:
+        sections.append(
+            '[Summary]\n'
+            f'Total: {summary.get("total", 0)} | '
+            f'Valid: {summary.get("valid", 0)} | '
+            f'Expired: {summary.get("expired", 0)} | '
+            f'Expiring Soon: {summary.get("expiring_soon", 0)}\n'
+            f'CA: {summary.get("ca_certificates", 0)} | '
+            f'Code Signing: {summary.get("code_signing", 0)} | '
+            f'Server Auth: {summary.get("server_authentication", 0)} | '
+            f'Client Auth: {summary.get("client_authentication", 0)}\n'
+            f'Private Keys: {summary.get("certificates_with_private_key", 0)} | '
+            f'Self-Signed: {summary.get("self_signed", 0)} | '
+            f'Weak Signature: {summary.get("weak_signature", 0)} | '
+            f'Weak Key: {summary.get("weak_key", 0)}'
+        )
+
+    findings = []
+
+    if summary.get('expired', 0):
+        findings.append(
+            f'- {summary["expired"]} expired certificate(s)'
+        )
+
+    if summary.get('expiring_soon', 0):
+        findings.append(
+            f'- {summary["expiring_soon"]} certificate(s) expire within 30 days'
+        )
+
+    if summary.get('not_yet_valid', 0):
+        findings.append(
+            f'- {summary["not_yet_valid"]} certificate(s) are not yet valid'
+        )
+
+    if summary.get('weak_signature', 0):
+        findings.append(
+            f'- {summary["weak_signature"]} certificate(s) use weak signature algorithms'
+        )
+
+    if summary.get('weak_key', 0):
+        findings.append(
+            f'- {summary["weak_key"]} certificate(s) have potentially weak keys'
+        )
+
+    if summary.get('self_signed', 0):
+        findings.append(
+            f'- {summary["self_signed"]} self-signed certificate(s) found'
+        )
+
+    if summary.get('certificates_with_private_key', 0):
+        findings.append(
+            f'- {summary["certificates_with_private_key"]} certificate(s) have an associated private key'
+        )
+
+    if findings:
+        sections.append('[Notable Findings]\n' + '\n'.join(findings))
+
+    def compact_cert(cert: Dict[str, Any], detailed: bool = False) -> str:
+        subject = cert.get('subject', '-')
+        thumbprint = cert.get('thumbprint', '-')
+        store = (
+            f'{cert.get("store_location", "-")}\\'
+            f'{cert.get("store_name", "-")}'
+        )
+
+        lines = [
+            f'Subject:    {subject}',
+            f'Thumbprint: {thumbprint}',
+            f'Store:      {store}',
+            f'Status:     {cert.get("validity_state", "-")}',
+            f'Expires:    {cert.get("not_after", "-")}',
+        ]
+
+        if detailed:
+            issuer = cert.get('issuer')
+            if issuer:
+                lines.insert(1, f'Issuer:     {issuer}')
+
+            public_key = cert.get('public_key') or {}
+
+            if isinstance(public_key, dict):
+                algorithm = public_key.get('algorithm')
+                key_size = public_key.get('key_size')
+
+                if algorithm or key_size:
+                    key = algorithm or '-'
+                    if key_size:
+                        key += f' ({key_size}-bit)'
+                    lines.append(f'Public Key: {key}')
+
+            signature = cert.get('signature_algorithm') or {}
+
+            if isinstance(signature, dict):
+                signature_name = signature.get('name')
+                if signature_name:
+                    lines.append(f'Signature:  {signature_name}')
+
+            flags = []
+
+            if cert.get('is_ca'):
+                flags.append('CA')
+            if cert.get('is_code_signing'):
+                flags.append('CodeSigning')
+            if cert.get('is_server_auth'):
+                flags.append('ServerAuth')
+            if cert.get('is_client_auth'):
+                flags.append('ClientAuth')
+            if cert.get('self_signed'):
+                flags.append('SelfSigned')
+            if cert.get('has_private_key'):
+                flags.append('PrivateKey')
+            if cert.get('weak_signature'):
+                flags.append('WeakSignature')
+            if cert.get('weak_key'):
+                flags.append('WeakKey')
+
+            if flags:
+                lines.append(f'Flags:      {", ".join(flags)}')
+
+        return '\n'.join(lines)
+
+    finding_sections = (
+        ('expired', 'Expired'),
+        ('expiring_soon', 'Expiring Soon'),
+        ('not_yet_valid', 'Not Yet Valid'),
+        ('weak_signature', 'Weak Signature'),
+        ('weak_key', 'Weak Key'),
+    )
+
+    for key, section_name in finding_sections:
+        certificates = data.get(key) or []
+
+        if not certificates:
+            continue
+
+        entries = []
+
+        for index, cert in enumerate(certificates[:10], 1):
+            entries.append(
+                f'#{index}\n{compact_cert(cert, detailed=True)}'
+            )
+
+        sections.append(
+            f'[{section_name}]\n' +
+            '\n\n'.join(entries)
+        )
+
+    category_sections = (
+        ('code_signing', 'Code Signing'),
+        ('ca_certificates', 'CA Certificates'),
+        ('root_ca_certificates', 'Root CA Certificates'),
+        ('server_authentication', 'Server Authentication'),
+        ('client_authentication', 'Client Authentication'),
+    )
+
+    for key, section_name in category_sections:
+        certificates = data.get(key) or []
+
+        if not certificates:
+            continue
+
+        entries = []
+
+        for index, cert in enumerate(certificates[:10], 1):
+            subject = cert.get('subject', '-')
+            thumbprint = cert.get('thumbprint', '-')
+            store = (
+                f'{cert.get("store_location", "-")}\\'
+                f'{cert.get("store_name", "-")}'
+            )
+            status = cert.get('validity_state', '-')
+            expires = cert.get('not_after', '-')
+
+            private_key = (
+                'Yes' if cert.get('has_private_key') else 'No'
+            )
+
+            entries.append(
+                f'#{index} {subject}\n'
+                f'  Thumbprint: {thumbprint}\n'
+                f'  Store:      {store}\n'
+                f'  Status:     {status}\n'
+                f'  Expires:    {expires}\n'
+                f'  Private Key: {private_key}'
+            )
+
+        sections.append(
+            f'[{section_name}]\n' +
+            '\n\n'.join(entries)
+        )
+
+    certificates = data.get('certificates') or []
+
+    if certificates:
+        rows = [
+            'Subject | Store | Status | Expires'
+        ]
+
+        for cert in certificates[:100]:
+            subject = cert.get('subject', '-')
+
+            store = (
+                f'{cert.get("store_location", "-")}\\'
+                f'{cert.get("store_name", "-")}'
+            )
+
+            status = cert.get('validity_state', '-')
+            expires = cert.get('not_after', '-')
+
+            rows.append(
+                f'{subject} | {store} | {status} | {expires}'
+            )
+
+        sections.append(
+            '[Certificate Inventory]\n' +
+            '\n'.join(rows)
+        )
+
+    if not sections:
+        return f'{title}: no certificates found.'
+
+    return f'{title}\n\n' + '\n\n'.join(sections)
