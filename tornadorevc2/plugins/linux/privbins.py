@@ -93,12 +93,16 @@ if cap_out:
 
 # Notable SUID binaries (GTFOBins-style common names)
 notable_names = {
-    'nmap', 'vim', 'find', 'bash', 'sh', 'dash', 'python', 'python3', 'perl',
-    'ruby', 'lua', 'awk', 'gcc', 'g++', 'make', 'docker', 'mount', 'umount',
-    'pkexec', 'sudo', 'su', 'passwd', 'chsh', 'newgrp', 'gpasswd', 'crontab',
-    'at', 'tar', 'zip', 'cp', 'mv', 'less', 'more', 'nano', 'view', 'wget',
-    'curl', 'ftp', 'scp', 'rsync', 'systemctl', 'journalctl',
+    'bash', 'sh', 'dash', 'zsh', 'python', 'python3', 'perl', 'ruby',
+    'lua', 'awk', 'gawk', 'php', 'node',
+    'vim', 'nvim', 'vi', 'less', 'more', 'nano', 'view',
+    'find', 'env', 'xargs', 'tar', 'zip', 'cp', 'mv',
+    'gcc', 'g++', 'make', 'crontab', 'at',
+    'sudo', 'su', 'pkexec', 'passwd', 'chsh', 'newgrp', 'gpasswd',
+    'systemctl', 'journalctl', 'chroot', 'mount', 'umount',
+    'docker', 'nmap', 'nc', 'socat', 'wget', 'curl', 'ftp', 'scp', 'rsync',
 }
+
 notable = []
 for entry in suid + sgid:
     base = os.path.basename(entry['path']).lower()
