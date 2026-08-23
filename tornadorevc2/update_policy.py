@@ -150,6 +150,46 @@ def check_working_tree(repo_root, run_git):
     return True, []
 
 
+_PORCELAIN_STATUS = {
+    'M': 'modified',
+    'A': 'added',
+    'D': 'deleted',
+    'R': 'renamed',
+    'C': 'copied',
+    'U': 'unmerged',
+}
+
+
+def _describe_porcelain_path(x, y, path):
+    if x == '?' and y == '?':
+        return f'untracked  {path}'
+    if ' -> ' in path:
+        return f'renamed    {path}'
+    if x == 'D' or y == 'D':
+        return f'deleted    {path}'
+    if x == 'A' or y == 'A':
+        return f'added      {path}'
+    if x == 'M' or y == 'M':
+        return f'modified   {path}'
+    x_label = _PORCELAIN_STATUS.get(x)
+    y_label = _PORCELAIN_STATUS.get(y)
+    if x_label and y_label:
+        return f'{x_label}/{y_label}  {path}'
+    label = x_label or y_label or 'changed'
+    return f'{label:<10} {path}'
+
+
+def format_working_tree_changes(status_lines):
+    """Return human-readable descriptions of git status --porcelain lines."""
+    formatted = []
+    for line in status_lines:
+        if len(line) >= 4 and line[2] == ' ':
+            formatted.append(_describe_porcelain_path(line[0], line[1], line[3:]))
+        elif line.strip():
+            formatted.append(line.strip())
+    return formatted
+
+
 def get_trusted_branch_tip(repo_root, run_git):
     """Return the commit SHA at origin/<trusted branch>, or None if unavailable."""
     branch_ref = f'origin/{OFFICIAL_BRANCH}'

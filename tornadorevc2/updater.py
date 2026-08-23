@@ -11,6 +11,7 @@ from .update_policy import (
     OFFICIAL_BRANCH,
     OFFICIAL_REPO_URL,
     check_working_tree,
+    format_working_tree_changes,
     get_origin_url,
     get_trusted_branch_tip,
     verify_origin_remote,
@@ -60,10 +61,14 @@ WRONG_BRANCH_MSG = (
     'Current branch: {current}\n\n'
     'Update aborted for security reasons.'
 )
-DIRTY_TREE_MSG = (
-    'Local changes were detected in the TornadoRevC2 installation.\n\n'
-    'The updater will not modify a dirty working tree.\n\n'
-    'Update aborted.'
+DIRTY_TREE_HEADER = (
+    'Update aborted: the installation has uncommitted local changes.\n\n'
+    'Updates require a clean working tree.'
+)
+DIRTY_TREE_FOOTER = (
+    '\nDiscard or stash your changes, then run update again:\n'
+    '  git stash push -u -m "local changes"\n'
+    '  git checkout -- .'
 )
 INTERRUPTED_UPDATE_MSG = (
     'A previous update did not complete successfully.\n'
@@ -165,6 +170,17 @@ def _collect_update_preview(repo_root, current_revision, target_revision):
     shortstat = stat_result.stdout.strip() if stat_result.returncode == 0 else ''
 
     return commit_count, commits, shortstat
+
+
+def _format_dirty_tree_message(status_lines):
+    changes = format_working_tree_changes(status_lines)
+    lines = [DIRTY_TREE_HEADER, '', 'Local changes:']
+    for entry in changes[:20]:
+        lines.append(f'  {entry}')
+    if len(changes) > 20:
+        lines.append(f'  ... and {len(changes) - 20} more')
+    lines.append(DIRTY_TREE_FOOTER)
+    return '\n'.join(lines)
 
 
 def _restart_process():
@@ -273,6 +289,14 @@ class Updater:
                     )
                     return
 
+                clean, status_lines = check_working_tree(repo_root, self._run_git)
+                working_tree_status = 'clean' if clean else 'dirty'
+                self.audit.log('UPDATE_WORKING_TREE', status=working_tree_status)
+                if not clean:
+                    self._print_error(_format_dirty_tree_message(status_lines))
+                    self.audit.log('UPDATE_ABORTED', reason='dirty_working_tree')
+                    return
+
                 self._print_info(
                     f'Fetching updates from {OFFICIAL_REPO_URL} ({OFFICIAL_BRANCH})...'
                 )
@@ -318,20 +342,6 @@ class Updater:
                         final_result='already_current',
                     )
                     clear_state()
-                    return
-
-                clean, status_lines = check_working_tree(repo_root, self._run_git)
-                working_tree_status = 'clean' if clean else 'dirty'
-                self.audit.log('UPDATE_WORKING_TREE', status=working_tree_status)
-                if not clean:
-                    self._print_error(DIRTY_TREE_MSG)
-                    if status_lines:
-                        print(f"{colors['yellow']}Detected changes:{colors['end']}")
-                        for line in status_lines[:20]:
-                            print(f"  {line}")
-                        if len(status_lines) > 20:
-                            print(f"  ... and {len(status_lines) - 20} more")
-                    self.audit.log('UPDATE_ABORTED', reason='dirty_working_tree')
                     return
 
                 commit_count, commits, shortstat = _collect_update_preview(
