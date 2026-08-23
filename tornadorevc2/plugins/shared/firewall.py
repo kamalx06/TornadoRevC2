@@ -109,10 +109,17 @@ if which('ufw'):
     numbered = sh('ufw status numbered 2>/dev/null', 8)
 
     status_line = 'unknown'
+
     if st:
         for line in st.splitlines():
-            if line.strip().lower().startswith('status:'):
-                status_line = line.strip()
+            line = line.strip()
+
+            if line.lower() == 'status: active':
+                status_line = 'active'
+                break
+
+            if line.lower() == 'status: inactive':
+                status_line = 'stopped'
                 break
 
     result['ufw'] = {
@@ -144,10 +151,17 @@ if which('firewall-cmd'):
         8,
     )
 
+    if state == 'running':
+        firewall_state = 'running'
+    elif state in ('', 'not running'):
+        firewall_state = 'stopped'
+    else:
+        firewall_state = state or 'unknown'
+
     result['firewalld'] = {
         'available': 'yes',
-        'state': state or 'unknown',
-        'default_zone': default or 'unknown',
+        'state': firewall_state,
+        'default_zone': default or 'N/A',
     }
 
     active_zones = []
@@ -282,7 +296,7 @@ if which('ip6tables'):
 
 if which('ss'):
     tcp = sh(
-        'ss -lntup 2>/dev/null',
+        'ss -lntp 2>/dev/null',
         8,
     )
 
@@ -295,7 +309,7 @@ if which('ss'):
         entries = []
 
         for line in output.splitlines():
-            if not line.startswith(('tcp', 'udp')):
+            if not line.startswith(protocol):
                 continue
 
             parts = line.split()
@@ -373,7 +387,7 @@ default_forward = 'unknown'
 for backend in (
     result.get('iptables', {}),
     result.get('ip6tables', {}),
-):unknown
+):
     policies = backend.get('default_policies', {})
 
     if default_inbound == 'unknown':
