@@ -34,6 +34,8 @@ Examples:
   run wiper method=quick /var/tmp/cache.dat
 """.strip()
 
+PLUGIN_INFO = WIPER_USAGE
+
 _SSD_CAVEAT = (
     'HDD note: multi-pass overwrite plus rename/truncate/delete provides strong assurance '
     'on traditional spinning disks.\n'
@@ -105,7 +107,7 @@ import os, secrets, platform, subprocess, stat
 path = {json.dumps(path)}
 profile = {json.dumps(method)}
 passes = {passes_literal}
-use_shred = {json.dumps(use_shred)}
+use_shred = {repr(use_shred)}
 method_label = {json.dumps(label)}
 steps = []
 pass_count = 0

