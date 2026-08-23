@@ -130,35 +130,43 @@ Write-Output ($start+(ConvertTo-Json $result -Depth 5 -Compress)+$end)
 
 
 def _build_adduser_command(username: str, password: str):
-    user_json = json.dumps(username)
-    pass_json = json.dumps(password)
+    user_json, pass_json = json.dumps(username), json.dumps(password)
+
     return rf"""
-$ErrorActionPreference='SilentlyContinue'
-$start='{PLUGIN_MARK_START}'; $end='{PLUGIN_MARK_END}'
-$user = {user_json}
-$pass = {pass_json}
-$result=[ordered]@{{action='adduser';ok=$false;user=$user;steps=@();message=''}}
-function Invoke-NetStep([string]$Label,[string[]]$Args){{
-  $out=& net.exe @Args 2>&1|Out-String
-  $ok=($LASTEXITCODE -eq 0)
-  return @{{step=$Label;ok=$ok;detail=($out -replace '\s+',' ').Trim()}}
+$ErrorActionPreference='Stop'
+$start='{PLUGIN_MARK_START}';$end='{PLUGIN_MARK_END}'
+$user={user_json};$pass={pass_json}
+$result=[ordered]@{{action='adduser';ok=$false;user=$user;steps=@()}}
+
+function NetStep($name,[string[]]$a){{
+  try{{
+    $o=& "$env:SystemRoot\System32\net.exe" @a 2>&1|Out-String
+    $c=$LASTEXITCODE
+    [ordered]@{{step=$name;ok=($c-eq 0);exit_code=$c;detail=(($o-replace'\s+',' ').Trim())}}
+  }}catch{{
+    [ordered]@{{step=$name;ok=$false;exit_code=-1;detail=$_.Exception.Message}}
+  }}
 }}
+
 try{{
-  $result.steps+=Invoke-NetStep 'create_user' @('user',$user,$pass,'/add')
-  $result.steps+=Invoke-NetStep 'administrators' @('localgroup','Administrators',$user,'/add')
-  $result.steps+=Invoke-NetStep 'rdp_users' @('localgroup','Remote Desktop Users',$user,'/add')
-  $result.ok=($result.steps|Where-Object{{-not $_.ok}}).Count -eq 0
+  $result.steps+=NetStep 'create_user' @('user',$user,$pass,'/add')
+  $result.steps+=NetStep 'administrators' @('localgroup','Administrators',$user,'/add')
+  $result.steps+=NetStep 'rdp_users' @('localgroup','Remote Desktop Users',$user,'/add')
+
+  $failed=@($result.steps|?{{-not $_.ok}})
+  $result.ok=$failed.Count-eq 0
   if($result.ok){{
     $result.message="User '$user' created with Administrators and Remote Desktop Users membership"
   }}else{{
-    $failed=($result.steps|Where-Object{{-not $_.ok}}|ForEach-Object{{$_.step}})-join ', '
-    $result.error="Failed step(s): $failed"
+    $result.error="Failed step(s): $(($failed|% step)-join ', ')"
   }}
 }}catch{{
   $result.error=$_.Exception.Message
 }}
+
 Write-Output ($start+(ConvertTo-Json $result -Depth 5 -Compress)+$end)
 """
+
 
 
 def _format_action_report(data: dict) -> str:
