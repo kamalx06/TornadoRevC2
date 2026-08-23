@@ -364,29 +364,163 @@ def format_memorymap_report(data: Dict[str, Any]) -> str:
 
 def format_firewall_report(data: Dict[str, Any]) -> str:
     sections = []
+
     summary = data.get('summary') or {}
     if summary:
         sections.append(format_section('Summary', summary))
+
+    windows_fw = data.get('windows_defender_firewall')
+
+    if isinstance(windows_fw, dict) and windows_fw:
+        lines = []
+
+        for profile, config in windows_fw.items():
+            if not isinstance(config, dict):
+                continue
+
+            lines.append(f'{profile}')
+
+            preferred_fields = (
+                'Enabled',
+                'DefaultInbound',
+                'DefaultOutbound',
+                'LogAllowed',
+                'LogBlocked',
+                'LogFileName',
+                'LogMaxSizeKilobytes',
+                'NotifyOnListen',
+            )
+
+            for field in preferred_fields:
+                if field in config:
+                    lines.append(
+                        f'  {field}: {config[field]}'
+                    )
+
+            lines.append('')
+
+        if lines:
+            sections.append(
+                'Windows Defender Firewall\n'
+                + '\n'.join(lines).rstrip()
+            )
+
+    network = data.get('network')
+
+    if isinstance(network, dict) and network:
+        if any(isinstance(v, dict) for v in network.values()):
+            rows = []
+
+            for interface, config in network.items():
+                if not isinstance(config, dict):
+                    continue
+
+                rows.append({
+                    'interface': interface,
+                    'ipv4': config.get('IPv4', ''),
+                    'ipv6': config.get('IPv6', ''),
+                    'gateway': config.get('Gateway', ''),
+                })
+
+            if rows:
+                sections.append(
+                    format_table_section(
+                        'Network Interfaces',
+                        rows,
+                        [
+                            'interface',
+                            'ipv4',
+                            'ipv6',
+                            'gateway',
+                        ],
+                    )
+                )
+        else:
+            sections.append(
+                format_section('Network', network)
+            )
+
     for key in (
-        'windows_defender_firewall', 'ufw', 'firewalld', 'nftables',
-        'iptables', 'ip6tables', 'other',
+        'ufw',
+        'firewalld',
+        'nftables',
+        'iptables',
+        'ip6tables',
+        'other',
     ):
         block = data.get(key)
+
         if isinstance(block, dict) and block:
-            sections.append(format_section(key.replace('_', ' ').title(), block))
+            sections.append(
+                format_section(
+                    key.replace('_', ' ').title(),
+                    block,
+                )
+            )
+
         elif isinstance(block, list) and block:
-            sections.append(format_list_section(key.replace('_', ' ').title(), [str(v) for v in block]))
+            sections.append(
+                format_list_section(
+                    key.replace('_', ' ').title(),
+                    [str(v) for v in block],
+                )
+            )
+
     rules = data.get('notable_rules') or []
+
     if rules:
-        if isinstance(rules[0], dict):
-            cols = list(rules[0].keys())[:6]
-            sections.append(format_table_section('Notable Rules', rules, cols))
+        if isinstance(rules, list) and isinstance(rules[0], dict):
+            preferred_columns = [
+                'name',
+                'direction',
+                'action',
+                'protocol',
+                'local_port',
+                'remote_port',
+                'local_address',
+                'remote_address',
+                'profile',
+                'program',
+            ]
+
+            available = set(rules[0].keys())
+
+            cols = [
+                col
+                for col in preferred_columns
+                if col in available
+            ][:8]
+
+            if cols:
+                sections.append(
+                    format_table_section(
+                        'Notable Rules',
+                        rules,
+                        cols,
+                    )
+                )
         else:
-            sections.append(format_list_section('Notable Rules', [str(r) for r in rules]))
+            sections.append(
+                format_list_section(
+                    'Notable Rules',
+                    [str(r) for r in rules],
+                )
+            )
+
+    netsh = data.get('netsh_output')
+
+    if netsh:
+        sections.append(
+            format_list_section(
+                'Netsh Firewall',
+                [str(netsh)],
+            )
+        )
+
     if not sections:
         return 'Firewall: no data collected.'
-    return '\n\n'.join(sections)
 
+    return '\n\n'.join(sections)
 
 def _sshaudit_flag(val: Any) -> str:
     if isinstance(val, bool):
