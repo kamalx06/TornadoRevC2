@@ -134,7 +134,7 @@ class ConsoleCompleter:
         self._session_id = session_id
         self._snapshot_at = 0.0
 
-    def _snapshot(self) -> dict:
+    def _get_snapshot(self) -> dict:
         now = time.monotonic()
         if now - self._snapshot_at > 0.4:
             try:
@@ -150,7 +150,7 @@ class ConsoleCompleter:
         if state == 0:
             line = readline.get_line_buffer()
             begidx = readline.get_begidx()
-            self._matches = candidates(line, text, begidx, self._mode, self._snapshot())
+            self._matches = candidates(line, text, begidx, self._mode, self._get_snapshot())
         try:
             return self._matches[state]
         except IndexError:

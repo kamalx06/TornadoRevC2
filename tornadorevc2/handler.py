@@ -324,6 +324,10 @@ class TORNADOREVC2:
         context.options |= ssl.OP_NO_COMPRESSION
         context.options |= ssl.OP_NO_RENEGOTIATION
         context.options |= ssl.OP_CIPHER_SERVER_PREFERENCE
+        try:
+            context.set_ecdh_curve("X25519")
+        except ssl.SSLError:
+            context.set_ecdh_curve("prime256v1")
         return context
 
     def send_to_revshell(self, client_sock, cmd):
