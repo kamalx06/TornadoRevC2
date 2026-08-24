@@ -88,8 +88,10 @@ def candidates(line: str, text: str, begidx: int, mode: str, snapshot: dict) -> 
             return sorted(s for s in PLUGINS_SUBCOMMANDS if s.startswith(needle))
         if cmd == 'plugins' and index == 2 and words[1].lower() in ('load', 'unload', 'reload', 'info'):
             return sorted(p for p in plugins if p.startswith(needle))
-        return []
+        # Show client commands as fallback when no specific condition matches
+        return sorted(c for c in CLIENT_COMMANDS if c.startswith(needle))
 
+    # Main console mode
     if index == 0:
         return sorted(c for c in CONSOLE_COMMANDS if c.startswith(needle))
     if index == 1 and cmd in ID_COMMANDS:
@@ -109,12 +111,13 @@ def candidates(line: str, text: str, begidx: int, mode: str, snapshot: dict) -> 
     if cmd == 'jobs' and index == 1:
         return sorted(s for s in JOBS_SUBCOMMANDS if s.startswith(needle))
     if cmd == 'jobs' and index == 2 and words[1].lower() in ('attach', 'show', 'get'):
-        return sorted(j for j in job_ids if j.startswith(text))
+        return sorted(j for j in job_ids if j.startswith(needle))
     if cmd == 'upload' and index == 2:
         return complete_paths(text)
     if cmd == 'download' and index == 3:
         return complete_paths(text)
-    return []
+    # Fallback: show main console commands
+    return sorted(c for c in CONSOLE_COMMANDS if c.startswith(needle))
 
 
 class ConsoleCompleter:

@@ -35,13 +35,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog='tornadorevc2',
         description='TornadoRevC2 daemon/client. -H/-p/-tp configure reverse-shell listeners only.',
-        epilog='Commands: start, stop, restart, status, console, jobs',
+        epilog='Commands: start, stop, restart, status, console, jobs, update, update unstable',
     )
     add_listener_args(parser)
     parser.add_argument('--runtime-dir', default=None, help='Runtime directory for local management IPC state')
     parser.add_argument('--foreground', action='store_true', help='Run the daemon in this process')
     parser.add_argument('--config', default=None, help=argparse.SUPPRESS)
-    parser.add_argument('command', nargs='?', default=None, help='start | stop | restart | status | console | jobs')
+    parser.add_argument('command', nargs='?', default=None, help='start | stop | restart | status | console | jobs | update [unstable]')
     parser.add_argument('extra', nargs=argparse.REMAINDER)
     return parser
 

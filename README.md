@@ -108,14 +108,22 @@ Handler updates are delivered through Git on the operator machine. The `update` 
 
 ## Architecture
 
+The TornadoRevC2 daemon/client architecture separates the management plane from the operator console:
+
 ```text
 ┌─────────────────────────────────────────────────────────────────┐
-│                     Operator Console (handler)                  │
-│  Sessions · Transfers · SOCKS · Plugins · Logging · Export ·    │
-│  update                                                         │
-└────────────────────────────┬────────────────────────────────────┘
-                             │ reverse shell channel (TCP/TLS)
-                             ▼
+│                    Management Daemon (background process)       │
+│  Sessions · Listeners · Jobs · Lifecycle · Plugins · Events       │
+│  Local IPC (Unix socket / TCP)                                  │
+└─────────────────────────────────────────────────────────────────┘
+                              │ local IPC
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Operator Console (client)                    │
+│  Sessions · Transfers · SOCKS · Plugins · Logging · Export      │
+└─────────────────────────────────────────────────────────────────┘
+                              │ reverse shell (TCP/TLS)
+                              ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                        Target Host                              │
 │  Native commands · PowerShell · inline collectors               │
@@ -123,7 +131,20 @@ Handler updates are delivered through Git on the operator machine. The `update` 
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### Plugin layout
+### Key Design Principles
+
+- **Persistent daemon**: Core session and listener management runs in a persistent background daemon. The daemon owns session, listener, job, and lifecycle management.
+- **Client terminals**: CLI terminals act as clients that can connect to the same daemon and manage existing sessions. Multiple terminals can connect simultaneously.
+- **Persistence**: Active sessions and long-running operations persist even when a CLI terminal closes. Long-running operations are represented as persistent jobs, allowing users to disconnect and later reconnect to view or stream results.
+- **Local IPC for management**: Daemon management is accessible only through localhost/local IPC (Unix socket or TCP). This separates management communication from reverse-shell listeners.
+- **Network-facing listeners**: Reverse-shell listeners remain network-facing (TCP/TLS), while management communication remains separated through local IPC.
+- **Concurrent operations**: The architecture is designed to support concurrent operations while maintaining per-session control.
+
+### TCP/TLS Listener Configuration
+
+The daemon supports configurable TCP/TLS listener host and port behavior. The `-H`, `-p`, and `-tp` flags configure the reverse-shell bind address and ports. The management plane uses local IPC (Unix socket by default, or TCP if configured) for operator communication.
+
+### Plugin Layout
 
 ```text
 tornadorevc2/plugins/

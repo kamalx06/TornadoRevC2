@@ -8,6 +8,7 @@ OFFICIAL_REPO_OWNER = 'kamalx06'
 OFFICIAL_REPO_NAME = 'TornadoRevC2'
 OFFICIAL_REPO_URL = 'https://github.com/kamalx06/TornadoRevC2/'
 OFFICIAL_BRANCH = 'main'
+DEVELOPMENT_BRANCH = 'development'
 
 # Accepted SSH remote for the official repository (explicit allow-list).
 OFFICIAL_SSH_REMOTE = f'git@github.com:{OFFICIAL_REPO_OWNER}/{OFFICIAL_REPO_NAME}.git'
@@ -99,14 +100,17 @@ def get_current_branch(repo_root, run_git):
     return branch
 
 
-def verify_trusted_branch(repo_root, run_git):
+def verify_trusted_branch(repo_root, run_git, development=False):
     """Verify the repository is on the configured trusted branch.
 
     Returns (ok, current_branch).
+    If development=True, checks against DEVELOPMENT_BRANCH instead of OFFICIAL_BRANCH.
     """
     branch = get_current_branch(repo_root, run_git)
     if not branch:
         return False, branch or 'HEAD'
+    if development:
+        return branch == DEVELOPMENT_BRANCH, branch
     return branch == OFFICIAL_BRANCH, branch
 
 
@@ -190,9 +194,14 @@ def format_working_tree_changes(status_lines):
     return formatted
 
 
-def get_trusted_branch_tip(repo_root, run_git):
-    """Return the commit SHA at origin/<trusted branch>, or None if unavailable."""
-    branch_ref = f'origin/{OFFICIAL_BRANCH}'
+def get_trusted_branch_tip(repo_root, run_git, development=False):
+    """Return the commit SHA at origin/<trusted branch>, or None if unavailable.
+
+    If development=True, resolves origin/<DEVELOPMENT_BRANCH> instead of
+    origin/<OFFICIAL_BRANCH>.
+    """
+    branch = DEVELOPMENT_BRANCH if development else OFFICIAL_BRANCH
+    branch_ref = f'origin/{branch}'
     result = run_git('rev-parse', branch_ref, cwd=repo_root)
     if result.returncode != 0:
         return None
