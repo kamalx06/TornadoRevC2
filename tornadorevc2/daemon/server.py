@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import os
 import socket
 import threading
@@ -134,6 +135,10 @@ class ManagementServer:
             return self.status_payload()
         if method == 'daemon.stop':
             return {'stopping': True}
+        if method == 'console.banner':
+            return self._banner()
+        if method == 'console.complete':
+            return self._complete_snapshot(params.get('session_id'))
         if method == 'console.command':
             return self._console_command(params.get('line') or '')
         if method == 'session.command':
@@ -173,6 +178,25 @@ class ManagementServer:
             },
             'sessions': self.handler.get_client_count(),
             'jobs': counts,
+        }
+
+    def _banner(self) -> dict[str, Any]:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.handler.print_banner()
+        return {'output': buf.getvalue()}
+
+    def _complete_snapshot(self, session_id=None) -> dict[str, Any]:
+        session_sock = None
+        if session_id is not None and str(session_id) != '':
+            try:
+                session_sock = self.handler._get_client_by_id(int(session_id))
+            except (TypeError, ValueError):
+                session_sock = None
+        return {
+            'session_ids': self.handler._get_client_ids(),
+            'plugins': self.handler.plugins.completion_plugins(session_sock),
+            'job_ids': [str(job.id) for job in self.jobs.list()],
         }
 
     def _console_command(self, line: str) -> dict[str, Any]:
@@ -288,6 +312,10 @@ class ManagementServer:
     def _subscribe_events(self, sock, req_id) -> None:
         pending = []
         lock = threading.Lock()
+
+        def on_event(evt):
+            with lock:
+                pending.append(evt)
 
         write_message(sock, response(req_id, result={'subscribed': True}))
         self.bus.subscribe(on_event)

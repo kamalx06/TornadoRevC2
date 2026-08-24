@@ -8,6 +8,7 @@ import threading
 
 from ..daemon.config import DaemonConfig
 from ..ipc.client import ManagementClient, load_token
+from .complete import ConsoleCompleter
 
 try:
     import readline
@@ -24,7 +25,7 @@ YELLOW = '\033[93m'
 END = '\033[0m'
 
 
-def _init_readline():
+def _init_readline(completer: ConsoleCompleter | None = None):
     if not readline:
         return
     try:
@@ -34,7 +35,10 @@ def _init_readline():
             readline.parse_and_bind('tab: complete')
     except Exception:
         pass
+    readline.set_completer_delims(' \t\n')
     readline.set_history_length(1000)
+    if completer is not None:
+        readline.set_completer(completer.complete)
 
 
 def attach_job(client: ManagementClient, job_id: int) -> None:
@@ -66,17 +70,27 @@ def _event_listener(config: DaemonConfig, token: str, stop: threading.Event) -> 
         return
 
 
-def _session_loop(client: ManagementClient, session_id: int) -> None:
-    while True:
-        try:
-            line = input(f'{GREEN}session {session_id}{END} {CYAN}>{END} ')
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return
-        result = client.call('session.command', {'session_id': session_id, 'line': line}, timeout=None)
-        sys.stdout.write(result.get('output') or '')
-        if result.get('result') in ('exit_session', 'disconnected'):
-            return
+def _session_loop(
+    client: ManagementClient,
+    session_id: int,
+    completer: ConsoleCompleter | None = None,
+) -> None:
+    if completer is not None:
+        completer.set_mode('client', session_id)
+    try:
+        while True:
+            try:
+                line = input(f'{GREEN}session {session_id}{END} {CYAN}>{END} ')
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return
+            result = client.call('session.command', {'session_id': session_id, 'line': line}, timeout=None)
+            sys.stdout.write(result.get('output') or '')
+            if result.get('result') in ('exit_session', 'disconnected'):
+                return
+    finally:
+        if completer is not None:
+            completer.set_mode('main')
 
 
 def run_console(config: DaemonConfig) -> int:
@@ -84,11 +98,23 @@ def run_console(config: DaemonConfig) -> int:
     stop = threading.Event()
     listener = threading.Thread(target=_event_listener, args=(config, token, stop), daemon=True)
     listener.start()
-    _init_readline()
-    print(f'{CYAN}Connected to TornadoRevC2 daemon. Type help; exit leaves the console running.{END}')
     try:
         with ManagementClient(config, token=token) as client:
             client.call('ping', timeout=5.0)
+            completer = ConsoleCompleter(
+                lambda sid: client.call(
+                    'console.complete',
+                    {'session_id': sid} if sid is not None else {},
+                    timeout=1.5,
+                )
+            )
+            _init_readline(completer)
+            try:
+                banner = client.call('console.banner', timeout=5.0)
+                sys.stdout.write(banner.get('output') or '')
+            except Exception:
+                pass
+            print(f'{CYAN}Connected to TornadoRevC2 daemon. Type help; exit leaves the console running.{END}')
             while True:
                 try:
                     line = input(f'{GREEN}tornadorevc2>{END} ')
@@ -109,7 +135,7 @@ def run_console(config: DaemonConfig) -> int:
                 if result.get('exit_console'):
                     break
                 if result.get('attach'):
-                    _session_loop(client, int(result['attach']))
+                    _session_loop(client, int(result['attach']), completer)
                 if result.get('attach_job'):
                     attach_job(client, int(result['attach_job']))
     finally:
