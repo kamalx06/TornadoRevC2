@@ -66,7 +66,9 @@ class ManagementClient:
         write_message(self.sock, msg)
         previous = self.sock.gettimeout()
         try:
-            if timeout is not None:
+            if timeout is None:
+                self.sock.settimeout(None)  # Set to blocking mode (no timeout)
+            else:
                 self.sock.settimeout(timeout)
             while True:
                 reply = read_message(self.sock)
@@ -88,7 +90,10 @@ class ManagementClient:
         write_message(self.sock, msg)
         previous = self.sock.gettimeout()
         try:
-            self.sock.settimeout(timeout)
+            if timeout is None:
+                self.sock.settimeout(None)  # Set to blocking mode (no timeout)
+            else:
+                self.sock.settimeout(timeout)
             while True:
                 reply = read_message(self.sock)
                 yield reply
