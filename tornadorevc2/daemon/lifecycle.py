@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Optional
 
@@ -84,6 +87,23 @@ def clear_runtime_state(config: DaemonConfig) -> None:
             os.remove(path)
         except OSError:
             pass
+    _cleanup_temp_directories()
+
+
+def _cleanup_temp_directories() -> None:
+    """Clean up tornado-* temporary directories in /tmp that may have been left behind."""
+    temp_dir = tempfile.gettempdir()
+    try:
+        for entry in os.listdir(temp_dir):
+            if entry.startswith('tornado-'):
+                entry_path = os.path.join(temp_dir, entry)
+                try:
+                    if os.path.isdir(entry_path):
+                        shutil.rmtree(entry_path, ignore_errors=True)
+                except OSError:
+                    pass
+    except OSError:
+        pass
 
 
 def running_daemon(config: DaemonConfig) -> Optional[tuple[int, DaemonConfig]]:
