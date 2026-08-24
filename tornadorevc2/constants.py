@@ -21,7 +21,7 @@ MAIN_COMMANDS = (
     'switch', 'kill', 'status', 'ls', 'sessions', 'reconnects', 'payloads',
     'rename', 'rn', 'upload', 'download', 'verify', 'hash', 'sysinfo',
     'clear', 'cls',
-    'socks', 'tunnels', 'export', 'plugins', 'run', 'update',
+    'socks', 'tunnels', 'export', 'plugins', 'run', 'update', 'jobs',
     'help', 'exit', 'quit', 'e', 'q',
 )
 CLIENT_COMMANDS = (

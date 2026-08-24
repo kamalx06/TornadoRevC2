@@ -3,3 +3,4 @@ logs/
 server.key
 server.pem
 __pycache__/
+tests/
