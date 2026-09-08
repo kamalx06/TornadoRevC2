@@ -176,7 +176,9 @@ class SSHTransport(RemoteTransport):
         self._ensure_dependency()
         private_key_path = kwargs.get('private_key')
         use_nxc = kwargs.get('use_nxc', False)
-        port = kwargs.get('port', self.DEFAULT_PORTS['ssh'])
+        port = kwargs.get('port')
+        if port is None:
+            port = self.DEFAULT_PORTS['ssh']
         target_os = kwargs.get('target_os')
         callback_host = kwargs.get('callback_host')
         callback_port = kwargs.get('callback_port')
@@ -408,7 +410,9 @@ class WinRMTransport(RemoteTransport):
             raise RemoteTransportError("WinRM does not support private key authentication")
         ntlm_hash = kwargs.get('ntlm_hash')
         use_nxc = kwargs.get('use_nxc', False)
-        port = kwargs.get('port', self.DEFAULT_PORTS['winrm'])
+        port = kwargs.get('port')
+        if port is None:
+            port = self.DEFAULT_PORTS['winrm']
         target_os = kwargs.get('target_os', 'windows')
         callback_host = kwargs.get('callback_host')
         callback_port = kwargs.get('callback_port')
@@ -533,7 +537,9 @@ class SMBTransport(RemoteTransport):
             raise RemoteTransportError("SMB does not support private key authentication")
         ntlm_hash = kwargs.get('ntlm_hash')
         use_nxc = kwargs.get('use_nxc', False)
-        port = kwargs.get('port', self.DEFAULT_PORTS['smb'])
+        port = kwargs.get('port')
+        if port is None:
+            port = self.DEFAULT_PORTS['smb']
         target_os = kwargs.get('target_os', 'windows')
 
         if not password and not ntlm_hash:
@@ -703,7 +709,9 @@ class RDPTransport(RemoteTransport):
             raise RemoteTransportError("RDP does not support private key authentication")
         ntlm_hash = kwargs.get('ntlm_hash')
         use_nxc = kwargs.get('use_nxc', True)
-        port = kwargs.get('port', self.DEFAULT_PORTS['rdp'])
+        port = kwargs.get('port')
+        if port is None:
+            port = self.DEFAULT_PORTS['rdp']
         if not password and not ntlm_hash:
             raise RemoteTransportError("Password or NTLM hash required for RDP")
         self._host = host
@@ -919,6 +927,8 @@ class WMITransport(RemoteTransport):
         ntlm_hash = kwargs.get('ntlm_hash')
         use_nxc = kwargs.get('use_nxc', False)
         port = kwargs.get('port')
+        if port is None:
+            port = self.DEFAULT_PORTS['wmi']
         target_os = kwargs.get('target_os', 'windows')
         callback_host = kwargs.get('callback_host')
         callback_port = kwargs.get('callback_port')
@@ -1101,7 +1111,9 @@ class MSSQLTransport(RemoteTransport):
             raise RemoteTransportError("MSSQL does not support private key authentication")
         ntlm_hash = kwargs.get('ntlm_hash')
         use_nxc = kwargs.get('use_nxc', False)
-        port = kwargs.get('port', 1433)
+        port = kwargs.get('port')
+        if port is None:
+            port = self.DEFAULT_PORTS['mssql']
         target_os = kwargs.get('target_os', 'windows')
         callback_host = kwargs.get('callback_host')
         callback_port = kwargs.get('callback_port')
