@@ -74,7 +74,7 @@ TornadoRevC2 is a modular reverse shell management framework that accepts inboun
 | **Session handling** | Multi-client TCP/TLS listeners, interactive PTY/TTY sessions, session fingerprinting, reconnect tracking |
 | **Transfer & execution** | Chunked file transfer with resume and SHA-256 verification; in-memory payload execution (`py`, `ps`, `exe`, `elf`, `bat`, `sh`) |
 | **Network operations** | SOCKS5 pivoting through compromised sessions with automatic remote cleanup |
-| **Enumeration** | 44 built-in plugins covering host triage, network posture, credentials metadata, browsers, VPN/proxy config, and more |
+| **Enumeration** | 45 built-in plugins covering host triage, network posture, credentials metadata, browsers, VPN/proxy config, and more |
 | **Operational plugins** | Secure file wiping, shell history clearing, Windows event log clearing |
 | **Extensibility** | Runtime plugin loading, reload, and external plugin support via `TORNADOREVC2_PLUGIN_DIR` |
 | **Reporting** | Per-session logging, structured plugin output, HTML transcript export |
