@@ -277,7 +277,53 @@ def format_generic_report(data: Dict[str, Any], title: str = 'Results') -> str:
         return f'{title}: no data collected.'
     return '\n\n'.join(sections)
 
-
+def format_make_token_report(data: Dict) -> str:
+    """Format the make_token result in a structured, section-based report."""
+    lines = []
+    # Title
+    lines.append("Make Token Result")
+    lines.append("-" * 18)
+    
+    # Summary section – all main fields except error/message
+    summary_fields = {
+        'protocol': 'Protocol',
+        'ip': 'IP',
+        'port': 'Port',
+        'username': 'Username',
+        'platform': 'Platform',
+        'status': 'Status',
+        'tool': 'Tool',
+        'auth_method': 'Auth Method',
+        'callback_host': 'Callback Host',
+        'callback_port': 'Callback Port',
+    }
+    # Collect summary lines
+    summary_lines = []
+    for key, label in summary_fields.items():
+        val = data.get(key)
+        if val not in (None, ''):
+            summary_lines.append(f"  {label:<14}{val}")
+    
+    if summary_lines:
+        lines.append("Summary:")
+        lines.extend(summary_lines)
+    
+    # Details section – for error or message if present
+    details = []
+    if data.get('error'):
+        details.append(f"  Error:   {data['error']}")
+    if data.get('message'):
+        details.append(f"  Message: {data['message']}")
+    if details:
+        lines.append("Details:")
+        lines.extend(details)
+    
+    # If no data at all
+    if not summary_lines and not details:
+        lines.append("No data collected.")
+    
+    return "\n".join(lines)
+    
 def format_clipboard_report(data: Dict[str, Any]) -> str:
     if not data.get('ok'):
         reason = data.get('reason') or data.get('error') or 'unknown error'
