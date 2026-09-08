@@ -129,8 +129,13 @@ def run_console(config: DaemonConfig) -> int:
                 try:
                     result = client.call('console.command', {'line': line}, timeout=None)
                 except Exception as exc:
-                    print(f'{YELLOW}IPC error: {exc}{END}')
-                    continue
+                    error_msg = str(exc).lower()
+                    if any(phrase in error_msg for phrase in ('connection', 'pipe', 'closed', 'eof', 'broken')):
+                        print(f'\n{YELLOW}Connection to daemon lost. Please reconnect.{END}')
+                        break   # exit the console loop
+                    else:
+                        print(f'{YELLOW}IPC error: {exc}{END}')
+                        continue
                 sys.stdout.write(result.get('output') or '')
                 if result.get('exit_console'):
                     break

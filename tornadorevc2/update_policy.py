@@ -8,7 +8,6 @@ OFFICIAL_REPO_OWNER = 'kamalx06'
 OFFICIAL_REPO_NAME = 'TornadoRevC2'
 OFFICIAL_REPO_URL = 'https://github.com/kamalx06/TornadoRevC2/'
 OFFICIAL_BRANCH = 'main'
-DEVELOPMENT_BRANCH = 'development'
 
 # Accepted SSH remote for the official repository (explicit allow-list).
 OFFICIAL_SSH_REMOTE = f'git@github.com:{OFFICIAL_REPO_OWNER}/{OFFICIAL_REPO_NAME}.git'
