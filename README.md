@@ -61,7 +61,7 @@ Use this software only on systems you own or on systems where you have **explici
 
 ## Introduction
 
-TornadoRevC2 is a modular reverse shell management framework that accepts inbound connections over both plain TCP and TLS, providing a unified operator console for session management, host reconnaissance, chunked file transfer, in-memory payload execution, SOCKS5 pivoting, plugin-driven post-exploitation, structured reporting, and a built-in `update` command for automatic Git-based updates and seamless handler restarts. Originally developed as a lightweight reverse shell handler, the project has evolved into an extensible framework in which capabilities such as firewall enumeration, credential store metadata collection, network mapping, browser profiling, and additional post-exploitation functionality are implemented as independent, modular plugins. The framework also includes the make_token plugin, which allows operators to establish new C2 sessions and enables lateral movement by connecting from the operator's machine to remote targets over SSH, WinRM, SMB, RDP, WMI, or MSSQL. It supports multiple authentication methods depending on the protocol, including passwords, SSH keys, and NTLM hashes, along with NetExec integration and custom port support. Once authenticated, the plugin can either execute a background reverse-shell payload over TLS back to the TornadoRevC2 handler or run a user-defined custom command. Background execution ensures that the operator's current session remains interactive and available for other tasks.
+TornadoRevC2 is a modular reverse shell management framework that accepts inbound connections over both plain TCP and TLS, providing a unified operator console for session management, host reconnaissance, chunked file transfer, in-memory payload execution, SOCKS5 pivoting, plugin-driven post-exploitation, structured reporting, and a built-in `update` command for automatic Git-based updates and seamless handler restarts. Originally developed as a lightweight reverse shell handler, the project has evolved into an extensible framework in which capabilities such as firewall enumeration, credential store metadata collection, network mapping, browser profiling, and additional post-exploitation functionality are implemented as independent, modular plugins. The framework also includes the `make_token` plugin for establishing new C2 sessions via remote protocols (SSH, WinRM, SMB, RDP, WMI, MSSQL) using command-line tools from the operator side, with support for custom ports, NTLM hash authentication, and netexec integration.
 
 **Supported platforms:** Linux and Windows (primary), with compatibility for generic Unix and BSD environments where applicable.
 
@@ -74,7 +74,7 @@ TornadoRevC2 is a modular reverse shell management framework that accepts inboun
 | **Session handling** | Multi-client TCP/TLS listeners, interactive PTY/TTY sessions, session fingerprinting, reconnect tracking |
 | **Transfer & execution** | Chunked file transfer with resume and SHA-256 verification; in-memory payload execution (`py`, `ps`, `exe`, `elf`, `bat`, `sh`) |
 | **Network operations** | SOCKS5 pivoting through compromised sessions with automatic remote cleanup |
-| **Enumeration** | 45 built-in plugins covering host triage, network posture, credentials metadata, browsers, VPN/proxy config, and more |
+| **Enumeration** | 47 built-in plugins covering host triage, network posture, credentials metadata, browsers, VPN/proxy config, and more |
 | **Operational plugins** | Secure file wiping, shell history clearing, Windows event log clearing |
 | **Extensibility** | Runtime plugin loading, reload, and external plugin support via `TORNADOREVC2_PLUGIN_DIR` |
 | **Reporting** | Per-session logging, structured plugin output, HTML transcript export |
@@ -284,7 +284,7 @@ Supported types: `py`, `ps`, `exe`, `elf`, `bat`, `sh`
 
 ## Built-in Plugins
 
-TornadoRevC2 ships with **45 built-in plugins** organized by function. All enumeration plugins are read-only unless noted otherwise.
+TornadoRevC2 ships with **47 built-in plugins** organized by function. All enumeration plugins are read-only unless noted otherwise.
 
 ### Host assessment & environment
 
@@ -297,6 +297,7 @@ TornadoRevC2 ships with **45 built-in plugins** organized by function. All enume
 | `filesearch` | Cross-platform | Search files by path, name, ext, size, owner, mtime (`run filesearch help` for options) |
 | `packages` | Cross-platform | Installed software, package managers, repository configuration, and recent installs |
 | `sysinfo` | Cross-platform | Host metadata collection (handler command, not a plugin) |
+| `kerberosenum` | Cross-platform | Kerberos ticket metadata: caches, default principal, realm, TGT, service tickets, encryption types, flags (renewable/forwardable), keytab files, krb5.conf/registry config, and environment variables (no secrets) |
 
 ### Network & connectivity
 
@@ -356,11 +357,12 @@ TornadoRevC2 ships with **45 built-in plugins** organized by function. All enume
 | Plugin | Platform | Description |
 |--------|----------|-------------|
 | `inmemory` | Cross-platform | In-memory payload execution (`py`, `ps`, `exe`, `elf`, `bat`, `sh`) |
-| `make_token` | Cross-platform | Establish C2 sessions over SSH, WinRM, SMB, RDP, WMI, or MSSQL via passwords, SSH keys, or NTLM hashes (netexec-friendly), and deploy backgrounded reverse shells or custom commands |
+| `make_token` | Cross-platform | Establish C2 sessions via remote protocols (SSH, WinRM, SMB, RDP, WMI, MSSQL) using CLI tools from operator side with support for custom ports, NTLM hashes, and netexec integration |
 | `nullcrypt` | Cross-platform | Hybrid encrypt a file (AES-GCM + RSA-wrapped key) then securely wipe the original via wiper |
 | `wiper` | Cross-platform | Configurable multi-pass secure overwrite (rename, truncate, delete); profiles: quick, standard, dod, thorough, shred |
 | `historydel` | Cross-platform | Clear current user shell history files and related storage |
 | `eventlogdel` | Windows | Clear Windows Event Logs via native `wevtutil` / `Clear-EventLog` |
+| `runas` | Windows | Execute commands or spawn a TLS‑encrypted reverse shell as another user (local/remote) with credential management, domain support, and netexec integration |
 
 **In-memory execution methods:**
 

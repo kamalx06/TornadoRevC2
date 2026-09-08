@@ -833,6 +833,35 @@ def format_wiper_report(data: Dict[str, Any]) -> str:
         lines.append(f"Error:         {data['error']}")
     return '\n'.join(lines)
 
+def format_runas_report(result: Dict[str, Any]) -> str:
+    sections = []
+
+    summary = {
+        'Host': result.get('host', 'N/A'),
+        'Username': result.get('username', 'N/A'),
+        'Command': result.get('command_display', 'N/A'),
+        'Success': 'Yes' if result.get('success') else 'No',
+        'Output length': len(result.get('output', '')) if result.get('output') else 0,
+        'Credential saved': 'Yes' if result.get('credential_saved') else 'No',
+        'Execution method': result.get('execution_method', 'N/A'),
+    }
+
+    try:
+        from .common import format_section  # if available
+        sections.append(format_section('Summary', summary))
+    except ImportError:
+        lines = ["Summary:"]
+        for key, value in summary.items():
+            lines.append(f"  {key}: {value}")
+        sections.append("\n".join(lines))
+
+    output = result.get('output', '')
+    if output:
+        sections.append(f"Command Output:\n{output}")
+    else:
+        sections.append("Command Output: (none)")
+
+    return '\n\n'.join(sections)
 
 def format_nullcrypt_report(data: Dict[str, Any], wiped: Optional[bool] = None) -> str:
     lines = ['Nullcrypt Result', '-' * 16]
