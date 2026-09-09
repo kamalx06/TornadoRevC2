@@ -14,6 +14,7 @@ import zipfile
 import socketserver
 import threading
 import urllib.parse
+import json
 from http.server import SimpleHTTPRequestHandler
 
 from ..api import plugin, SessionContext
@@ -21,17 +22,54 @@ from ...constants import PLUGIN_MARK_END, PLUGIN_MARK_START
 
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 BIN_DIR = os.path.join(os.path.dirname(os.path.dirname(PLUGIN_DIR)), 'ligolo_binaries')
+VERSION_FILE = os.path.join(BIN_DIR, 'ligolo_version.txt')
 
 LIGOLO_LINUX = 'ligolong-linux'
 LIGOLO_WIN = 'ligolong-windows.exe'
 
-LINUX_URL = 'https://github.com/nicocha30/ligolo-ng/releases/download/v0.9.1/ligolo-ng_agent_0.9.1_linux_amd64.tar.gz'
-WINDOWS_URL = 'https://github.com/nicocha30/ligolo-ng/releases/download/v0.9.1/ligolo-ng_agent_0.9.1_windows_amd64.zip'
+GITHUB_API_LATEST = "https://api.github.com/repos/nicocha30/ligolo-ng/releases/latest"
+FALLBACK_VERSION = "0.9.1"
+
+_CACHED_VERSION = None
+
+def _get_latest_version(session):
+    """Query GitHub API for the latest release version."""
+    global _CACHED_VERSION
+    if _CACHED_VERSION:
+        return _CACHED_VERSION
+
+    try:
+        req = urllib.request.Request(GITHUB_API_LATEST, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+            tag = data['tag_name']
+            if tag.startswith('v'):
+                version = tag[1:]
+            else:
+                version = tag
+            session.print(f"Latest Ligolo-NG version: {version}", 'green')
+            _CACHED_VERSION = version
+            return version
+    except Exception as e:
+        session.print(f"Could not fetch latest version: {e}. Falling back to {FALLBACK_VERSION}", 'yellow')
+        _CACHED_VERSION = FALLBACK_VERSION
+        return _CACHED_VERSION
+
+def _read_stored_version():
+    """Read the version of currently cached binaries."""
+    if os.path.isfile(VERSION_FILE):
+        with open(VERSION_FILE, 'r') as f:
+            return f.read().strip()
+    return None
+
+def _write_stored_version(version):
+    """Store the version of the binaries we have."""
+    with open(VERSION_FILE, 'w') as f:
+        f.write(version)
 
 def _ensure_bin_dir():
     if not os.path.exists(BIN_DIR):
         os.makedirs(BIN_DIR, exist_ok=True)
-
 
 def _download_file(url, dest_path):
     try:
@@ -47,12 +85,13 @@ def _download_file(url, dest_path):
     except Exception:
         return False
 
-
-def _download_and_extract_linux(session):
+def _download_and_extract_linux(session, version):
     _ensure_bin_dir()
-    archive = os.path.join(BIN_DIR, 'ligolo-ng_agent_0.9.1_linux_amd64.tar.gz')
+    filename = f'ligolo-ng_agent_{version}_linux_amd64.tar.gz'
+    archive = os.path.join(BIN_DIR, filename)
+    url = f'https://github.com/nicocha30/ligolo-ng/releases/download/v{version}/{filename}'
     session.print("Downloading Linux agent...", 'yellow')
-    if not _download_file(LINUX_URL, archive):
+    if not _download_file(url, archive):
         session.print("Linux download failed.", 'red')
         return False
 
@@ -67,12 +106,12 @@ def _download_and_extract_linux(session):
         os.remove(archive)
         return False
 
-    subdir = os.path.join(extract_dir, 'ligolo-ng_agent_0.9.1_linux_amd64')
-    agent = os.path.join(subdir, 'agent')
-    if not os.path.isfile(agent):
+    subdir_name = f'ligolo-ng_agent_{version}_linux_amd64'
+    agent_path = os.path.join(extract_dir, subdir_name, 'agent')
+    if not os.path.isfile(agent_path):
         for root, _, files in os.walk(extract_dir):
             if 'agent' in files:
-                agent = os.path.join(root, 'agent')
+                agent_path = os.path.join(root, 'agent')
                 break
         else:
             session.print("Could not find 'agent' in extracted archive.", 'red')
@@ -81,19 +120,20 @@ def _download_and_extract_linux(session):
             return False
 
     target = os.path.join(BIN_DIR, LIGOLO_LINUX)
-    shutil.move(agent, target)
+    shutil.move(agent_path, target)
     os.chmod(target, 0o755)
     shutil.rmtree(extract_dir, ignore_errors=True)
     os.remove(archive)
     session.print("Linux agent ready.", 'green')
     return True
 
-
-def _download_and_extract_windows(session):
+def _download_and_extract_windows(session, version):
     _ensure_bin_dir()
-    archive = os.path.join(BIN_DIR, 'ligolo-ng_agent_0.9.1_windows_amd64.zip')
+    filename = f'ligolo-ng_agent_{version}_windows_amd64.zip'
+    archive = os.path.join(BIN_DIR, filename)
+    url = f'https://github.com/nicocha30/ligolo-ng/releases/download/v{version}/{filename}'
     session.print("Downloading Windows agent...", 'yellow')
-    if not _download_file(WINDOWS_URL, archive):
+    if not _download_file(url, archive):
         session.print("Windows download failed.", 'red')
         return False
 
@@ -108,12 +148,12 @@ def _download_and_extract_windows(session):
         os.remove(archive)
         return False
 
-    subdir = os.path.join(extract_dir, 'ligolo-ng_agent_0.9.1_windows_amd64')
-    agent = os.path.join(subdir, 'agent.exe')
-    if not os.path.isfile(agent):
+    subdir_name = f'ligolo-ng_agent_{version}_windows_amd64'
+    agent_path = os.path.join(extract_dir, subdir_name, 'agent.exe')
+    if not os.path.isfile(agent_path):
         for root, _, files in os.walk(extract_dir):
             if 'agent.exe' in files:
-                agent = os.path.join(root, 'agent.exe')
+                agent_path = os.path.join(root, 'agent.exe')
                 break
         else:
             session.print("Could not find 'agent.exe' in extracted archive.", 'red')
@@ -122,7 +162,7 @@ def _download_and_extract_windows(session):
             return False
 
     target = os.path.join(BIN_DIR, LIGOLO_WIN)
-    shutil.move(agent, target)
+    shutil.move(agent_path, target)
     shutil.rmtree(extract_dir, ignore_errors=True)
     os.remove(archive)
     session.print("Windows agent ready.", 'green')
@@ -138,13 +178,15 @@ def ensure_binaries(session):
         session.print("Ligolo-NG binaries are available. Continuing...", 'green')
         return True
 
+    version = _get_latest_version(session)
     if not os.path.isfile(linux_path):
-        if not _download_and_extract_linux(session):
+        if not _download_and_extract_linux(session, version):
             return False
     if not os.path.isfile(win_path):
-        if not _download_and_extract_windows(session):
+        if not _download_and_extract_windows(session, version):
             return False
 
+    _write_stored_version(version)
     session.print("Both Ligolo-NG binaries are ready.", 'green')
     return True
 
