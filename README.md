@@ -74,7 +74,7 @@ TornadoRevC2 is a modular reverse shell management framework that accepts inboun
 | **Session handling** | Multi-client TCP/TLS listeners, interactive PTY/TTY sessions, session fingerprinting, reconnect tracking |
 | **Transfer & execution** | Chunked file transfer with resume and SHA-256 verification; in-memory payload execution (`py`, `ps`, `exe`, `elf`, `bat`, `sh`) |
 | **Network operations** | SOCKS5 pivoting through compromised sessions with automatic remote cleanup |
-| **Enumeration** | 47 built-in plugins covering host triage, network posture, credentials metadata, browsers, VPN/proxy config, and more |
+| **Enumeration** | Covering host triage, network posture, credentials metadata, browsers, VPN/proxy config, and more |
 | **Operational plugins** | Secure file wiping, shell history clearing, Windows event log clearing |
 | **Extensibility** | Runtime plugin loading, reload, and external plugin support via `TORNADOREVC2_PLUGIN_DIR` |
 | **Reporting** | Per-session logging, structured plugin output, HTML transcript export |
@@ -276,7 +276,7 @@ Supported types: `py`, `ps`, `exe`, `elf`, `bat`, `sh`
 
 ## Built-in Plugins
 
-TornadoRevC2 ships with **47 built-in plugins** organized by function. All enumeration plugins are read-only unless noted otherwise.
+TornadoRevC2 ships with **48 built-in plugins** organized by function. All enumeration plugins are read-only unless noted otherwise.
 
 ### Host assessment & environment
 
@@ -355,6 +355,7 @@ TornadoRevC2 ships with **47 built-in plugins** organized by function. All enume
 | `historydel` | Cross-platform | Clear current user shell history files and related storage |
 | `eventlogdel` | Windows | Clear Windows Event Logs via native `wevtutil` / `Clear-EventLog` |
 | `runas` | Windows | Execute commands or spawn a TLS‑encrypted reverse shell as another user (local/remote) with credential management, domain support, and netexec integration |
+| `ligolong` | Cross‑platform | Deploy Ligolo‑NG tunneling agent to Linux/Windows targets with background persistence |
 
 **In-memory execution methods:**
 
