@@ -4,3 +4,6 @@ server.key
 server.pem
 __pycache__/
 tests/
+ligolong-linux
+ligolong-windows.exe
+ligolo_binaries/
