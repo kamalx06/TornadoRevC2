@@ -76,11 +76,12 @@ TornadoRevC2 is a modular reverse shell management framework that accepts inboun
 | **Network operations** | SOCKS5 pivoting through compromised sessions with automatic remote cleanup |
 | **Enumeration** | Covering host triage, network posture, credentials metadata, browsers, VPN/proxy config, and more |
 | **Operational plugins** | Secure file wiping, shell history clearing, Windows event log clearing |
+| **Persistence** | Cross‑platform persistent backdoor installation (cron @reboot on Linux/Unix, Windows Run registry) using TLS‑encrypted reverse‑shell payloads |
 | **Extensibility** | Runtime plugin loading, reload, and external plugin support via `TORNADOREVC2_PLUGIN_DIR` |
 | **Reporting** | Per-session logging, structured plugin output, HTML transcript export |
 | **Self-update** | `update` operator command: Git availability check, repository verification, remote fetch, fast-forward pull, and automatic handler restart |
 
-**Not supported:** Automated persistence, task scheduling, or beacon-style callback infrastructure.
+**Not supported:** Task scheduling, or beacon-style callback infrastructure.
 
 ---
 
@@ -123,18 +124,9 @@ Handler updates are delivered through Git on the operator machine. The `update` 
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### Key Design Principles
-
-- **Persistent daemon**: Core session and listener management runs in a persistent background daemon. The daemon owns session, listener, job, and lifecycle management.
-- **Client terminals**: CLI terminals act as clients that can connect to the same daemon and manage existing sessions. Multiple terminals can connect simultaneously.
-- **Persistence**: Active sessions and long-running operations persist even when a CLI terminal closes. Long-running operations are represented as persistent jobs, allowing users to disconnect and later reconnect to view or stream results.
-- **Local IPC for management**: Daemon management is accessible only through localhost/local IPC (Unix socket or TCP). This separates management communication from reverse-shell listeners.
-- **Network-facing listeners**: Reverse-shell listeners remain network-facing (TCP/TLS), while management communication remains separated through local IPC.
-- **Concurrent operations**: The architecture is designed to support concurrent operations while maintaining per-session control.
-
 ### TCP/TLS Listener Configuration
 
-The daemon supports configurable TCP/TLS listener host and port behavior. The `-H`, `-p`, and `-tp` flags configure the reverse-shell bind address and ports. The management plane uses local IPC (Unix socket by default, or TCP if configured) for operator communication.
+The Tornado supports configurable TCP/TLS listener host and port behavior. The `-H`, `-p`, and `-tp` flags configure the reverse-shell bind address and ports.
 
 ### Plugin Layout
 
@@ -276,7 +268,7 @@ Supported types: `py`, `ps`, `exe`, `elf`, `bat`, `sh`
 
 ## Built-in Plugins
 
-TornadoRevC2 ships with **48 built-in plugins** organized by function. All enumeration plugins are read-only unless noted otherwise.
+TornadoRevC2 ships with **49 built-in plugins** organized by function. All enumeration plugins are read-only unless noted otherwise.
 
 ### Host assessment & environment
 
@@ -356,6 +348,7 @@ TornadoRevC2 ships with **48 built-in plugins** organized by function. All enume
 | `eventlogdel` | Windows | Clear Windows Event Logs via native `wevtutil` / `Clear-EventLog` |
 | `runas` | Windows | Execute commands or spawn a TLS‑encrypted reverse shell as another user (local/remote) with credential management, domain support, and netexec integration |
 | `ligolong` | Cross‑platform | Deploy Ligolo‑NG tunneling agent to Linux/Windows targets with background persistence |
+| `persistence` | Cross‑platform | Install a persistent reverse shell backdoor (cron @reboot / Run registry) using TLS‑encrypted payload |
 
 **In-memory execution methods:**
 
