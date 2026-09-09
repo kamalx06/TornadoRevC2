@@ -1055,7 +1055,7 @@ class TunnelManager:
         if not self._check_python(client_sock, shell_type):
             self._set_error('Python is not installed on the remote host')
             self._log(client_sock, 'Tunnel aborted: Python missing')
-            print(f"{self.h.colors['red']}Python not found on target – tunnel cannot start{self.h.colors['end']}")
+            print(f"{self.h.colors['red']}Python not found on target – tunnel cannot start, use ligolong plugin instead{self.h.colors['end']}")
             return None
         handler_ip = client_sock.getsockname()[0]
         token = self._agent_token(client_sock)
