@@ -22,7 +22,6 @@ def parse_remote_url(url):
     if not url:
         return None
 
-    # SCP-style: git@github.com:owner/repo.git
     scp_match = re.match(
         r'^(?:ssh://)?(?:git@)?([^:/]+):([^/]+)/(.+?)(?:\.git)?/?$',
         url,
@@ -31,7 +30,6 @@ def parse_remote_url(url):
         host, owner, repo = scp_match.groups()
         return host.lower(), owner.lower(), repo.removesuffix('.git').lower()
 
-    # SSH URL: ssh://git@github.com/owner/repo.git
     if url.startswith('ssh://'):
         parsed = urlparse(url)
         path = parsed.path.lstrip('/')
@@ -41,7 +39,6 @@ def parse_remote_url(url):
             return parsed.hostname.lower(), owner.lower(), repo.removesuffix('.git').lower()
         return None
 
-    # HTTPS / git:// / file URLs
     if '://' in url:
         parsed = urlparse(url)
         if not parsed.hostname:
@@ -99,17 +96,14 @@ def get_current_branch(repo_root, run_git):
     return branch
 
 
-def verify_trusted_branch(repo_root, run_git, development=False):
+def verify_trusted_branch(repo_root, run_git):
     """Verify the repository is on the configured trusted branch.
 
     Returns (ok, current_branch).
-    If development=True, checks against DEVELOPMENT_BRANCH instead of OFFICIAL_BRANCH.
     """
     branch = get_current_branch(repo_root, run_git)
     if not branch:
         return False, branch or 'HEAD'
-    if development:
-        return branch == DEVELOPMENT_BRANCH, branch
     return branch == OFFICIAL_BRANCH, branch
 
 
@@ -193,14 +187,9 @@ def format_working_tree_changes(status_lines):
     return formatted
 
 
-def get_trusted_branch_tip(repo_root, run_git, development=False):
-    """Return the commit SHA at origin/<trusted branch>, or None if unavailable.
-
-    If development=True, resolves origin/<DEVELOPMENT_BRANCH> instead of
-    origin/<OFFICIAL_BRANCH>.
-    """
-    branch = DEVELOPMENT_BRANCH if development else OFFICIAL_BRANCH
-    branch_ref = f'origin/{branch}'
+def get_trusted_branch_tip(repo_root, run_git):
+    """Return the commit SHA at origin/<trusted branch>, or None if unavailable."""
+    branch_ref = f'origin/{OFFICIAL_BRANCH}'
     result = run_git('rev-parse', branch_ref, cwd=repo_root)
     if result.returncode != 0:
         return None

@@ -5,10 +5,6 @@ import time
 
 from .constants import XFER_MARK_END, XFER_MARK_START, XFER_STATE_SUFFIX
 
-DEFAULT_CHUNK_SIZE = 4096
-MAX_WRITE_RETRIES = 3
-RETRY_DELAY = 0.5
-
 
 class FileTransfer:
     """Chunked file upload/download with integrity checks and resume support."""
@@ -17,10 +13,9 @@ class FileTransfer:
         self.h = handler
 
     def _state_path(self, local_path, remote_path, direction):
-        norm_local = os.path.normpath(os.path.abspath(local_path))
-        key = f"{direction}|{norm_local}|{remote_path}"
+        key = f"{direction}|{os.path.abspath(local_path)}|{remote_path}"
         digest = hashlib.sha256(key.encode()).hexdigest()[:16]
-        base = os.path.dirname(norm_local) or '.'
+        base = os.path.dirname(os.path.abspath(local_path)) or '.'
         return os.path.join(base, f".tornado_{digest}{XFER_STATE_SUFFIX}")
 
     def _load_state(self, path):
@@ -52,21 +47,16 @@ class FileTransfer:
     def _print_progress(self, transferred, total, start_time, label='Transfer'):
         self.h._print_progress(transferred, total, start_time, label)
 
-    def _log_transfer(self, client_sock, direction, local_path, remote_path,
-                      status, detail=''):
+    def _log_transfer(self, client_sock, direction, local_path, remote_path, status, detail=''):
         logger = self.h._get_session_logger(client_sock)
         if logger:
             logger.log_transfer(direction, local_path, remote_path, status, detail)
-
-    def _quote_remote_path(self, remote_path):
-        return f'"{remote_path}"'
 
     def upload_file(self, client_sock, local_path, remote_path, resume=False):
         info = self.h._client_info(client_sock)
         if not info:
             print(f"{self.h.colors['red']}Client disconnected{self.h.colors['end']}")
             return False
-
         shell_type = info.get('type', 'unknown')
         if not os.path.isfile(local_path):
             print(f"{self.h.colors['red']}Local file not found: {local_path}{self.h.colors['end']}")
@@ -74,60 +64,49 @@ class FileTransfer:
 
         total = os.path.getsize(local_path)
         local_hash = self.h._sha256_file(local_path)
-
         chunk_size = self.h._write_chunk_size(remote_path, shell_type)
-        print(f"[DEBUG] chunk_size from handler = {chunk_size} (type: {type(chunk_size)})")
-        if not chunk_size or chunk_size <= 0:
-            chunk_size = DEFAULT_CHUNK_SIZE
-            print(f"[DEBUG] chunk_size set to default = {chunk_size}")
-        else:
-            print(f"[DEBUG] chunk_size remains {chunk_size}")
-
-        quoted_remote = self._quote_remote_path(remote_path)
-
         state_path = self._state_path(local_path, remote_path, 'upload')
         state = self._load_state(state_path)
         transferred = 0
         first = True
 
         if resume and state:
-            if (state.get('local_path') == os.path.normpath(os.path.abspath(local_path))
+            if (state.get('local_path') == os.path.abspath(local_path)
                     and state.get('remote_path') == remote_path
                     and state.get('direction') == 'upload'
                     and state.get('total') == total
                     and state.get('sha256') == local_hash):
                 transferred = min(state.get('transferred', 0), total)
                 if transferred > 0:
-                    print(f"{self.h.colors['yellow']}Resuming upload from "
-                          f"{self._format_size(transferred)}{self.h.colors['end']}")
+                    print(
+                        f"{self.h.colors['yellow']}Resuming upload from "
+                        f"{self._format_size(transferred)}{self.h.colors['end']}"
+                    )
                     first = False
             else:
                 print(f"{self.h.colors['yellow']}Stale resume state ignored{self.h.colors['end']}")
                 self._clear_state(state_path)
         elif resume:
-            remote_size = self.h._remote_file_size(client_sock, quoted_remote, shell_type)
+            remote_size = self.h._remote_file_size(client_sock, remote_path, shell_type)
             if remote_size and 0 < remote_size < total:
                 transferred = remote_size
-                print(f"{self.h.colors['yellow']}Resuming upload from remote offset "
-                      f"{self._format_size(transferred)}{self.h.colors['end']}")
+                print(
+                    f"{self.h.colors['yellow']}Resuming upload from remote offset "
+                    f"{self._format_size(transferred)}{self.h.colors['end']}"
+                )
                 first = False
 
-        print(f"{self.h.colors['yellow']}Uploading {local_path} -> {remote_path} "
-            f"({self._format_size(total)}, chunk={self._format_size(chunk_size)}){self.h.colors['end']}")
-
-        if shell_type == 'windows':
-            print(f"{self.h.colors['yellow']}Note: Windows uploads via reverse shell can be slow or fail due to "
-                f"shell limitations. If issues occur, try running the handler as Administrator, "
-                f"or use an alternative method (SMB, WinRM, or upload the file with other methods instead).{self.h.colors['end']}")
-
+        print(
+            f"{self.h.colors['yellow']}Uploading {local_path} -> {remote_path} "
+            f"({self._format_size(total)}, chunk={self._format_size(chunk_size)}){self.h.colors['end']}"
+        )
         print(f"{self.h.colors['blue']}Local SHA256: {local_hash}{self.h.colors['end']}")
         self.h._flush_shell(client_sock)
 
         if transferred == 0:
-            if not self.h._remote_truncate(client_sock, quoted_remote, shell_type):
+            if not self.h._remote_truncate(client_sock, remote_path, shell_type):
                 print(f"\n{self.h.colors['red']}Failed to prepare remote file{self.h.colors['end']}")
-                self._log_transfer(client_sock, 'upload', local_path, remote_path,
-                                   'failed', 'truncate')
+                self._log_transfer(client_sock, 'upload', local_path, remote_path, 'failed', 'truncate')
                 return False
             self.h.recv_output(client_sock, timeout=2.0)
         else:
@@ -141,26 +120,12 @@ class FileTransfer:
                     data = f.read(chunk_size)
                     if not data:
                         break
-
-                    success = False
-                    for attempt in range(MAX_WRITE_RETRIES):
-                        if self.h._remote_write_chunk(
-                            client_sock, quoted_remote, data, shell_type,
-                            truncate=first, skip_flush=not first
-                        ):
-                            new_size = self.h._remote_file_size(client_sock, quoted_remote, shell_type)
-                            if new_size is not None and new_size == transferred + len(data):
-                                success = True
-                                break
-                            else:
-                                print(f"{self.h.colors['yellow']}Write verification failed "
-                                      f"(expected {transferred+len(data)}, got {new_size}) – retrying{self.h.colors['end']}")
-                        time.sleep(RETRY_DELAY * (attempt + 1))
-
-                    if not success:
+                    if not self.h._remote_write_chunk(
+                        client_sock, remote_path, data, shell_type, truncate=first, skip_flush=not first
+                    ):
                         self._save_state(state_path, {
                             'direction': 'upload',
-                            'local_path': os.path.normpath(os.path.abspath(local_path)),
+                            'local_path': os.path.abspath(local_path),
                             'remote_path': remote_path,
                             'transferred': transferred,
                             'total': total,
@@ -168,18 +133,21 @@ class FileTransfer:
                             'shell_type': shell_type,
                             'chunk_size': chunk_size,
                         })
-                        print(f"\n{self.h.colors['red']}Upload failed at "
-                              f"{self._format_size(transferred)} — resume with: "
-                              f"upload --resume <local> <remote>{self.h.colors['end']}")
-                        self._log_transfer(client_sock, 'upload', local_path, remote_path,
-                                           'interrupted', f"offset={transferred}")
+                        print(
+                            f"\n{self.h.colors['red']}Upload failed at "
+                            f"{self._format_size(transferred)} — resume with: "
+                            f"upload --resume <local> <remote>{self.h.colors['end']}"
+                        )
+                        self._log_transfer(
+                            client_sock, 'upload', local_path, remote_path,
+                            'interrupted', f"offset={transferred}"
+                        )
                         return False
-
                     first = False
                     transferred += len(data)
                     self._save_state(state_path, {
                         'direction': 'upload',
-                        'local_path': os.path.normpath(os.path.abspath(local_path)),
+                        'local_path': os.path.abspath(local_path),
                         'remote_path': remote_path,
                         'transferred': transferred,
                         'total': total,
@@ -190,60 +158,52 @@ class FileTransfer:
                     self._print_progress(transferred, total, start, 'Upload')
         except OSError as e:
             print(f"\n{self.h.colors['red']}Upload error: {e}{self.h.colors['end']}")
-            self._log_transfer(client_sock, 'upload', local_path, remote_path,
-                               'error', str(e))
+            self._log_transfer(client_sock, 'upload', local_path, remote_path, 'error', str(e))
             return False
 
         self.h._flush_shell(client_sock, timeout=1.0)
-        print(f"\n{self.h.colors['yellow']}Verifying remote integrity...{self.h.colors['end']}",
-              end='', flush=True)
-        remote_hash = self.h._remote_sha256(client_sock, quoted_remote, shell_type)
+        print(f"\n{self.h.colors['yellow']}Verifying remote integrity...{self.h.colors['end']}", end='', flush=True)
+        remote_hash = self.h._remote_sha256(client_sock, remote_path, shell_type)
         if remote_hash == local_hash:
             print(f"\r{self.h.colors['green']}Integrity verified — SHA256 match{self.h.colors['end']}          ")
             print(f"{self.h.colors['green']}Upload complete: {remote_path}{self.h.colors['end']}")
             self._clear_state(state_path)
             self._log_transfer(client_sock, 'upload', local_path, remote_path, 'complete')
             return True
-        else:
-            print(f"\r{self.h.colors['red']}Integrity mismatch!{self.h.colors['end']}                          ")
-            print(f"  Local:  {local_hash}")
-            print(f"  Remote: {remote_hash or 'unavailable'}")
-            self._log_transfer(client_sock, 'upload', local_path, remote_path,
-                               'hash_mismatch')
-            return False
+        print(f"\r{self.h.colors['red']}Integrity mismatch!{self.h.colors['end']}                          ")
+        print(f"  Local:  {local_hash}")
+        print(f"  Remote: {remote_hash or 'unavailable'}")
+        self._log_transfer(client_sock, 'upload', local_path, remote_path, 'hash_mismatch')
+        return False
 
     def download_file(self, client_sock, remote_path, local_path, resume=False):
         info = self.h._client_info(client_sock)
         if not info:
             print(f"{self.h.colors['red']}Client disconnected{self.h.colors['end']}")
             return False
-
         shell_type = info.get('type', 'unknown')
-        quoted_remote = self._quote_remote_path(remote_path)
-        remote_size = self.h._remote_file_size(client_sock, quoted_remote, shell_type)
+        remote_size = self.h._remote_file_size(client_sock, remote_path, shell_type)
         if remote_size is None:
             print(f"{self.h.colors['red']}Remote file not found or unreadable: {remote_path}{self.h.colors['end']}")
             return False
 
         chunk_size = self.h._write_chunk_size(remote_path, shell_type)
-        if not chunk_size or chunk_size <= 0:
-            chunk_size = DEFAULT_CHUNK_SIZE
-            print(f"{self.h.colors['yellow']}WARNING: chunk_size was {chunk_size!r}, using {DEFAULT_CHUNK_SIZE}{self.h.colors['end']}")
-
         state_path = self._state_path(local_path, remote_path, 'download')
         state = self._load_state(state_path)
         transferred = 0
         mode = 'wb'
 
         if resume and state:
-            if (state.get('local_path') == os.path.normpath(os.path.abspath(local_path))
+            if (state.get('local_path') == os.path.abspath(local_path)
                     and state.get('remote_path') == remote_path
                     and state.get('direction') == 'download'
                     and state.get('total') == remote_size):
                 transferred = min(state.get('transferred', 0), remote_size)
                 if transferred > 0:
-                    print(f"{self.h.colors['yellow']}Resuming download from "
-                          f"{self._format_size(transferred)}{self.h.colors['end']}")
+                    print(
+                        f"{self.h.colors['yellow']}Resuming download from "
+                        f"{self._format_size(transferred)}{self.h.colors['end']}"
+                    )
                     mode = 'r+b'
             else:
                 print(f"{self.h.colors['yellow']}Stale resume state ignored{self.h.colors['end']}")
@@ -253,15 +213,17 @@ class FileTransfer:
             if 0 < local_partial < remote_size:
                 transferred = local_partial
                 mode = 'r+b'
-                print(f"{self.h.colors['yellow']}Resuming download from local offset "
-                      f"{self._format_size(transferred)}{self.h.colors['end']}")
+                print(
+                    f"{self.h.colors['yellow']}Resuming download from local offset "
+                    f"{self._format_size(transferred)}{self.h.colors['end']}"
+                )
 
-        print(f"{self.h.colors['yellow']}Downloading {remote_path} -> {local_path} "
-              f"({self._format_size(remote_size)}, chunk={self._format_size(chunk_size)}){self.h.colors['end']}")
-
-        print(f"{self.h.colors['yellow']}Computing remote SHA256...{self.h.colors['end']}",
-              end='', flush=True)
-        remote_hash = self.h._remote_sha256(client_sock, quoted_remote, shell_type)
+        print(
+            f"{self.h.colors['yellow']}Downloading {remote_path} -> {local_path} "
+            f"({self._format_size(remote_size)}, chunk={self._format_size(chunk_size)}){self.h.colors['end']}"
+        )
+        print(f"{self.h.colors['yellow']}Computing remote SHA256...{self.h.colors['end']}", end='', flush=True)
+        remote_hash = self.h._remote_sha256(client_sock, remote_path, shell_type)
         if remote_hash:
             print(f"\r{self.h.colors['blue']}Remote SHA256: {remote_hash}{self.h.colors['end']}          ")
         else:
@@ -280,7 +242,7 @@ class FileTransfer:
             os.makedirs(local_dir, exist_ok=True)
 
         start = time.time()
-        chunk_index = transferred // chunk_size if chunk_size > 0 else 0
+        chunk_index = transferred // chunk_size if chunk_size else 0
         try:
             with open(local_path, mode) as f:
                 if transferred > 0:
@@ -288,13 +250,12 @@ class FileTransfer:
                 while transferred < remote_size:
                     read_size = min(chunk_size, remote_size - transferred)
                     data = self.h._remote_read_chunk(
-                        client_sock, quoted_remote, transferred, read_size,
-                        shell_type, chunk_index
+                        client_sock, remote_path, transferred, read_size, shell_type, chunk_index
                     )
                     if data is None:
                         self._save_state(state_path, {
                             'direction': 'download',
-                            'local_path': os.path.normpath(os.path.abspath(local_path)),
+                            'local_path': os.path.abspath(local_path),
                             'remote_path': remote_path,
                             'transferred': transferred,
                             'total': remote_size,
@@ -302,18 +263,22 @@ class FileTransfer:
                             'shell_type': shell_type,
                             'chunk_size': chunk_size,
                         })
-                        print(f"\n{self.h.colors['red']}Download failed at "
-                              f"{self._format_size(transferred)} — resume with: "
-                              f"download --resume <remote> <local>{self.h.colors['end']}")
-                        self._log_transfer(client_sock, 'download', local_path, remote_path,
-                                           'interrupted', f"offset={transferred}")
+                        print(
+                            f"\n{self.h.colors['red']}Download failed at "
+                            f"{self._format_size(transferred)} — resume with: "
+                            f"download --resume <remote> <local>{self.h.colors['end']}"
+                        )
+                        self._log_transfer(
+                            client_sock, 'download', local_path, remote_path,
+                            'interrupted', f"offset={transferred}"
+                        )
                         return False
                     f.write(data)
                     transferred += len(data)
                     chunk_index += 1
                     self._save_state(state_path, {
                         'direction': 'download',
-                        'local_path': os.path.normpath(os.path.abspath(local_path)),
+                        'local_path': os.path.abspath(local_path),
                         'remote_path': remote_path,
                         'transferred': transferred,
                         'total': remote_size,
@@ -324,12 +289,10 @@ class FileTransfer:
                     self._print_progress(transferred, remote_size, start, 'Download')
         except OSError as e:
             print(f"\n{self.h.colors['red']}Download error: {e}{self.h.colors['end']}")
-            self._log_transfer(client_sock, 'download', local_path, remote_path,
-                               'error', str(e))
+            self._log_transfer(client_sock, 'download', local_path, remote_path, 'error', str(e))
             return False
 
-        print(f"\n{self.h.colors['yellow']}Verifying local integrity...{self.h.colors['end']}",
-              end='', flush=True)
+        print(f"\n{self.h.colors['yellow']}Verifying local integrity...{self.h.colors['end']}", end='', flush=True)
         local_hash = self.h._sha256_file(local_path)
         if local_hash == remote_hash:
             print(f"\r{self.h.colors['green']}Integrity verified — SHA256 match{self.h.colors['end']}          ")
@@ -337,13 +300,11 @@ class FileTransfer:
             self._clear_state(state_path)
             self._log_transfer(client_sock, 'download', local_path, remote_path, 'complete')
             return True
-        else:
-            print(f"\r{self.h.colors['red']}Integrity mismatch!{self.h.colors['end']}                          ")
-            print(f"  Remote: {remote_hash}")
-            print(f"  Local:  {local_hash}")
-            self._log_transfer(client_sock, 'download', local_path, remote_path,
-                               'hash_mismatch')
-            return False
+        print(f"\r{self.h.colors['red']}Integrity mismatch!{self.h.colors['end']}                          ")
+        print(f"  Remote: {remote_hash}")
+        print(f"  Local:  {local_hash}")
+        self._log_transfer(client_sock, 'download', local_path, remote_path, 'hash_mismatch')
+        return False
 
     def verify_file(self, client_sock, remote_path):
         info = self.h._client_info(client_sock)
@@ -351,12 +312,11 @@ class FileTransfer:
             print(f"{self.h.colors['red']}Client disconnected{self.h.colors['end']}")
             return
         shell_type = info.get('type', 'unknown')
-        quoted_remote = self._quote_remote_path(remote_path)
-        remote_size = self.h._remote_file_size(client_sock, quoted_remote, shell_type)
+        remote_size = self.h._remote_file_size(client_sock, remote_path, shell_type)
         if remote_size is None:
             print(f"{self.h.colors['red']}Remote file not found: {remote_path}{self.h.colors['end']}")
             return
-        remote_hash = self.h._remote_sha256(client_sock, quoted_remote, shell_type)
+        remote_hash = self.h._remote_sha256(client_sock, remote_path, shell_type)
         print(f"{self.h.colors['green']}Remote file:{self.h.colors['end']} {remote_path}")
         print(f"  Size:   {self._format_size(remote_size)} ({remote_size} bytes)")
         print(f"  SHA256: {remote_hash or 'unavailable'}")

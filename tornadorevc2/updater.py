@@ -4,7 +4,7 @@ import os
 import shutil
 import subprocess
 import sys
-from .daemon.lifecycle import spawn_detached, wait_until_ready, read_pid, pid_is_alive
+
 from .update_audit import UpdateAuditLogger
 from .update_lock import UpdateLock, UpdateLockError
 from .update_policy import (
@@ -48,6 +48,7 @@ NOT_GIT_REPO_MSG = (
     f'from {OFFICIAL_REPO_URL}'
 )
 UP_TO_DATE_MSG = 'TornadoRevC2 is already running the latest version.'
+UPDATE_SUCCESS_MSG = 'Update installed successfully. Restarting TornadoRevC2...'
 
 WRONG_REMOTE_MSG = (
     'The configured Git remote is not the official TornadoRevC2 repository.\n'
@@ -182,19 +183,15 @@ def _format_dirty_tree_message(status_lines):
     return '\n'.join(lines)
 
 
-def _restart_process(handler):
-    """Restart the daemon via the CLI restart command, then exit."""
-    # Launch the restart command in the background
-    subprocess.Popen(
-        [sys.executable, '-m', 'tornadorevc2', 'restart'],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        stdin=subprocess.DEVNULL,
-        close_fds=True,
-        start_new_session=True   # detach on Unix
-    )
-    # Tell the current daemon to exit after the response is sent
-    handler.running = False
+def _restart_process():
+    argv = [sys.executable, *sys.argv]
+    sys.stdout.flush()
+    sys.stderr.flush()
+    if os.name == 'nt':
+        subprocess.Popen(argv, close_fds=False)
+        os._exit(0)
+    os.execv(sys.executable, argv)
+
 
 class Updater:
     """Operator-facing secure self-update from the official Git repository."""
@@ -206,12 +203,9 @@ class Updater:
         self._run_git = _run_git
 
     def handle_command(self, cmd_parts):
-        if not cmd_parts:
+        if not cmd_parts or cmd_parts[0].lower() != 'update':
             return False
-        if cmd_parts[0].lower() != 'update':
-            return False
-        force = len(cmd_parts) > 1 and cmd_parts[1].lower() in ('--yes', '-y')
-        self.run_update(force=force)
+        self.run_update()
         return True
 
     def _print_error(self, message):
@@ -244,7 +238,7 @@ class Updater:
             target_revision=state.get('target_revision'),
         )
 
-    def run_update(self, force=False):
+    def run_update(self):
         if self._busy:
             self._print_warning('Update already in progress.')
             return
@@ -254,6 +248,7 @@ class Updater:
         repo_root = None
         previous_revision = None
         target_revision = None
+        operator_confirmed = 'no'
 
         try:
             with UpdateLock():
@@ -369,8 +364,22 @@ class Updater:
                     f"SOCKS proxies, tunnels, and other runtime state.{colors['end']}"
                 )
 
-                self._print_info('Proceeding with update automatically.')
-                
+                try:
+                    answer = input(
+                        f"{colors['cyan']}Proceed with update? [y/N]: {colors['end']}"
+                    ).strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    self._print_warning('Update cancelled.')
+                    self.audit.log('UPDATE_ABORTED', reason='operator_cancelled', operator_confirmed='no')
+                    return
+
+                if answer not in ('y', 'yes'):
+                    self._print_warning('Update cancelled.')
+                    self.audit.log('UPDATE_ABORTED', reason='operator_declined', operator_confirmed='no')
+                    return
+                operator_confirmed = 'yes'
+
                 begin_update(
                     previous_revision=previous_revision,
                     target_revision=target_revision,
@@ -391,6 +400,7 @@ class Updater:
                     self.audit.log(
                         'UPDATE_ABORTED',
                         reason='apply_failure',
+                        operator_confirmed=operator_confirmed,
                     )
                     return
 
@@ -442,18 +452,19 @@ class Updater:
                     return
 
                 set_state(STATE_COMPLETED, validation_result='success')
+                self._print_success(UPDATE_SUCCESS_MSG)
                 self.audit.log(
                     'UPDATE_COMPLETED',
                     previous_revision=previous_revision,
                     new_revision=target_revision,
                     final_result='success',
+                    operator_confirmed=operator_confirmed,
                 )
                 clear_state()
-                self._print_success("Update completed successfully. The console will now disconnect.")
-                self._print_info("Reconnect with: python3 tornadorevc2.py console")
                 sys.stdout.flush()
                 try:
-                    _restart_process(self.h)
+                    self.h.shutdown_for_restart()
+                    _restart_process()
                 except Exception as exc:
                     self._print_error(f'Failed to restart TornadoRevC2: {exc}')
                     self.audit.log('UPDATE_ABORTED', reason='restart_failure', detail=str(exc))

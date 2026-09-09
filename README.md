@@ -108,22 +108,14 @@ Handler updates are delivered through Git on the operator machine. The `update` 
 
 ## Architecture
 
-The TornadoRevC2 daemon/client architecture separates the management plane from the operator console:
-
 ```text
 ┌─────────────────────────────────────────────────────────────────┐
-│                    Management Daemon (background process)       │
-│  Sessions · Listeners · Jobs · Lifecycle · Plugins · Events       │
-│  Local IPC (Unix socket / TCP)                                  │
-└─────────────────────────────────────────────────────────────────┘
-                              │ local IPC
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Operator Console (client)                    │
-│  Sessions · Transfers · SOCKS · Plugins · Logging · Export      │
-└─────────────────────────────────────────────────────────────────┘
-                              │ reverse shell (TCP/TLS)
-                              ▼
+│                     Operator Console (handler)                  │
+│  Sessions · Transfers · SOCKS · Plugins · Logging · Export ·    │
+│  update                                                         │
+└────────────────────────────┬────────────────────────────────────┘
+                             │ reverse shell channel (TCP/TLS)
+                             ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                        Target Host                              │
 │  Native commands · PowerShell · inline collectors               │
