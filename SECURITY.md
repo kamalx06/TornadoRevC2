@@ -21,17 +21,15 @@ Specifically, I consider the following categories as security-critical code flaw
   - Logging cleartext passwords, NTLM hashes, or API keys to `logs/` via `session.log_command()`.
   - Exposing those same credentials as plaintext arguments to external subprocesses (e.g., SSH, netexec), making them visible to any local user on the operator machine via `ps aux`.
 
-- **Local Infrastructure Hijacking:** The local IPC channel (Unix socket / TCP management interface) lacking authentication or strict filesystem permissions. If another user or unprivileged process on your shared operator machine can connect to the daemon, they could hijack active sessions, run commands, or exfiltrate data without your knowledge.
-
 - **Supply-Chain / Self-Update Poisoning:** The `update` command strictly pulls from the official GitHub origin (`kamalx06/TornadoRevC2`) to prevent malicious remote redirection. However, it does **not** currently verify GPG signatures on commits or tags. If my GitHub account is compromised, an attacker could push malicious code directly to the official repository, and your handler would fetch and execute it without warning. I recommend operators manually review `git log` before running `update` on critical engagements.
 
 - **Insecure Command Construction (Operator‑Accidental Injection):** Failure to properly sanitize user‑supplied arguments (e.g., `filesearch` path strings, `upload`/`download` remote filenames) before passing them to `session.run_shell()`. This could allow an operator to accidentally (or a malicious external plugin to intentionally) inject destructive shell commands on the target. This is primarily an OPSEC risk rather than a target‑side attack.
 
-- **Malicious External Plugins (Operator‑Side RCE):** Loading an external plugin via `plugins load` executes arbitrary Python code **inside the handler process** on your machine—not on the target. A malicious or untrusted plugin can read your SSH keys, exfiltrate `server.key`, delete your home directory, or hijack all active sessions. **Never load external plugins from untrusted sources.** I do not sandbox plugin execution.
-
 - **Path Traversal via Target Metadata:** Session directories are created using the target's reported hostname (e.g., `logs/001_user@hostname_...`). A compromised target with a malicious hostname (e.g., `../../tmp/evil`) could force the handler to write logs outside the intended directory, potentially overwriting sensitive files on your operator machine.
 
-- **Rogue Client Connections (Resource Exhaustion):** The TCP/TLS listener accepts any incoming connection without an initial handshake or pre‑shared secret. While unauthenticated clients cannot hijack authenticated sessions, they can consume handler resources (file descriptors, memory), fill logs with garbage, or attempt to trigger parser edge cases.
+- **Plugin Loading Vulnerabilities:** Flaws in the plugin-loading mechanism that allow an attacker to load, execute, or substitute a plugin without the operator's intended action. This includes unauthorized plugin execution, loading plugins from unintended locations, or bypassing plugin validation.
+
+- **Rogue Client Connections (Resource Exhaustion):** The TCP/TLS listener accepts incoming connections without an initial handshake or pre-shared secret. While unauthenticated clients cannot hijack authenticated sessions, malicious clients may consume handler resources such as file descriptors or memory, inject unwanted data into logs, or trigger parser edge cases. Reports should demonstrate a meaningful security or availability impact.
 
 **If you find something like this, you can report through:**
 
@@ -45,16 +43,24 @@ Specifically, I consider the following categories as security-critical code flaw
 6. If I decline the report:
    - I will clearly explain why (e.g., it requires local access that an attacker already has, it's a feature, or it's out of scope).
 
+## External Plugin Trust
+
+External plugins execute as Python code within the operator process and have the same privileges as the handler.
+
+Operators should only load plugins from trusted sources.
+
+A malicious plugin intentionally loaded by an operator is **not considered a framework vulnerability**. However, vulnerabilities in the plugin-loading mechanism that allow unauthorized or unintended code execution are considered security issues as described above.
+
 ## Reporting Other Bugs (Modules & Execution)
 
-Because my modules rely on **native commands that already exist on the target**, they won't be blocked by AV/EDR—but they *can* fail due to OS differences, missing tools, or syntax quirks.
+Because my modules rely on **native commands that already exist on the target**, they may behave differently depending on the target OS, available tools, or command syntax.
 
 For general bugs, such as:
 - A module failing to run on a specific OS/version.
 - Output not parsing correctly (e.g., encoding issues).
 - Connection instability or session drops.
 - Help text or UI glitches.
-- Or any other bug
+- Or any other non-security bug.
 
 **Please just open a regular GitHub Issue** (without the `security` label). Include:
 - The target OS and CPU architecture.
@@ -64,6 +70,22 @@ For general bugs, such as:
 
 ## Operator OPSEC Warning
 
-This framework logs all commands, plugin outputs, and session metadata to the `logs/` directory. These logs may contain sensitive internal IPs, usernames, file paths, and (if misused) cleartext credentials. **Do not share or publicly paste these logs**—they expose your entire engagement. When reporting a non-security bug, sanitize any identifiable information from the log excerpts you include.
+The framework stores commands, plugin output, session metadata, and other data received from targets in the `logs/` directory.
+
+Because targets may be compromised, logged data must be considered potentially attacker-controlled as well as sensitive.
+
+Logs may contain:
+
+- Internal IP addresses.
+- Usernames.
+- Hostnames.
+- File paths.
+- Credentials or authentication material.
+- Terminal control characters.
+- Maliciously crafted output.
+
+Do not execute, render, or otherwise process untrusted log data in security-sensitive environments without appropriate precautions.
+
+Never publicly share unredacted engagement logs. When reporting a non-security bug, sanitize sensitive and identifying information before including log excerpts.
 
 I appreciate every report—they make the framework more reliable for everyone using it ethically!
