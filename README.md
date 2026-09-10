@@ -63,7 +63,7 @@ Use this software only on systems you own or on systems where you have **explici
 
 TornadoRevC2 is a modular reverse shell management framework that accepts inbound connections over both plain TCP and TLS, providing a unified operator console for session management, host reconnaissance, chunked file transfer, in-memory payload execution, SOCKS5 pivoting, plugin-driven post-exploitation, structured reporting, and a built-in `update` command for automatic Git-based updates and seamless handler restarts. Originally developed as a lightweight reverse shell handler, the project has evolved into an extensible framework in which capabilities such as firewall enumeration, credential store metadata collection, network mapping, browser profiling, and additional post-exploitation functionality are implemented as independent, modular plugins. The framework also includes the `make_token` plugin for establishing new C2 sessions via remote protocols (SSH, WinRM, SMB, RDP, WMI, MSSQL) using command-line tools from the operator side, with support for custom ports, NTLM hash authentication, and netexec integration.
 
-**Supported platforms:** Linux and Windows (primary), with compatibility for generic Unix and BSD environments where applicable.
+**Supported target platforms:** Linux and Windows (primary), with compatibility for generic Unix and BSD environments where applicable.
 
 ---
 
@@ -268,7 +268,7 @@ Supported types: `py`, `ps`, `exe`, `elf`, `bat`, `sh`
 
 ## Built-in Plugins
 
-TornadoRevC2 ships with **50 built-in plugins** organized by function. All enumeration plugins are read-only unless noted otherwise.
+TornadoRevC2 ships with **50 built-in plugins** organized by function. All enumeration related plugins are read-only unless noted otherwise.
 
 ### Host assessment & environment
 
