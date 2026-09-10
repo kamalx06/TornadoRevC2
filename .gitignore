@@ -5,3 +5,4 @@ server.pem
 __pycache__/
 tests/
 ligolo_binaries/
+chisel_binaries/

