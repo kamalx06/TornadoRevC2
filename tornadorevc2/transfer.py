@@ -57,22 +57,10 @@ class FileTransfer:
             logger.log_transfer(direction, local_path, remote_path, status, detail)
             
     def _start_agent_http_server(self, content, port=None, path='/agent.py'):
-        """
-        Start a simple HTTP server serving 'content' on a random port.
-        Returns (port, server_thread, stop_event, server).
-        path: the URL path to serve the content on (e.g., '/file').
-        """
         if port is None:
-            for _ in range(20):
-                port = random.randint(8000, 9000)
-                try:
-                    server = socketserver.TCPServer(('0.0.0.0', port),
-                                                    self._make_agent_handler(content, path))
-                    break
-                except OSError:
-                    continue
-            else:
-                raise RuntimeError("Could not find a free port for HTTP server")
+            server = socketserver.TCPServer(('0.0.0.0', 0),
+                                            self._make_agent_handler(content, path))
+            port = server.server_address[1]
         else:
             server = socketserver.TCPServer(('0.0.0.0', port),
                                             self._make_agent_handler(content, path))
