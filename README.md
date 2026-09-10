@@ -268,7 +268,7 @@ Supported types: `py`, `ps`, `exe`, `elf`, `bat`, `sh`
 
 ## Built-in Plugins
 
-TornadoRevC2 ships with **49 built-in plugins** organized by function. All enumeration plugins are read-only unless noted otherwise.
+TornadoRevC2 ships with **50 built-in plugins** organized by function. All enumeration plugins are read-only unless noted otherwise.
 
 ### Host assessment & environment
 
@@ -348,6 +348,7 @@ TornadoRevC2 ships with **49 built-in plugins** organized by function. All enume
 | `eventlogdel` | Windows | Clear Windows Event Logs via native `wevtutil` / `Clear-EventLog` |
 | `runas` | Windows | Execute commands or spawn a TLS‑encrypted reverse shell as another user (local/remote) with credential management, domain support, and netexec integration |
 | `ligolong` | Cross‑platform | Deploy Ligolo‑NG tunneling agent to Linux/Windows targets with background persistence |
+| `chisel` | Cross‑platform | Deploy Chisel tunneling agent in reverse (client) or bind (server) mode; supports SOCKS5 and background persistence |
 | `persistence` | Cross‑platform | Install a persistent reverse shell backdoor (cron @reboot / Run registry) using TLS‑encrypted payload |
 
 **In-memory execution methods:**
