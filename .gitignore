@@ -8,3 +8,4 @@ ligolo_binaries/
 chisel_binaries/
 mtls_certs/
 tls_certs/
+winrm-certs/

