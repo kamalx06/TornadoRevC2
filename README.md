@@ -61,7 +61,7 @@ Use this software only on systems you own or on systems where you have **explici
 
 ## Introduction
 
-TornadoRevC2 is a modular reverse shell management framework that accepts inbound connections over plain TCP, server-authenticated TLS, and mutual TLS (mTLS) with client-certificate verification, providing a unified operator console for session management, host reconnaissance, chunked file transfer, in-memory payload execution, SOCKS5 pivoting, plugin-driven post-exploitation, structured reporting, and a built-in `update` command for automatic Git-based updates and seamless handler restarts. Originally developed as a lightweight reverse shell handler, the project has evolved into an extensible framework in which capabilities such as firewall enumeration, credential store metadata collection, network mapping, browser profiling, and additional post-exploitation functionality are implemented as independent, modular plugins. The framework also includes the `make_token` plugin for establishing new C2 sessions via remote protocols (SSH, WinRM, SMB, RDP, WMI, MSSQL) using command-line tools from the operator side, with support for custom ports, NTLM hash authentication, and netexec integration, and an `upgrade_mtls` plugin that migrates a live session onto the mutual-TLS listener by pushing the handler's client certificate bundle to the target.
+TornadoRevC2 is a modular reverse shell management framework that accepts inbound connections over plain TCP, server-authenticated TLS, and mutual TLS (mTLS) with client-certificate verification, providing a unified operator console for session management, host reconnaissance, chunked file transfer, in-memory payload execution, SOCKS5 pivoting, plugin-driven post-exploitation, structured reporting, and a built-in `update` command for automatic Git-based updates and seamless handler restarts. Originally developed as a lightweight reverse shell handler, the project has evolved into an extensible framework in which capabilities such as firewall enumeration, credential store metadata collection, network mapping, browser profiling, and additional post-exploitation functionality are implemented as independent, modular plugins. The framework also includes the `make_token` plugin for establishing new C2 sessions via remote protocols (SSH, WinRM, SMB, WMI, MSSQL) using command-line tools from the operator side, with support for custom ports, NTLM hash authentication, and netexec integration, and an `upgrade_mtls` plugin that migrates a live session onto the mutual-TLS listener by pushing the handler's client certificate bundle to the target.
 
 **Supported target platforms:** Linux and Windows (primary), with compatibility for generic Unix and BSD environments where applicable.
 
@@ -75,7 +75,7 @@ TornadoRevC2 is a modular reverse shell management framework that accepts inboun
 | **File transfer** | Chunked upload and download · SHA-256 integrity verification |
 | **Payload execution** | In-memory execution for `py`, `ps`, `exe`, `elf`, `bat`, and `sh` |
 | **Pivoting & tunneling** | SOCKS5 proxy through compromised sessions with automatic remote cleanup · Ligolo-NG and Chisel agent deployment with background persistence |
-| **Remote session establishment** | `make_token` — establish new sessions over SSH, WinRM, SMB, RDP, WMI, and MSSQL from the operator side, with NTLM hash auth and netexec integration |
+| **Remote session establishment** | `make_token` — establish new sessions over SSH, WinRM, SMB, WMI, and MSSQL from the operator side, with NTLM hash auth and netexec integration |
 | **Impersonation** | `runas` — execute commands or spawn a TLS-encrypted shell as another user, local or remote, with domain support and netexec integration |
 | **Enumeration** | Covering host triage, network posture, credentials and browser metadata, Kerberos tickets, Linux internals, and Windows domain and system configuration |
 | **Operational plugins** | Multi-pass secure file wiping · Hybrid file encryption · Shell history clearing · Windows event log clearing |
@@ -371,7 +371,7 @@ TornadoRevC2 ships with **51 built-in plugins** organized by function. All enume
 | Plugin | Platform | Description |
 |--------|----------|-------------|
 | `inmemory` | Cross-platform | In-memory payload execution (`py`, `ps`, `exe`, `elf`, `bat`, `sh`) |
-| `make_token` | Cross-platform | Establish C2 sessions via SSH, WinRM, SMB, RDP, WMI, or MSSQL from the operator side. Supports passwords, NTLM hashes, SSH keys, WinRM client certificates, custom ports, and netexec |
+| `make_token` | Cross-platform | Establish C2 style reverse shell sessions via SSH, WinRM, SMB, WMI, or MSSQL from the operator side. Supports passwords, NTLM hashes, SSH keys, WinRM client certificates, custom ports, and netexec |
 | `nullcrypt` | Cross-platform | Hybrid encrypt a file (AES-GCM + RSA-wrapped key) then securely wipe the original via wiper |
 | `wiper` | Cross-platform | Configurable multi-pass secure overwrite (rename, truncate, delete); profiles: quick, standard, dod, thorough, shred |
 | `historydel` | Cross-platform | Clear current user shell history files and related storage |
