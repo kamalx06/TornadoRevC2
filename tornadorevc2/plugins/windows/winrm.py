@@ -100,111 +100,134 @@ General:
   - To 'disable' a listener, remove it. The WSMan provider does not expose a
     portable enable/disable for listeners.
 
-Auth methods:
+Authentication methods
+======================
 
-  WinRM has two independent auth configurations:
-    - Service: which methods this host ACCEPTS from incoming clients.
-    - Client:  which methods this host USES when connecting to other hosts.
+  WinRM has two independent auth configurations that never have to match:
 
-  Service-side methods (inbound):
-    Basic       Username+password sent in cleartext. Safe only over HTTPS.
-                Off by default. Enable when the operator is not domain-joined
-                and cannot use Negotiate/Kerberos.
-    Negotiate   NTLM or Kerberos, selected automatically. Default in domain
-                environments; leave on unless troubleshooting.
-    Kerberos    Kerberos only. Requires SPN and a usable ticket.
-    Digest      HTTP Digest (challenge-response). Rarely used; weak.
-    CredSSP     Delegates the operator's credentials to this host. Powerful
-                for double-hop scenarios, but exposes credentials to the
-                target. Enable only when needed.
-    Certificate Client cert auth. Pairs with a thumbprint->user mapping in
-                the registry for passwordless logins. Service side only.
+    Service side (WSMan:\\localhost\\Service\\Auth\\*)
+      What this host ACCEPTS from clients connecting in.
 
-  Client-side methods (outbound):
-    Same names, but they control what THIS host will use when connecting
-    elsewhere. No Certificate option (there's nothing to map on the client).
+    Client side (WSMan:\\localhost\\Client\\Auth\\*)
+      What this host USES when connecting out to other hosts.
+
+  Both sides expose the same five methods:
+
+    Basic       Username + password in cleartext. Safe only over HTTPS.
+                Off by default.
+    Negotiate   NTLM or Kerberos, auto-selected. The domain default.
+    Kerberos    Kerberos only. Requires a valid SPN and a usable ticket.
+    Digest      HTTP Digest challenge-response. Rarely used; weak.
+    CredSSP     Delegates credentials across a hop. Powerful for double-hop
+                scenarios, but the operator's credentials are exposed to the
+                target. Enable only when genuinely needed.
+
+  The service side additionally has one method that the client side does not:
+
+    Certificate Inbound client-certificate authentication. This is a toggle
+                on Service\\Auth only. The client side has no equivalent,
+                because a client presents its certificate during the TLS
+                handshake, not as a WinRM-level auth choice — there is
+                nothing to enable on the outbound side.
+
+  See 'exploitcert' below for how the Certificate toggle pairs with a
+  thumbprint->user registry mapping to give passwordless access.
 
   Cautions:
     - Basic without HTTPS exposes credentials in transit.
     - CredSSP exposes the operator's credentials to the target.
-    - Revert to the defaults when done; both weaken the host.
+    - Both weaken the host. Revert to defaults when done.
 
-Certificates — two roles, two certs:
+Certificates — two independent roles
+====================================
 
-  WinRM uses certificates in two independent roles, and they should be
-  different certificates:
+  WinRM uses certificates in two unrelated roles, and they should always be
+  two different certificates:
 
-    Server cert (serverAuth EKU)
+    Server certificate (serverAuth EKU)
       Bound to the target's HTTPS listener via 'cert bind'. The private key
       is uploaded to the target and stored in LocalMachine\\My. Its only job
-      is to serve TLS on port 5986.
+      is to serve TLS on port 5986. Nothing about it authenticates anyone.
 
-    Client cert (clientAuth EKU)
+    Client certificate (clientAuth EKU)
       Used with 'exploitcert' for passwordless auth. The public half is
       installed in LocalMachine\\TrustedPeople on the target and mapped to a
-      user in the registry. The private key NEVER leaves the operator
+      user in the registry. The private key never leaves the operator
       machine.
 
-  Do NOT use the same certificate for both. If you do, 'cert bind' uploads
-  the private key to the target, and that same key is what authenticates you
-  as the mapped user. Anyone with admin on the target can export the key and
-  authenticate back as that user. This plugin refuses this by default —
-  'exploitcert' will reject a PFX that carries both serverAuth and clientAuth
-  EKUs unless you pass --allow-dual-use.
+  Why they must be separate:
+    'cert bind' uploads the private key to the target. If that same cert is
+    also your client-auth credential, then anyone with admin on the target
+    can export the key and authenticate back as the mapped user. The plugin
+    refuses this combination by default; 'exploitcert' will reject a PFX
+    carrying both serverAuth and clientAuth EKUs unless you pass
+    --allow-dual-use.
 
-  Generate two separate certs:
+  Generate two certs:
       run winrm cert create-selfsigned target.corp.local              # server
       run winrm cert create-selfsigned operator-client --client       # client
 
-cert bind:
+cert bind
+=========
+
   - Only creates an HTTPS listener on port 5986 using the chosen certificate.
     It does NOT grant access, bypass authentication, create users, or change
     credential requirements. It is a transport-layer change, not an access
     primitive.
-  - Use it when 5985 is blocked but 5986 is reachable, or when a tool requires
-    HTTPS.
-  - If the target already has a working HTTPS listener with a trusted cert,
-    binding your own gains nothing and may break existing clients.
+  - Use it when 5985 is blocked but 5986 is reachable, or when a tool
+    requires an HTTPS endpoint.
   - If a ServerAuth cert already exists in LocalMachine\\My (from a CA or
     auto-enrollment), prefer binding that one over generating a new cert:
     clients already trust it, no client-side import needed.
   - Self-signed certs are a fallback for workgroup hosts, labs, or when you
     want to avoid using the host's real identity. Clients will NOT trust them
     unless the .crt is imported into their Trusted Root store.
-  - For client cert auth, see 'exploitcert'.
+  - For the client-side auth use of certificates, see 'exploitcert'.
 
-exploitcert:
-  - Deploys the PUBLIC half of a clientAuth certificate to the target,
-    enables Certificate auth on the WinRM service, and creates a registry
-    mapping from the certificate's thumbprint to a local user account. After
-    this, a client holding the corresponding PRIVATE key can authenticate to
-    the target over WinRM without a password.
-  - What is uploaded:
-        Public cert → LocalMachine\\TrustedPeople (so WinRM trusts it).
-  - What stays on the operator side:
-        The private key. Never leaves your machine.
-  - Registry path used for the mapping:
-        HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\WSMAN\\ClientAuth\\Certificate\\<thumbprint>
-      with values Issuer, Subject, UserName.
-  - Options:
-        --password <pw>      PFX password (defaults to 'winrmbind').
-        --no-enable-auth     Skip enabling WSMan Certificate auth. Use this
-                             if you've already enabled it and don't want
-                             the action touching the auth config.
-        --allow-dual-use     Permit a PFX whose cert carries both serverAuth
-                             and clientAuth EKUs. Only for labs. See the
-                             warning above.
-  - Reverting:
-        Delete the registry key under ClientAuth\\Certificate\\<thumbprint>,
-        remove the public cert from LocalMachine\\TrustedPeople, and
-        optionally disable Certificate auth with
-        'run winrm auth disable certificate'.
+exploitcert
+===========
 
-Generated cert files:
+  Deploys the public half of a clientAuth certificate to the target, enables
+  Certificate auth on the WinRM service, and creates a registry mapping from
+  the certificate's thumbprint to a local user account. After this, a client
+  holding the corresponding private key can authenticate to the target over
+  WinRM without a password.
+
+  What it changes on the target:
+    1. Public cert  → LocalMachine\\TrustedPeople (so WinRM trusts it).
+    2. Auth toggle  → WSMan:\\localhost\\Service\\Auth\\Certificate = true.
+    3. Registry key → HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\
+                      WSMAN\\ClientAuth\\Certificate\\<thumbprint>
+                      with values Issuer, Subject, UserName.
+
+  What stays on the operator side:
+    The private key. It never leaves your machine.
+
+  Options:
+    --password <pw>      PFX password (defaults to 'winrmbind').
+    --no-enable-auth     Skip enabling WSMan Certificate auth. Use this
+                         if you've already enabled it and don't want the
+                         action touching the auth config.
+    --allow-dual-use     Permit a PFX whose cert carries both serverAuth
+                         and clientAuth EKUs. Labs only. See the warning
+                         under "Certificates — two independent roles".
+
+  Reverting:
+    Delete the registry key under ClientAuth\\Certificate\\<thumbprint>,
+    remove the public cert from LocalMachine\\TrustedPeople, and optionally
+    disable Certificate auth with:
+        run winrm auth disable certificate
+
+Generated cert files
+====================
+
   - Written to winrm-certs/.
-  - Each run produces winrm-<dns>-<timestamp>.key, .crt, .pfx.
-  - The PFX uses a fixed password ('winrmbind') during upload only; the file
-    is deleted from the target immediately after import.
+  - Each run produces three files:
+        winrm-<name>-<timestamp>.key   (private key — keep this)
+        winrm-<name>-<timestamp>.crt   (public cert)
+        winrm-<name>-<timestamp>.pfx   (both, password-protected)
+  - The PFX password is fixed ('winrmbind') and used only during upload; the
+    PFX file is deleted from the target immediately after import.
 """.strip()
 
 PLUGIN_INFO = WINRM_USAGE
