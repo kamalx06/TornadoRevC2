@@ -1,4 +1,11 @@
-"""Self-update from the official TornadoRevC2 Git repository."""
+"""Self-update from the official TornadoRevC2 Git repository.
+
+The updater always fetches directly from the official repository URL,
+regardless of how the local installation's Git remotes are configured.
+Community forks therefore keep receiving updates from the official
+project without needing to add an ``upstream`` remote or rename
+``origin``.
+"""
 
 import os
 import shutil
@@ -12,9 +19,6 @@ from .update_policy import (
     OFFICIAL_REPO_URL,
     check_working_tree,
     format_working_tree_changes,
-    get_origin_url,
-    get_trusted_branch_tip,
-    verify_origin_remote,
     verify_trusted_branch,
 )
 from .update_state import (
@@ -33,7 +37,8 @@ from .update_state import (
 )
 from .update_validate import validate_installation
 
-OFFICIAL_REPO_URL = OFFICIAL_REPO_URL  # re-export for backward compatibility
+OFFICIAL_REPO_URL = OFFICIAL_REPO_URL
+OFFICIAL_FETCH_REF = 'refs/tornadorev/upstream'
 
 GIT_TIMEOUT_QUICK = 30
 GIT_TIMEOUT_FETCH = 120
@@ -50,12 +55,6 @@ NOT_GIT_REPO_MSG = (
 UP_TO_DATE_MSG = 'TornadoRevC2 is already running the latest version.'
 UPDATE_SUCCESS_MSG = 'Update installed successfully. Restarting TornadoRevC2...'
 
-WRONG_REMOTE_MSG = (
-    'The configured Git remote is not the official TornadoRevC2 repository.\n'
-    'Expected: {expected}\n'
-    'Actual:   {actual}\n\n'
-    'Update aborted for security reasons.'
-)
 WRONG_BRANCH_MSG = (
     'Updates are only permitted from the trusted branch {branch}.\n'
     'Current branch: {current}\n\n'
@@ -76,6 +75,19 @@ INTERRUPTED_UPDATE_MSG = (
     'Previous revision: {previous}\n'
     'Target revision: {target}\n\n'
     'Resolve the repository state manually or retry the update after inspection.'
+)
+DIVERGED_FORK_HEADER = (
+    'This installation has local commits that are not in the official branch.\n'
+    'A fast-forward update cannot be applied on top of them.'
+)
+DIVERGED_FORK_PROMPT = (
+    "To update anyway, the local branch must be reset to the official revision.\n"
+    "This will PERMANENTLY DISCARD local commits that are not in the official\n"
+    "branch. Uncommitted changes were already checked and are not present.\n\n"
+    "If you want to keep your local commits, cancel now and rebase them manually:\n"
+    f"  git rebase {OFFICIAL_FETCH_REF}\n\n"
+    "Type 'reset' (without quotes) to discard local commits and continue, or\n"
+    "anything else to cancel: "
 )
 
 
@@ -146,6 +158,37 @@ def _short_revision(revision):
     return revision[:7] if revision else 'unknown'
 
 
+def _fetch_official_branch(repo_root):
+    refspec = f'+refs/heads/{OFFICIAL_BRANCH}:{OFFICIAL_FETCH_REF}'
+    return _run_git(
+        'fetch', '--quiet', '--no-tags', OFFICIAL_REPO_URL, refspec,
+        cwd=repo_root,
+        timeout=GIT_TIMEOUT_FETCH,
+    )
+
+
+def _get_official_tip(repo_root):
+    result = _run_git('rev-parse', '--verify', OFFICIAL_FETCH_REF, cwd=repo_root)
+    if result.returncode != 0:
+        return None
+    revision = result.stdout.strip()
+    return revision or None
+
+
+def _is_fast_forwardable(repo_root, target_revision):
+    result = _run_git(
+        'merge-base', '--is-ancestor', 'HEAD', target_revision,
+        cwd=repo_root,
+    )
+    if result.returncode == 0:
+        return 'yes', None
+    if result.returncode == 1:
+        return 'no', None
+    return 'unknown', _git_error(
+        result, 'Unable to determine relationship with the official branch'
+    )
+
+
 def _collect_update_preview(repo_root, current_revision, target_revision):
     count_result = _run_git(
         'rev-list', '--count', f'{current_revision}..{target_revision}',
@@ -194,8 +237,6 @@ def _restart_process():
 
 
 class Updater:
-    """Operator-facing secure self-update from the official Git repository."""
-
     def __init__(self, handler):
         self.h = handler
         self._busy = False
@@ -265,17 +306,6 @@ class Updater:
                     self.audit.log('UPDATE_ABORTED', reason='not_git_repo')
                     return
 
-                remote_ok, expected, actual = verify_origin_remote(repo_root, self._run_git)
-                if not remote_ok:
-                    self._print_error(WRONG_REMOTE_MSG.format(expected=expected, actual=actual or 'unknown'))
-                    self.audit.log(
-                        'UPDATE_ABORTED',
-                        reason='wrong_remote',
-                        repository=actual,
-                        expected_repository=expected,
-                    )
-                    return
-
                 branch_ok, current_branch = verify_trusted_branch(repo_root, self._run_git)
                 if not branch_ok:
                     self._print_error(
@@ -300,14 +330,14 @@ class Updater:
                 self._print_info(
                     f'Fetching updates from {OFFICIAL_REPO_URL} ({OFFICIAL_BRANCH})...'
                 )
-                fetch = self._run_git(
-                    'fetch', '--quiet', 'origin', OFFICIAL_BRANCH,
-                    cwd=repo_root,
-                    timeout=GIT_TIMEOUT_FETCH,
-                )
+                fetch = _fetch_official_branch(repo_root)
                 if fetch.returncode != 0:
                     self._print_error(_git_error(fetch, 'git fetch failed'))
-                    self.audit.log('UPDATE_ABORTED', reason='fetch_failure')
+                    self.audit.log(
+                        'UPDATE_ABORTED',
+                        reason='fetch_failure',
+                        repository=OFFICIAL_REPO_URL,
+                    )
                     return
 
                 local = self._run_git('rev-parse', 'HEAD', cwd=repo_root)
@@ -317,10 +347,10 @@ class Updater:
                     return
                 previous_revision = local.stdout.strip()
 
-                target_revision = get_trusted_branch_tip(repo_root, self._run_git)
+                target_revision = _get_official_tip(repo_root)
                 if target_revision is None:
                     self._print_error(
-                        f'Unable to determine the trusted branch tip for origin/{OFFICIAL_BRANCH}.'
+                        f'Unable to determine the official branch tip from {OFFICIAL_FETCH_REF}.'
                     )
                     self.audit.log('UPDATE_ABORTED', reason='target_identification_failed')
                     return
@@ -329,7 +359,7 @@ class Updater:
                     'UPDATE_STARTED',
                     current_revision=previous_revision,
                     target_revision=target_revision,
-                    repository=get_origin_url(repo_root, self._run_git),
+                    repository=OFFICIAL_REPO_URL,
                     trusted_branch=OFFICIAL_BRANCH,
                 )
 
@@ -344,14 +374,21 @@ class Updater:
                     clear_state()
                     return
 
+                ff_state, ff_error = _is_fast_forwardable(repo_root, target_revision)
+                if ff_state == 'unknown':
+                    self._print_error(ff_error)
+                    self.audit.log('UPDATE_ABORTED', reason='ancestor_check_failed')
+                    return
+                diverged = (ff_state == 'no')
+
                 commit_count, commits, shortstat = _collect_update_preview(
                     repo_root, previous_revision, target_revision
                 )
 
                 print(f"{colors['yellow']}An update is available for TornadoRevC2.{colors['end']}")
+                print(f"Source:         {OFFICIAL_REPO_URL} ({OFFICIAL_BRANCH})")
                 print(f"Current commit: {_short_revision(previous_revision)}")
                 print(f"Target commit:  {_short_revision(target_revision)}")
-                print(f"Source branch:  {OFFICIAL_BRANCH}")
                 print(f"Commits:        {commit_count}")
                 if shortstat:
                     print(f"Changes:        {shortstat}")
@@ -359,52 +396,88 @@ class Updater:
                     print('Summary:')
                     for entry in commits:
                         print(f"  {entry}")
+
+                if diverged:
+                    print()
+                    self._print_warning(DIVERGED_FORK_HEADER)
+
                 print(
                     f"{colors['yellow']}Updating will restart TornadoRevC2 and terminate all active sessions, "
                     f"SOCKS proxies, tunnels, and other runtime state.{colors['end']}"
                 )
 
-                try:
-                    answer = input(
-                        f"{colors['cyan']}Proceed with update? [y/N]: {colors['end']}"
-                    ).strip().lower()
-                except (EOFError, KeyboardInterrupt):
-                    print()
-                    self._print_warning('Update cancelled.')
-                    self.audit.log('UPDATE_ABORTED', reason='operator_cancelled', operator_confirmed='no')
-                    return
+                apply_method = 'merge'
+                if diverged:
+                    try:
+                        answer = input(
+                            f"{colors['red']}{DIVERGED_FORK_PROMPT}{colors['end']}"
+                        ).strip()
+                    except (EOFError, KeyboardInterrupt):
+                        print()
+                        self._print_warning('Update cancelled.')
+                        self.audit.log('UPDATE_ABORTED', reason='operator_cancelled', operator_confirmed='no')
+                        return
+                    if answer.lower() != 'reset':
+                        self._print_warning('Update cancelled.')
+                        self.audit.log('UPDATE_ABORTED', reason='operator_declined', operator_confirmed='no')
+                        return
+                    apply_method = 'reset'
+                else:
+                    try:
+                        answer = input(
+                            f"{colors['cyan']}Proceed with update? [y/N]: {colors['end']}"
+                        ).strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        print()
+                        self._print_warning('Update cancelled.')
+                        self.audit.log('UPDATE_ABORTED', reason='operator_cancelled', operator_confirmed='no')
+                        return
+                    if answer not in ('y', 'yes'):
+                        self._print_warning('Update cancelled.')
+                        self.audit.log('UPDATE_ABORTED', reason='operator_declined', operator_confirmed='no')
+                        return
 
-                if answer not in ('y', 'yes'):
-                    self._print_warning('Update cancelled.')
-                    self.audit.log('UPDATE_ABORTED', reason='operator_declined', operator_confirmed='no')
-                    return
                 operator_confirmed = 'yes'
 
                 begin_update(
                     previous_revision=previous_revision,
                     target_revision=target_revision,
-                    repository=get_origin_url(repo_root, self._run_git),
+                    repository=OFFICIAL_REPO_URL,
                     branch=OFFICIAL_BRANCH,
                 )
 
                 set_state(STATE_APPLYING)
-                self._print_info('Applying update...')
-                apply_result = self._run_git(
-                    'merge', '--ff-only', target_revision,
-                    cwd=repo_root,
-                    timeout=GIT_TIMEOUT_APPLY,
-                )
+                if apply_method == 'reset':
+                    self._print_info('Resetting to the official revision...')
+                    apply_result = self._run_git(
+                        'reset', '--hard', target_revision,
+                        cwd=repo_root,
+                        timeout=GIT_TIMEOUT_APPLY,
+                    )
+                else:
+                    self._print_info('Applying update...')
+                    apply_result = self._run_git(
+                        'merge', '--ff-only', target_revision,
+                        cwd=repo_root,
+                        timeout=GIT_TIMEOUT_APPLY,
+                    )
+
                 if apply_result.returncode != 0:
                     set_state(STATE_FAILED, failure_reason=_git_error(apply_result, 'apply failed'))
                     self._print_error(_git_error(apply_result, 'Failed to apply update'))
                     self.audit.log(
                         'UPDATE_ABORTED',
                         reason='apply_failure',
+                        apply_method=apply_method,
                         operator_confirmed=operator_confirmed,
                     )
                     return
 
-                self.audit.log('UPDATE_APPLIED', target_revision=target_revision)
+                self.audit.log(
+                    'UPDATE_APPLIED',
+                    target_revision=target_revision,
+                    apply_method=apply_method,
+                )
 
                 set_state(STATE_VALIDATING)
                 ok, detail = validate_installation(repo_root)
@@ -459,6 +532,7 @@ class Updater:
                     new_revision=target_revision,
                     final_result='success',
                     operator_confirmed=operator_confirmed,
+                    apply_method=apply_method,
                 )
                 clear_state()
                 sys.stdout.flush()
