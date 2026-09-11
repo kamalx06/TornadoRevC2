@@ -71,15 +71,18 @@ TornadoRevC2 is a modular reverse shell management framework that accepts inboun
 
 | Category | Capabilities |
 |----------|-------------|
-| **Session handling** | Multi-client TCP / TLS / mTLS listeners, on-demand mTLS upgrade for live sessions, interactive PTY/TTY sessions, session fingerprinting, reconnect tracking |
-| **Transfer & execution** | Chunked file transfer with resume and SHA-256 verification; in-memory payload execution (`py`, `ps`, `exe`, `elf`, `bat`, `sh`) |
-| **Network operations** | SOCKS5 pivoting through compromised sessions with automatic remote cleanup |
-| **Enumeration** | Covering host triage, network posture, credentials metadata, browsers, VPN/proxy config, and more |
-| **Operational plugins** | Secure file wiping, shell history clearing, Windows event log clearing |
-| **Persistence** | Cross‑platform persistent backdoor installation (cron @reboot on Linux/Unix, Windows Run registry) using TLS‑encrypted reverse‑shell payloads |
-| **Extensibility** | Runtime plugin loading, reload, and external plugin support via `TORNADOREVC2_PLUGIN_DIR` |
-| **Reporting** | Per-session logging, structured plugin output, HTML transcript export |
-| **Self-update** | `update` operator command: Git availability check, repository verification, remote fetch, fast-forward pull, and automatic handler restart |
+| **Session handling** | Multi-client TCP / TLS / mTLS listeners with automatic PKI bootstrapping · On-demand mTLS upgrade for live sessions · Interactive PTY/TTY shells · Session fingerprinting and reconnect tracking |
+| **File transfer** | Chunked upload and download · SHA-256 integrity verification |
+| **Payload execution** | In-memory execution for `py`, `ps`, `exe`, `elf`, `bat`, and `sh` |
+| **Pivoting & tunneling** | SOCKS5 proxy through compromised sessions with automatic remote cleanup · Ligolo-NG and Chisel agent deployment with background persistence |
+| **Remote session establishment** | `make_token` — establish new sessions over SSH, WinRM, SMB, RDP, WMI, and MSSQL from the operator side, with NTLM hash auth and netexec integration |
+| **Impersonation** | `runas` — execute commands or spawn a TLS-encrypted shell as another user, local or remote, with domain support and netexec integration |
+| **Enumeration** | Covering host triage, network posture, credentials and browser metadata, Kerberos tickets, Linux internals, and Windows domain and system configuration |
+| **Operational plugins** | Multi-pass secure file wiping · Hybrid file encryption · Shell history clearing · Windows event log clearing |
+| **Persistence** | Cross-platform backdoor installation using TLS-encrypted payloads — cron `@reboot` on Linux/Unix, Run registry on Windows |
+| **Extensibility** | Runtime plugin load, reload, and unload · External plugins via `TORNADOREVC2_PLUGIN_DIR` · Documented `SessionContext` API |
+| **Reporting** | Per-session logging · Structured plugin output · HTML transcript export |
+| **Self-update** | Git-based `update` command with repository verification, fast-forward pull, and automatic handler restart · Fork-friendly, with divergence detection and a safe reset prompt |
 
 **Not supported:** Task scheduling, or beacon-style callback infrastructure.
 
