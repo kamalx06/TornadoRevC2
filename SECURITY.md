@@ -34,7 +34,7 @@ Specifically, I consider the following categories as security-critical code flaw
 **If you find something like this, you can report through:**
 
 1. **Preferred:** Use GitHub's **"Private vulnerability reporting"** feature (go to the repo's "Security" tab → "Report a vulnerability"). This keeps all details confidential until I publish a fix.
-2. **Alternative:** If that's unavailable, open a **GitHub Issue** with the `security` label, or email me directly at `kamalx06github@gmail.com`.
+2. **Alternative:** If that's unavailable, email me directly at `kamalx06github@gmail.com`.
 3. I will acknowledge your report within **48 hours**.
 4. I will investigate and give you a status update within **5 business days**.
 5. If I accept the vulnerability:
