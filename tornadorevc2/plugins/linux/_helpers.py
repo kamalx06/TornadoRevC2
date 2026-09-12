@@ -6,8 +6,8 @@ import hashlib
 from ...constants import PLUGIN_MARK_END, PLUGIN_MARK_START
 from ...sysinfo import _b64_exec_cmd
 
-_INLINE_LIMIT = 4000
-_CHUNK_SIZE = 400
+_INLINE_LIMIT = 20000
+_CHUNK_SIZE = 2000
 
 
 def _wrap_collector(source: str) -> str:
