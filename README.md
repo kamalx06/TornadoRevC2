@@ -357,7 +357,7 @@ TornadoRevC2 ships with **51 built-in plugins** organized by function. All enume
 | `scheduledtasks` | Windows | Scheduled tasks, triggers, execution context, and actions |
 | `registry` | Windows | Autorun keys, startup locations, and installed software |
 | `eventlogs` | Windows | Security, System, Application, and PowerShell log summaries |
-| `defender` | Windows | Microsoft Defender status, exclusions, ASR rules, and third-party AV |
+| `defender` | Windows | Windows Defender status, exclusions, preferences, ASR rules, threats, AV products, services, and Exploit Protection config. `-d/--disable` attempts a full disable (admin required). |
 | `certificates` | Windows | Certificate stores, code-signing, and enterprise certificates |
 | `rdp` | Windows | Remote Desktop configuration, active sessions, recent targets, restricted-admin, start, adduser, and shadow (reverse shell as session user) |
 | `gpo` | Windows | Applied GPOs, local/domain security policies, AppLocker, WDAC, SRP, and GPO scripts |
@@ -375,8 +375,8 @@ TornadoRevC2 ships with **51 built-in plugins** organized by function. All enume
 | `nullcrypt` | Cross-platform | Hybrid encrypt a file (AES-GCM + RSA-wrapped key) then securely wipe the original via wiper |
 | `wiper` | Cross-platform | Configurable multi-pass secure overwrite (rename, truncate, delete); profiles: quick, standard, dod, thorough, shred |
 | `historydel` | Cross-platform | Clear current user shell history files and related storage |
-| `eventlogdel` | Windows | Clear Windows Event Logs via native `wevtutil` / `Clear-EventLog` |
-| `runas` | Windows | Execute commands or spawn a TLS‑encrypted reverse shell as another user (local/remote) with credential management, domain support, and netexec integration |
+| `eventlogdel` | Windows | Clear Windows Event Logs: defaults (Security, System, Application, PowerShell), a custom log list, or every log with records; optional .evtx backup |
+| `runas` | Windows | Execute commands or launch a TLS‑encrypted reverse shell locally as another user, with saved credential management and domain support |
 | `ligolong` | Cross‑platform | Deploy Ligolo‑NG tunneling agent to Linux/Windows targets with background persistence |
 | `chisel` | Cross‑platform | Deploy Chisel tunneling agent in reverse (client) or bind (server) mode; supports SOCKS5 and background persistence |
 | `persistence` | Cross‑platform | Install a persistent reverse shell backdoor (cron @reboot / Run registry) using TLS‑encrypted payload |
