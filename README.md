@@ -29,29 +29,13 @@ Use this software only on systems you own or on systems where you have **explici
 - [Introduction](#introduction)
 - [Key Features](#key-features)
 - [Design Philosophy](#design-philosophy)
+- [Operational Security](#operational-security)
 - [Architecture](#architecture)
 - [Requirements & Installation](#requirements--installation)
 - [Quick Start](#quick-start)
 - [Operator Reference](#operator-reference)
 - [Built-in Plugins](#built-in-plugins)
 - [Plugin Development](#plugin-development)
-  - [Plugin system overview](#plugin-system-overview)
-  - [Plugin placement](#plugin-placement)
-  - [Registration](#registration)
-  - [Execution lifecycle](#execution-lifecycle)
-  - [Pattern 1: Simple shell plugin](#pattern-1-simple-shell-plugin)
-  - [Pattern 2: Structured collector](#pattern-2-structured-collector-recommended)
-  - [Pattern 3: Custom handler](#pattern-3-custom-handler)
-  - [Linux collectors](#linux-collectors)
-  - [Windows collectors](#windows-collectors)
-  - [JSON payload conventions](#json-payload-conventions)
-  - [Custom formatters](#custom-formatters)
-  - [Platform-specific plugins](#platform-specific-plugins)
-  - [External plugins](#external-plugins)
-  - [SessionContext API](#sessioncontext-api)
-  - [Error handling & return codes](#error-handling--return-codes)
-  - [Best practices](#best-practices)
-  - [Reference implementations](#reference-implementations)
 - [Session Logging](#session-logging)
 - [Project Structure](#project-structure)
 - [TLS & mTLS Configuration](#tls--mtls-configuration)
@@ -61,7 +45,7 @@ Use this software only on systems you own or on systems where you have **explici
 
 ## Introduction
 
-TornadoRevC2 is a modular reverse shell management framework that accepts inbound connections over plain TCP, server-authenticated TLS, and mutual TLS (mTLS) with client-certificate verification, providing a unified operator console for session management, host reconnaissance, chunked file transfer, in-memory payload execution, SOCKS5 pivoting, plugin-driven post-exploitation, structured reporting, and a built-in `update` command for automatic Git-based updates and seamless handler restarts. Originally developed as a lightweight reverse shell handler, the project has evolved into an extensible framework in which capabilities such as firewall enumeration, credential store metadata collection, network mapping, browser profiling, and additional post-exploitation functionality are implemented as independent, modular plugins. The framework also includes the `make_token` plugin for establishing new C2 sessions via remote protocols (SSH, WinRM, SMB, WMI, MSSQL, DCOM, and MySQL/MariaDB) using command-line tools from the operator side, with support for custom ports, NTLM hash authentication, SSH keys, WinRM client-certificate authentication, MySQL UDF auto-loading, custom command execution, and netexec integration, and an `upgrade_mtls` plugin that migrates a live session onto the mutual-TLS listener by pushing the handler's client certificate bundle to the target.
+TornadoRevC2 is a modular reverse shell management framework that accepts inbound connections over plain TCP, server-authenticated TLS, and mutual TLS (mTLS) with client-certificate verification, providing a unified operator console for session management, host reconnaissance, chunked file transfer, in-memory payload execution, SOCKS5 pivoting, plugin-driven post-exploitation, structured reporting, and a built-in `update` command for automatic Git-based updates and seamless handler restarts. Originally developed as a lightweight reverse shell handler, the project has evolved into an extensible framework in which capabilities such as firewall enumeration, credential store metadata collection, network mapping, browser profiling, and additional post-exploitation functionality are implemented as independent, modular plugins. The framework also includes the `make_token` plugin for establishing new C2 sessions via remote protocols (SSH, WinRM, SMB, WMI, MSSQL, DCOM, and MySQL/MariaDB) using command-line tools from the operator side, and an `upgrade_mtls` plugin that migrates a live session onto the mutual-TLS listener by pushing the handler's client certificate bundle to the target.
 
 **Supported target platforms:** Linux and Windows (primary), with compatibility for generic Unix and BSD environments where applicable.
 
@@ -72,8 +56,9 @@ TornadoRevC2 is a modular reverse shell management framework that accepts inboun
 | Category | Capabilities |
 |----------|-------------|
 | **Session handling** | Multi-client TCP / TLS / mTLS listeners with automatic PKI bootstrapping · On-demand mTLS upgrade for live sessions · Interactive PTY/TTY shells · Session fingerprinting and reconnect tracking |
+| **Operational security** | Shell history suppression on Linux and Windows · No `pty.spawn` or `Invoke-Expression` in command paths · Session-scoped probe markers · Jitter between automated commands · Host deny-list guardrails that refuse production-looking targets |
 | **File transfer** | Chunked upload and download · SHA-256 integrity verification |
-| **Payload execution** | In-memory execution for `py`, `ps`, `exe`, `elf`, `bat`, and `sh` |
+| **Payload execution** | In-memory execution for `py`, `ps`, `exe`, `elf`, `bat`, and `sh` — with memfd-based ELF execution (modern and legacy fallbacks) and subsystem-aware PE loading |
 | **Pivoting & tunneling** | SOCKS5 proxy through compromised sessions with automatic remote agent cleanup on stop · Soft and hard tunnel reset (`socks reset [--hard]`) · Ligolo-NG and Chisel agent deployment with background persistence |
 | **Remote session establishment** | `make_token` — establish new sessions over SSH, WinRM, SMB, WMI, MSSQL, DCOM, or MySQL/MariaDB from the operator side, with password / NTLM-hash / SSH-key / WinRM-client-certificate authentication, MySQL UDF auto-loading, custom-command execution, and netexec integration |
 | **Impersonation** | `runas` — execute commands or spawn a TLS-encrypted shell as another user, local or remote, with domain support and netexec integration |
@@ -82,7 +67,7 @@ TornadoRevC2 is a modular reverse shell management framework that accepts inboun
 | **Persistence** | Cross-platform backdoor installation using TLS-encrypted payloads — cron `@reboot` on Linux/Unix, Run registry on Windows |
 | **Extensibility** | Runtime plugin load, reload, and unload · External plugins via `TORNADOREVC2_PLUGIN_DIR` · Documented `SessionContext` API |
 | **Reporting** | Per-session logging · Structured plugin output · HTML transcript export |
-| **Self-update** | Git-based `update` command with repository verification, fast-forward pull, and automatic handler restart · Fork-friendly, with divergence detection and a safe reset prompt |
+| **Self-update** | Git-based `update` command with repository verification, fast-forward pull, and automatic handler restart |
 
 **Not supported:** Task scheduling, or beacon-style callback infrastructure.
 
@@ -98,7 +83,7 @@ Plugins leverage **native Windows and Linux utilities and built-in system comman
 
 ### Enumeration without artifact drops
 
-**Enumeration plugins execute through the existing reverse shell channel and do not drop binaries, scripts, or temporary files for reconnaissance.** Native commands, inline Python collectors, and in-process PowerShell scripts return structured JSON over the shell. The only unavoidable artifact is normal command history generated by the shell itself.
+**Enumeration plugins execute through the existing reverse shell channel and do not drop binaries, scripts, or temporary files for reconnaissance.** Native commands, inline Python collectors, and in-process PowerShell scripts return structured JSON over the shell. The only unavoidable artifact is normal command history generated by the shell itself — which TornadoRevC2 suppresses at session start (see [Operational Security](#operational-security)).
 
 Operational plugins intentionally place artifacts on the target and document their own cleanup behavior:
 
@@ -117,13 +102,63 @@ Handler updates are delivered through Git on the operator machine. The `update` 
 
 ---
 
+## Operational Security
+
+TornadoRevC2 applies a set of always-on operational security measures across every session. These are not optional flags — they run unconditionally so that even a hurried operator receives the full benefit.
+
+### Shell history suppression
+
+Every session neutralizes its own command history before doing anything else.
+
+**Linux/Unix** — the PTY upgrade path unsets `HISTFILE`, points it at `/dev/null`, zeroes `HISTSIZE` and `HISTFILESIZE`, sets `HISTCONTROL=ignorespace`, and disables the shell's history via `set +o history`. Every subsequent command is space-prefixed where `ignorespace` is honored. Result: `~/.bash_history` receives nothing from the session.
+
+**Windows** — on session init, the handler runs:
+
+```powershell
+Set-PSReadlineOption -HistorySaveStyle SaveNothing -ErrorAction SilentlyContinue
+```
+
+Result: `%APPDATA%\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt` receives nothing from the session.
+
+### Command construction discipline
+
+The handler and its plugins avoid command patterns that are widely known as red-team signatures.
+
+- **No `python -c 'import pty; pty.spawn(...)'`.** The PTY upgrade path uses `script -qfc` (util-linux) or `script -q /dev/null` (BSD/macOS), both of which are legitimate sysadmin utilities. `pty.spawn` is not.
+- **No `Invoke-Expression` (IEX).** PowerShell scripts are either sent inline (for short single statements) or wrapped in `[ScriptBlock]::Create(...).Invoke()`. When the payload is too large for a single command line, it is staged to a plausibly-named temp file under `%TEMP%`, executed with `-File`, and deleted immediately.
+- **No static probe markers.** The platform and identity probes use per-session randomized markers, so no fixed string appears in command logs or process-creation telemetry.
+
+### Jitter between automated commands
+
+Plugin collectors insert a random 0.5–2.5 s delay at the start of each run and between fallback probes. This breaks the tight command-burst pattern that defenders associate with automated tooling.
+
+### Guardrails
+
+The handler refuses to operate on hosts that match a deny list of production-looking patterns:
+
+- Hostnames containing `prod`, `prd`, or `dc1`-style prefixes
+- Domains containing `.corp.`
+- Known test hostnames (`localhost`, `sandbox`, `test-vm`, `testvm`, `kali`, `ubuntu`, `metasploitable`, `dvwa`)
+
+When a session is blocked, the operator console shows the reason and every subsequent command is refused until the block is cleared manually. This prevents accidental impact on production infrastructure during an engagement.
+
+### Session log hygiene
+
+Session logs are written through an error-safe path (logging failures never abort a session) and ANSI/OSC/DCS terminal control sequences are stripped from target output so logs remain readable in any editor. Operator commands are stored verbatim.
+
+### What this layer does not claim
+
+TornadoRevC2 does **not** claim to evade EDR, AMSI, ScriptBlock logging, or memory forensics. The architecture (reverse-shell channel based post exploitation framework, no compiled implant) has a hard ceiling on what is possible. The measures above reduce forensic footprint and operational risk; they do not make the tool undetectable on a monitored host. Operators should treat every session as potentially observable and follow engagement-specific rules of engagement.
+
+---
+
 ## Architecture
 
 ```text
 ┌─────────────────────────────────────────────────────────────────┐
 │                     Operator Console (handler)                  │
 │  Sessions · Transfers · SOCKS · Plugins · Logging · Export ·    │
-│  update                                                         │
+│  update · Guardrails                                            │
 └────────────────────────────┬────────────────────────────────────┘
                              │ reverse shell channel (TCP / TLS / mTLS)
                              ▼
@@ -232,7 +267,7 @@ python tornadorevc2.py \
 
 ### 2. Establish a session
 
-Deploy a reverse shell from the built-in catalog (`payloads`) or use your own implant. On connect, TornadoRevC2 assigns a session ID and begins logging under `logs/`.
+Deploy a reverse shell from the built-in catalog (`payloads`) or use your own implant. On connect, TornadoRevC2 assigns a session ID, suppresses shell history on the target, and begins logging under `logs/`.
 
 ### 3. Operate
 
@@ -303,7 +338,7 @@ Supported types: `py`, `ps`, `exe`, `elf`, `bat`, `sh`
 | `socks <ID> <listen_port>` | `socks <listen_port>` | Start a SOCKS5 proxy through a session (local listener on `127.0.0.1:<listen_port>`) |
 | `socks <ID> test <host> <port>` | `socks test <host> <port>` | Test TCP reachability to an internal host through the tunnel agent |
 | `socks <ID> reset` | `socks reset` | **Soft reset** — abort local relays, purge remote streams, clear buffers, and rebalance channels. Active SOCKS listeners remain bound. |
-| `socks <ID> reset --hard` | `socks reset --hard` | **Hard reset** — kill and redeploy the remote tunnel agent for a fully fresh state (use when soft reset fails to recover a stuck tunnel) |
+| `socks <ID> reset --hard` | `socks reset --hard` | **Hard reset** — kill and redeploy the remote tunnel agent for a fully fresh state |
 | `socks stop <proxy_id>` | `socks stop <proxy_id>` | Stop a SOCKS proxy. When it was the last proxy on that session, the remote agent process is killed and its `.tornado_agent_*.py` artifact is removed from the target. |
 | `tunnels` | `tunnels` | List active SOCKS proxies, channel count, and status |
 
@@ -414,9 +449,9 @@ TornadoRevC2 ships with **51 built-in plugins** organized by function. All enume
 | Type | Method |
 |------|--------|
 | `py` | Python via `exec(compile(...))` |
-| `ps` | PowerShell via `Invoke-Expression` |
-| `exe` | Windows PE via in-memory RunPE (process hollowing) |
-| `elf` | Linux ELF via `memfd_create` with `/dev/shm` fallback |
+| `ps` | PowerShell via `[ScriptBlock]::Create(...)` (no IEX) |
+| `exe` | Windows PE via in-memory RunPE (process hollowing), subsystem-aware host selection, full `CONTEXT64` context, background pipe draining |
+| `elf` | Linux ELF via `memfd_create` — modern (`os.memfd_create`, Python 3.8+), legacy (direct syscall via ctypes for older Python or unsupported architectures), or `/dev/shm` fallback |
 | `sh` | Shell script streamed via `bash -s` |
 | `bat` | Batch script streamed via `cmd.exe /Q` stdin |
 
@@ -437,7 +472,7 @@ The plugin system has four layers:
 | **Registration** | `plugins/api.py` | `@plugin.command` decorator, global command registry, `SessionContext` |
 | **Discovery** | `plugins/loader.py` | Scans `shared/`, `linux/`, `windows/`, and external directories; imports modules |
 | **Execution** | `plugins/manager.py` | Resolves platform, builds context, invokes handler, handles errors |
-| **Collectors** | `plugins/shared/runner.py` | Marker parsing, JSON extraction, report formatting, logging |
+| **Collectors** | `plugins/shared/runner.py` | Marker parsing, JSON extraction, report formatting, logging, unconditional jitter |
 
 At import time, the `@plugin.command` decorator registers each handler in a thread-safe global registry. At runtime, `PluginManager.run_plugin()` validates platform compatibility, constructs a `SessionContext`, and calls the handler with `(session, args)`.
 
@@ -471,13 +506,13 @@ Register a command with the `@plugin.command` decorator:
 from tornadorevc2.plugins import plugin, SessionContext
 
 @plugin.command(
-    name="myplugin",                          # Command name used with `run myplugin <ID>`
-    platforms=["linux", "windows", "unix"],   # Supported session platforms
+    name="myplugin",
+    platforms=["linux", "windows", "unix"],
     description="Short description for plugins list and TAB completion",
 )
 def run(session: SessionContext, args):
     ...
-    return 0  # 0 = success, non-zero = failure
+    return 0
 ```
 
 **Platform values:** `linux`, `windows`, `unix`. Linux and `unix` are treated as compatible — a plugin registered for `linux` runs on both `linux` and `unix` sessions. Default if omitted: `["linux", "windows", "unix"]`.
@@ -493,16 +528,17 @@ When an operator runs `run myplugin 1 arg1 arg2`:
 2. Platform check: plugin.platforms vs session shell type (unix/windows)
 3. SessionContext(handler, client_socket) is constructed
 4. Handler invoked: run(ctx, ["arg1", "arg2"])
-5. Handler executes remote work via run_shell / run_marked / run_collector_plugin
-6. Output printed to operator console; results logged under logs/<session>/plugins/
-7. Exit code returned (0 = success)
+5. Jitter delay (0.5–2.5 s) before the first target command
+6. Handler executes remote work via run_shell / run_marked / run_collector_plugin
+7. Output printed to operator console; results logged under logs/<session>/plugins/
+8. Exit code returned (0 = success)
 ```
 
 Inside an attached session (`switch <ID>`), the session ID is omitted and args start immediately after the plugin name: `run myplugin arg1 arg2`.
 
 ### Pattern 1: Simple shell plugin
 
-Use this when you need a quick one-off command without structured JSON parsing. The handler runs a native shell command, prints output, and logs the result.
+Use this when you need a quick one-off command without structured JSON parsing.
 
 ```python
 from tornadorevc2.plugins import plugin, SessionContext
@@ -533,35 +569,9 @@ def run(session: SessionContext, args):
     return 0
 ```
 
-**When to use:** Simple probes, one-liner enumeration, commands that do not need structured reports.
-
-**Key methods:** `session.run_shell(cmd, timeout)`, `session.print(text, color)`, `session.log_plugin_result(name, report, detail='')`.
-
 ### Pattern 2: Structured collector (recommended)
 
-Use this for enumeration plugins that gather structured data on the target and return a formatted report. This is the pattern used by all built-in reconnaissance plugins (`firewall`, `ports`, `browser`, etc.).
-
-**Flow:**
-
-```text
-Handler                              Target host
-  │                                       │
-  ├─ session.log_event("started")         │
-  ├─ flush shell buffer                   │
-  ├─ resolve platform (unix/windows)      │
-  ├─ build collector command/script ─────►│  Linux: inline Python or native shell
-  │                                       │  Windows: PowerShell script in-process
-  │                                       ├─ invoke native OS commands
-  │                                       ├─ assemble result dict
-  │                                       └─ emit __T_PLUGIN_START__ + JSON + __T_PLUGIN_END__
-  │◄──────────────────────────────────────┤
-  ├─ parse_collector_json(raw)            │
-  ├─ formatter(data) → report string      │
-  ├─ session.print(report)                │
-  └─ session.log_plugin_result(...)       │
-```
-
-**Minimal cross-platform example:**
+Use this for enumeration plugins that gather structured data on the target and return a formatted report.
 
 ```python
 from tornadorevc2.plugins import plugin, SessionContext
@@ -572,11 +582,10 @@ from tornadorevc2.constants import PLUGIN_MARK_END, PLUGIN_MARK_START
 
 
 def _linux_collector_source():
-    # Runs inside a try/except wrapper on the target.
-    # Call _emit(result) with a JSON-serializable dict — do NOT print markers yourself.
     return r'''
-import subprocess
+import shutil, subprocess
 result = {'summary': {}, 'processes': []}
+# Prefer shutil.which() over spawning `which` — no process creation.
 try:
     out = subprocess.check_output(['ps', 'auxww'], stderr=subprocess.STDOUT, timeout=10)
     lines = out.decode('utf-8', errors='replace').splitlines()
@@ -615,10 +624,10 @@ def run(session: SessionContext, args):
     return run_collector_plugin(
         session,
         "processes",
-        _build_linux_command,       # callable — built at execution time
-        _build_windows_command,     # callable — built at execution time
-        format_generic_report,      # turns parsed dict into operator-facing text
-        timeout=25.0,               # seconds to wait for marked output
+        _build_linux_command,
+        _build_windows_command,
+        format_generic_report,
+        timeout=25.0,
     )
 ```
 
@@ -633,31 +642,9 @@ def run(session: SessionContext, args):
 | `formatter` | `Callable[[dict], str]` | Converts parsed JSON dict to a report string |
 | `timeout` | `float` | Maximum seconds to wait for marked output (default 30) |
 
-Pass `None` for a platform builder to mark the plugin unavailable on that OS (see [Platform-specific plugins](#platform-specific-plugins)).
-
-After saving an external plugin:
-
-```bash
-plugins load processes
-plugins info processes
-run processes 1
-```
-
 ### Pattern 3: Custom handler
 
-Use this when you need argument validation, dynamic collector construction, post-collector processing, or operator-side file handling that `run_collector_plugin` does not cover alone.
-
-**Examples in the codebase:**
-
-| Plugin | Custom behavior |
-|--------|-----------------|
-| `memorymap` | Requires PID argument; builds collector dynamically with embedded PID |
-| `wiper` | Requires remote path; destructive action with confirmation output |
-| `screenshot` | Decodes base64 image and saves PNG locally on the operator machine |
-| `historydel` | Runs collector, then sends follow-up shell command for in-memory history cleanup |
-| `clipboard` | Custom soft-failure handling via `reason` field instead of hard `error` |
-
-**Argument validation example** (from `memorymap`):
+Use this for argument validation, dynamic collector construction, post-collector processing, or operator-side file handling.
 
 ```python
 import re
@@ -678,7 +665,7 @@ def run(session: SessionContext, args):
     session.log_event(f"Plugin memorymap: started for PID {pid}")
     session._handler._flush_shell(session._client_sock, timeout=1.0)
 
-    unix_cmd = _build_linux_command(pid)   # builder accepts runtime args
+    unix_cmd = _build_linux_command(pid)
     win_ps = _build_windows_command(pid)
 
     raw = _run_collector_marked(session, unix_cmd, win_ps, session.platform, 45.0)
@@ -693,36 +680,9 @@ def run(session: SessionContext, args):
     return 0
 ```
 
-**Post-collector processing example** (from `historydel`):
-
-```python
-def run(session: SessionContext, args):
-    # ... run collector via _run_collector_marked ...
-    data = parse_collector_json(raw)
-
-    # Additional in-memory cleanup in the interactive shell
-    if session.is_unix:
-        session.run_shell("history -c 2>/dev/null; history -w 2>/dev/null; true", timeout=5.0)
-    elif session.is_windows:
-        session.run_marked("", "Clear-History -ErrorAction SilentlyContinue", timeout=5.0)
-
-    report = format_historydel_report(data)
-    session.print(report, "green" if data.get("cleared") else "yellow")
-    return 0
-```
-
-For direct access to marked execution without the full collector wrapper, use `_run_collector_marked` and `parse_collector_json` from `plugins/shared/runner.py`.
-
 ### Linux collectors
 
 Linux collectors are Python source strings executed on the target via `build_linux_collector_command()`.
-
-**Structure:**
-
-1. Define `_linux_collector_source()` returning a raw string (`r'''...'''`).
-2. Write collector logic that builds a `result` dict.
-3. Call `_emit(result)` at the end — never print markers manually.
-4. Wrap with `_build_linux_command()` → `build_linux_collector_command(source)`.
 
 The wrapper in `linux/_helpers.py` automatically:
 
@@ -732,100 +692,45 @@ The wrapper in `linux/_helpers.py` automatically:
 - Encodes the script for inline execution via `python3 -c` (or `python2` fallback)
 - Falls back to chunked `/tmp` staging only when the encoded payload exceeds ~20000 bytes
 
-**Prefer native commands:**
-
-```python
-def sh(cmd, timeout=5):
-    try:
-        out = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT, timeout=timeout)
-        return out.decode("utf-8", "ignore")
-    except Exception:
-        return ""
-
-result = {"summary": {}, "ports": []}
-output = sh("ss -tulpn 2>/dev/null || netstat -tulpn 2>/dev/null", 10)
-for line in output.splitlines()[:60]:
-    result["ports"].append(line.strip())
-_emit(result)
-```
-
 **Guidelines:**
 
-- Use `subprocess.check_output(..., timeout=N)` for every external command.
+- **Prefer `shutil.which()` over spawning `which`** — no process creation.
+- **Prefer reading config files in-process** over spawning helper binaries (`xdg-settings`, etc.).
+- Use `subprocess.check_output(..., timeout=N)` for external commands that cannot be avoided.
 - Trim large lists before emitting (cap at 50–80 entries).
 - Handle missing tools gracefully—leave sections empty rather than raising.
-- Avoid embedding marker strings in output; the `history` plugin scrubs `__T_PLUGIN_*__` from collected text for this reason.
+- Avoid embedding marker strings in output.
 - Keep collectors compact to stay under the inline size limit and avoid `/tmp` staging.
+- **Skip credential-store filenames** (`Login Data`, `logins.json`, `key4.db`, `Cookies`) when enumerating browser artifacts — even a `stat()` on these paths can trip EDR rules.
 
 ### Windows collectors
 
 Windows collectors are PowerShell script strings returned from `_build_windows_command()`.
 
-**Structure:**
-
-```python
-from tornadorevc2.constants import PLUGIN_MARK_END, PLUGIN_MARK_START
-
-def _build_windows_command():
-    return rf"""
-$ErrorActionPreference='SilentlyContinue'
-$start='{PLUGIN_MARK_START}'; $end='{PLUGIN_MARK_END}'
-$result = [ordered]@{{
-  summary = @{{ count = 0 }}
-  items = @()
-}}
-try {{
-  Get-CimInstance Win32_Service -EA 0 | Select-Object -First 50 | ForEach-Object {{
-    $result.items += @{{ name = $_.Name; state = $_.State }}
-  }}
-  $result.summary.count = $result.items.Count
-}} catch {{
-  $result.summary.error = $_.Exception.Message
-}}
-Write-Output ($start + (ConvertTo-Json $result -Depth 5 -Compress) + $end)
-"""
-```
-
 **Guidelines:**
 
 - Always set `$ErrorActionPreference='SilentlyContinue'` at the top.
-- Use `-EA 0` (ErrorAction SilentlyContinue) on cmdlets that may fail on older systems.
-- Brace-doubling is required inside Python f-strings and raw f-strings: `{{` and `}}` for PowerShell hashtables and script blocks.
-- Use `[ordered]@{{...}}` to preserve key order in JSON output.
-- Prefer built-in cmdlets (`Get-NetTCPConnection`, `Get-Process`, `netsh`, `wevtutil`) over external tools.
-- Wrap each logical section in its own `try/catch` so one failure does not abort the entire collector.
-- On interactive PowerShell sessions, scripts are delivered in-process via `win_client.py` for reliable output capture.
-
-**Alternative:** For Windows-only plugins with minimal entry points, use a single `build_command()` function:
-
-```python
-# tornadorevc2/plugins/windows/services.py
-@plugin.command(name="services", platforms=["windows"], description="...")
-def run(session: SessionContext, args):
-    return run_collector_plugin(session, "services", None, build_command, format_generic_report, timeout=35.0)
-```
+- Use `-EA 0` on cmdlets that may fail on older systems.
+- Brace-doubling is required inside Python f-strings: `{{` and `}}`.
+- Use `[ordered]@{{...}}` to preserve key order.
+- Prefer built-in cmdlets over external tools.
+- Wrap each logical section in its own `try/catch`.
+- On interactive PowerShell sessions, scripts are delivered in-process via `win_client.py`.
 
 ### JSON payload conventions
-
-Collectors should return a JSON-serializable dict. The runner and formatters expect consistent key usage:
 
 | Key | Type | Purpose |
 |-----|------|---------|
 | `summary` | `dict` | High-level counts and stats; rendered first by `format_generic_report()` |
 | `error` | `str` | **Hard failure** — runner prints error and returns exit code 1 |
 | `traceback` | `str` | Optional; logged as detail when `error` is set |
-| `reason` | `str` | **Soft failure** — use with custom formatters (e.g. clipboard unavailable) |
-| `ok` | `bool` | Success flag for operational plugins (screenshot, clipboard) |
-| Lists of `dict` | `list` | Rendered as tables by `format_generic_report()` |
+| `reason` | `str` | **Soft failure** — use with custom formatters |
+| `ok` | `bool` | Success flag for operational plugins |
+| Lists of `dict` | `list` | Rendered as tables |
 | Lists of `str` | `list` | Rendered as bullet lists |
 | Nested `dict` | `dict` | Rendered as labeled sections |
 
-**Graceful degradation:** For multi-section enumeration, use separate dict keys per section and catch exceptions locally. Do not set top-level `error` unless the entire collector failed—partial results are preferable.
-
-```python
-result = {"summary": {}, "ufw": {}, "iptables": {}}
-# Each backend probed independently; failures leave that section empty
-```
+**Graceful degradation:** For multi-section enumeration, use separate dict keys per section and catch exceptions locally. Do not set top-level `error` unless the entire collector failed.
 
 ### Custom formatters
 
@@ -867,7 +772,7 @@ Reusable helpers in `plugins/shared/common.py`:
 def run(session: SessionContext, args):
     return run_collector_plugin(
         session, "rdp",
-        None,                    # no Linux builder
+        None,
         build_command,
         format_generic_report,
         timeout=35.0,
@@ -882,21 +787,15 @@ def run(session: SessionContext, args):
     return run_collector_plugin(
         session, "cron",
         build_linux_command,
-        None,                    # no Windows builder
+        None,
         format_generic_report,
         timeout=30.0,
     )
 ```
 
-**Cross-platform with split builders:**
-
-Some shared plugins delegate to platform-specific builder modules (e.g. `virtualization` imports from `linux/virtualization.py` and `windows/virtualization.py`). The `@plugin.command` entry point stays in `shared/`; builder modules under `linux/` or `windows/` contain no decorator and are not registered as independent plugins.
-
 ### External plugins
 
 External plugins let you extend TornadoRevC2 without modifying the repository.
-
-**Setup:**
 
 ```bash
 # Default location (created automatically if missing)
@@ -909,24 +808,12 @@ export TORNADOREVC2_PLUGIN_DIR=/path/to/my/plugins
 **Workflow:**
 
 ```bash
-# From the handler console
-plugins load myplugin          # import and register commands
-plugins info myplugin          # verify name, platforms, description, module path
-run myplugin 1                 # execute against session 1
-run myplugin 1 --verbose       # extra args passed to handler as args=["--verbose"]
-plugins reload myplugin        # re-import after editing (clears stale registrations)
-plugins unload myplugin        # fully unload external plugin
+plugins load myplugin
+plugins info myplugin
+run myplugin 1
+plugins reload myplugin
+plugins unload myplugin
 ```
-
-**External vs built-in lifecycle:**
-
-| Action | Built-in plugin | External plugin |
-|--------|-----------------|-----------------|
-| `plugins unload` | Soft-disabled (module stays imported) | Fully unloaded and unregistered |
-| `plugins reload` | Re-imports module, clears stale command registrations | Removes from `sys.modules`, re-imports from disk |
-| Startup | Auto-loaded | Loaded on demand |
-
-External modules are imported as `tornado_ext_plugin_<name>` to avoid namespace collisions.
 
 ### SessionContext API
 
@@ -939,22 +826,22 @@ Every handler receives a `SessionContext` wrapping the handler and client socket
 | `session_id` | `str` | Assigned session identifier |
 | `platform` | `str` | `unix`, `windows`, or `unknown` |
 | `is_windows` / `is_unix` | `bool` | Platform convenience flags |
-| `sysinfo` | `dict` | Cached host information from `sysinfo` collection |
+| `sysinfo` | `dict` | Cached host information |
 | `identity` | `dict` | Session identity/fingerprint metadata |
 | `addr` | `tuple` | Remote address |
 | `tls` | `bool` | Whether session uses TLS |
 | `name` | `str` | Operator-assigned friendly name |
 | `fingerprint` | `str` | Stable host fingerprint |
-| `logger` | `SessionLogger` | Per-session log writer (may be `None`) |
+| `logger` | `SessionLogger` | Per-session log writer |
 | `colors` | `dict` | Console color codes |
-| `socket` | socket | Raw client socket (advanced use) |
+| `socket` | socket | Raw client socket |
 
 **Execution methods:**
 
 | Method | Description |
 |--------|-------------|
 | `run_shell(cmd, timeout=15.0)` | Send command, wait for output, return string |
-| `run_shell_streaming(cmd, timeout, idle_timeout, on_chunk)` | Stream output with idle detection; useful for long-running commands |
+| `run_shell_streaming(cmd, timeout, idle_timeout, on_chunk)` | Stream output with idle detection |
 | `run_marked(unix_cmd, win_ps_script, timeout, start_mark, end_mark, strip_ws)` | Execute platform-appropriate command and extract marked payload |
 | `get_cwd()` | Return remote working directory |
 | `collect_sysinfo(mode='stealth')` | Trigger host info collection |
@@ -971,7 +858,7 @@ Every handler receives a `SessionContext` wrapping the handler and client socket
 
 | Method | Description |
 |--------|-------------|
-| `print(text, color=None)` | Print to operator console with optional color (`red`, `green`, `yellow`, `cyan`) |
+| `print(text, color=None)` | Print to operator console with optional color |
 | `log_event(message)` | Append timestamped event to `session.log` |
 | `log_command(cmd, output)` | Log command and output to `session.log` |
 | `log_plugin_result(name, report, detail='')` | Write report to `logs/<session>/plugins/<name>_<timestamp>.log` |
@@ -991,22 +878,7 @@ Every handler receives a `SessionContext` wrapping the handler and client socket
 | Timeout / no markers in output | Exit 1, log "no response" |
 | Output not valid JSON | Exit 1, log raw output (truncated) as detail |
 | `data["error"]` present | Exit 1, print error and traceback |
-| Partial section failures | Should **not** set top-level `error`; leave section empty |
-
-**Soft failures** (operational plugins): Use `reason` or `ok: false` and handle in a custom formatter or custom handler rather than relying on the runner's hard `error` check.
-
-### Best practices
-
-1. **Prefer native OS commands** over uploaded tooling—aligns with the framework's dependency-light design.
-2. **Do not write files on the target** for enumeration; return data over the shell channel. Operational plugins (wiper, historydel) are exceptions with clear purpose.
-3. **Degrade gracefully** — probe each backend independently; empty sections beat total failure.
-4. **Cap output size** — trim lists to 50–80 items; truncate long strings to 200–500 characters.
-5. **Set realistic timeouts** — quick probes: 15–30s; comprehensive enumeration: 45–75s.
-6. **Log consistently** — call `session.log_event()` at start, `session.log_plugin_result()` on completion, `session.log_command()` for transcript export.
-7. **Validate args early** — return 1 with usage message before sending anything to the target.
-8. **Test from both consoles** — main handler (`run plugin <ID>`) and attached session (`switch` then `run plugin`).
-9. **Use `plugins reload`** during development to pick up changes without restarting the handler.
-10. **Scrub sensitive markers** from collected output if your plugin reads arbitrary file content.
+| Partial section failures | Leave section empty; do **not** set top-level `error` |
 
 ### Reference implementations
 
@@ -1025,8 +897,6 @@ Every handler receives a `SessionContext` wrapping the handler and client socket
 | `rdp` | `plugins/windows/rdp.py` | Windows-only collector | Registry and firewall enumeration |
 | `virtualization` | `plugins/shared/virtualization.py` | Shared entry + split builders | Imports `linux/` and `windows/` builders |
 | `secrets` | `plugins/linux/secrets.py` | Linux-only collector | Platform-restricted listing |
-
-For new enumeration plugins, start from `run_collector_plugin` in `plugins/shared/runner.py` and copy the layout from `firewall.py` or `ports.py`. For plugins with arguments or side effects, refer to `memorymap.py` or `wiper.py`.
 
 ---
 
@@ -1048,6 +918,10 @@ logs/001_user@hostname_192.168.1.10_unix_10-08-2026_143022/
 
 Plugin logs contain a human-readable report and, when applicable, the raw JSON payload returned by the remote collector.
 
+**Log writing is error-safe:** if a write fails (disk full, permission error, etc.), the failure is swallowed and the session continues. Logging never aborts an active session.
+
+**Terminal control sequences are stripped** from all target output before it is written to disk, so logs remain readable in any editor.
+
 Tunnel operations (SOCKS start/stop, reset, cleanup, reconnect of the remote agent) are logged via the session logger under `session.log`, including remote artifact removal results.
 
 ---
@@ -1059,15 +933,17 @@ TornadoRevC2/
 ├── tornadorevc2.py                 Entry point
 ├── tornadorevc2/
 │   ├── handler.py                  Listeners, sessions, operator console
+│   ├── guardrails.py               Host deny list and operational guardrails
 │   ├── updater.py                  Git-based self-update and restart
 │   ├── sysinfo.py                  Host information collection
-│   ├── terminal.py                 PTY/TTY management
+│   ├── terminal.py                 PTY/TTY management (OPSEC-aware)
 │   ├── transfer.py                 Chunked file transfers
 │   ├── tunnel.py                   SOCKS5 pivoting
 │   ├── remote_exec.py              Remote command builders
 │   ├── win_client.py               Windows shell detection and script delivery
 │   ├── session_registry.py         Session persistence and reconnect logic
-│   ├── session_log.py              Per-session directory logging
+│   ├── session_log.py              Per-session directory logging (error-safe)
+│   ├── terminal_sanitize.py        ANSI/OSC/DCS sequence stripping
 │   ├── export.py                   HTML transcript export
 │   ├── payloads.py                 Built-in payload catalog
 │   └── plugins/
@@ -1075,6 +951,9 @@ TornadoRevC2/
 │       ├── manager.py              Plugin lifecycle and execution
 │       ├── loader.py               Module discovery
 │       ├── shared/                 Cross-platform plugins
+│       │   ├── runner.py           Collector execution + jitter
+│       │   ├── inmemory.py         In-memory payload execution
+│       │   └── _win_pe_loader.cs   Windows PE loader (C#)
 │       ├── linux/                  Linux/Unix-only plugins
 │       └── windows/                Windows-only plugins
 ├── plugins/                        Optional external plugin directory
@@ -1128,7 +1007,7 @@ python tornadorevc2.py -H 0.0.0.0 -mp 9443 \
 
 ### Upgrading a live session to mTLS
 
-Existing sessions on plain TCP or server-auth TLS can be moved onto the mTLS listener without restarting the handler. The `upgrade_mtls` plugin uploads `client.pem`, `client.key`, and `ca.pem` to the target, launches a background shell that presents the client certificate, and (by default) removes the bundle from disk once the new session is up.
+Existing sessions on plain TCP or server-auth TLS can be moved onto the mTLS listener without restarting the handler.
 
 ```bash
 # From the main handler prompt

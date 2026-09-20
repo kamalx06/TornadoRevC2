@@ -382,11 +382,121 @@ try {{
         path = self._escape_for_sh(self.h._escape_path(remote_path, 'unix'))
         args_json = self._json_escape(payload_args)
         source = f"""
-import hashlib, json, os, sys, subprocess, tempfile
+import hashlib, json, os, sys, subprocess
+
 path = {self._json_escape(path)}
 expected = {self._json_escape(expected_hash)}
 args = {args_json}
 result = {{'stdout': '', 'stderr': '', 'exit_code': 0, 'method': 'memfd'}}
+
+
+def _memfd_modern(name, flags):
+    fd = os.memfd_create(name, flags)
+    os.set_inheritable(fd, True)
+    return fd
+
+
+def _memfd_legacy(name, flags):
+    import ctypes
+    import platform
+    machine = platform.machine().lower()
+    # memfd_create syscall numbers per architecture.
+    # Sources: kernel arch/*/entry/syscalls/syscall_64.tbl and asm/unistd_*.h
+    syscall_nr = {{
+        'x86_64': 319,
+        'amd64': 319,
+        'aarch64': 279,
+        'arm64': 279,
+        'riscv64': 279,
+        'i386': 356,
+        'i686': 356,
+        'armv7l': 385,
+        'armv6l': 385,
+        'ppc64': 360,
+        'ppc64le': 360,
+        's390x': 350,
+    }}.get(machine)
+    if not syscall_nr:
+        raise OSError('memfd_create unsupported on ' + machine)
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.syscall.restype = ctypes.c_long
+    libc.syscall.argtypes = [ctypes.c_long] + [ctypes.c_long] * 5
+    name_b = name.encode() if isinstance(name, str) else name
+    fd = libc.syscall(syscall_nr, ctypes.c_char_p(name_b),
+                      ctypes.c_uint(flags))
+    if fd < 0:
+        errno = ctypes.get_errno()
+        raise OSError(errno, os.strerror(errno))
+    os.set_inheritable(fd, True)
+    return fd
+
+
+def _try_memfd(data, args, result):
+    \"\"\"Attempt in-memory execution via memfd. Returns True on success.\"\"\"
+    fd = -1
+    try:
+        if hasattr(os, 'memfd_create'):
+            fd = _memfd_modern('payload', 0)
+        else:
+            fd = _memfd_legacy('payload', 0)
+    except Exception as exc:
+        result['method'] = 'memfd-unavailable'
+        result['stderr'] = str(exc)
+        return False
+
+    try:
+        os.write(fd, data)
+        fd_path = '/proc/self/fd/' + str(fd)
+        try:
+            os.chmod(fd_path, 0o755)
+        except Exception:
+            pass
+        proc = subprocess.run(
+            [fd_path] + args,
+            capture_output=True,
+            text=True,
+            pass_fds=(fd,),
+        )
+        result['stdout'] = proc.stdout
+        result['stderr'] = proc.stderr
+        result['exit_code'] = proc.returncode
+        result['method'] = 'memfd'
+        return True
+    except Exception as exc:
+        result['method'] = 'memfd-failed'
+        result['stderr'] = str(exc)
+        return False
+    finally:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+
+
+def _try_shm(data, args, result):
+    \"\"\"Fallback: write to /dev/shm, exec, remove.\"\"\"
+    tmp = os.path.join('/dev/shm', '.tornado_exec_' + os.urandom(4).hex())
+    try:
+        with open(tmp, 'wb') as out:
+            out.write(data)
+        os.chmod(tmp, 0o755)
+        proc = subprocess.run([tmp] + args, capture_output=True, text=True)
+        result['stdout'] = proc.stdout
+        result['stderr'] = proc.stderr
+        result['exit_code'] = proc.returncode
+        result['method'] = 'shm-fallback'
+        return True
+    except Exception as exc:
+        result['method'] = 'shm-failed'
+        result['stderr'] = str(exc)
+        return False
+    finally:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+
+
 try:
     with open(path, 'rb') as fh:
         data = fh.read()
@@ -399,37 +509,8 @@ try:
         result['stderr'] = 'SHA256 verification failed'
     else:
         exec_args = [arg for arg in args] if args else []
-        launched = False
-        if hasattr(os, 'memfd_create'):
-            fd = os.memfd_create('payload', 0)
-            os.write(fd, data)
-            fd_path = '/proc/self/fd/' + str(fd)
-            os.chmod(fd_path, 0o755)
-            try:
-                proc = subprocess.run([fd_path] + exec_args, capture_output=True, text=True)
-                result['stdout'] = proc.stdout
-                result['stderr'] = proc.stderr
-                result['exit_code'] = proc.returncode
-                launched = True
-            except Exception as exc:
-                result['method'] = 'memfd-failed'
-                result['stderr'] = str(exc)
-        if not launched:
-            tmp = os.path.join('/dev/shm', '.tornado_exec_' + os.urandom(4).hex())
-            with open(tmp, 'wb') as out:
-                out.write(data)
-            os.chmod(tmp, 0o755)
-            try:
-                proc = subprocess.run([tmp] + exec_args, capture_output=True, text=True)
-                result['stdout'] = proc.stdout
-                result['stderr'] = proc.stderr
-                result['exit_code'] = proc.returncode
-                result['method'] = 'shm-fallback'
-            finally:
-                try:
-                    os.remove(tmp)
-                except Exception:
-                    pass
+        if not _try_memfd(data, exec_args, result):
+            _try_shm(data, exec_args, result)
 except Exception as exc:
     result['exit_code'] = 1
     result['stderr'] = str(exc)

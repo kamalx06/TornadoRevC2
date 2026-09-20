@@ -1,11 +1,23 @@
 """Shared plugin execution helpers."""
 
 import json
+import random
+import time
 from typing import Callable, Dict, Optional
 
 from ...constants import PLUGIN_MARK_END, PLUGIN_MARK_START
 from ...sysinfo import _extract_marked
 from .common import resolve_session_platform
+
+
+def _jitter(min_s: float = 0.5, max_s: float = 2.5) -> None:
+    """Unconditional jitter between automated commands.
+
+    Defenders look for rapid bursts of shell commands as an automation
+    signature. This inserts a small random delay before each collector
+    step to break that pattern.
+    """
+    time.sleep(random.uniform(min_s, max_s))
 
 
 def parse_collector_json(raw: Optional[str]) -> dict:
@@ -33,11 +45,15 @@ def _run_collector_marked(session, unix_cmd: str, win_ps: str, platform: str, ti
     )
 
     if platform == 'unknown':
+        first = True
         for shell_type in ('windows', 'unix'):
             if shell_type == 'windows' and not win_ps:
                 continue
             if shell_type == 'unix' and not unix_cmd:
                 continue
+            if not first:
+                _jitter()
+            first = False
             payload = handler._run_marked(
                 sock,
                 unix_cmd if shell_type == 'unix' else 'true',
@@ -60,6 +76,7 @@ def run_collector_plugin(
     formatter: Callable[[dict], str],
     timeout: float = 30.0,
 ) -> int:
+    _jitter()
     session.log_event(f'Plugin {plugin_name}: collection started')
     session._handler._flush_shell(session._client_sock, timeout=1.0)
 

