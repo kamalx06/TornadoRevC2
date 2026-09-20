@@ -57,16 +57,22 @@ def _chunked_command(source: str) -> str:
 
 def build_linux_collector_command(source: str) -> str:
     wrapped = _wrap_collector(source)
-    encoded_len = len(base64.b64encode(wrapped.encode('utf-8')))
-    if encoded_len > _INLINE_LIMIT:
-        return _chunked_command(wrapped)
-    interpreters = [
-        ('python3', 'python'),
-        ('python', 'python'),
-        ('python2', 'python'),
-    ]
-    body = _b64_exec_cmd(wrapped, interpreters)
-    return f"({body}) 2>/dev/null; true"
+    encoded = base64.b64encode(wrapped.encode('utf-8'))
+
+    # Worst-case inline command embeds the payload N times, once per
+    # interpreter. Budget for the worst case.
+    worst_case_inline = len(encoded) * len([
+        ('python3', 'python'), ('python', 'python'), ('python2', 'python'),
+    ]) + 200
+
+    # 4 KB is safe on busybox, dash, ksh, zsh, and bash.
+    # 8 KB is safe on most modern systems.
+    # 30 KB+ is only safe on bash with a raised limit.
+    if worst_case_inline <= 3500:
+        body = _b64_exec_cmd(wrapped, [('python3', 'python')])
+        return f"({body}) 2>/dev/null; true"
+
+    return _chunked_command(wrapped)
 
 
 def linux_markers():

