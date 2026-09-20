@@ -1199,7 +1199,7 @@ class TORNADOREVC2:
     {self.colors['green']}INTERNAL PIVOTING (SOCKS5):{self.colors['end']}
     socks <listen_port>                               Start SOCKS5 proxy via session
     socks test <host> <port>                          Test internal TCP reachability
-    socks reset                                       Reset tunnel streams/buffers
+    socks reset [--hard]                              Reset tunnel (soft: purge streams/buffers; hard: redeploy agent)
     tunnels                                           List active SOCKS proxies
     socks stop <proxy_id>                             Stop a SOCKS proxy
 
@@ -1394,15 +1394,15 @@ class TORNADOREVC2:
 
     {self.colors['green']}PLUGINS:{self.colors['end']}
     plugins / plugins list                                   List registered plugins
-    plugins load|unload|reload|info <name>                     Manage plugins at runtime
+    plugins load|unload|reload|info <name>                   Manage plugins at runtime
     run <plugin> <ID>                                        Execute a plugin on a session
 
     {self.colors['green']}INTERNAL PIVOTING (SOCKS5):{self.colors['end']}
     socks <ID> <listen_port>                                 Start SOCKS5 proxy via session
     socks <ID> test <host> <port>                            Test internal TCP reachability
-    socks <ID> reset                                           Reset tunnel streams/buffers
+    socks <ID> reset [--hard]                                Reset tunnel (soft: purge streams; hard: redeploy agent)
     tunnels                                                  List active SOCKS proxies
-    socks stop <proxy_id>                                    Stop a SOCKS proxy
+    socks stop <proxy_id>                                    Stop proxy + delete remote agent artifact
 
     {self.colors['green']}IN-MEMORY EXECUTION:{self.colors['end']}
     run inmemory <ID> <filetype> <local_file> [-- args] [--save-output <file>]

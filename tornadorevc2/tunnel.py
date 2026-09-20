@@ -1168,25 +1168,39 @@ class TunnelManager:
             self._drop_pool(client_sock)
             return False
 
-        agent_path = (agent or {}).get('remote_path') or self._remote_paths(client_sock, shell_type, token)
+        agent_path = (agent or {}).get('remote_path') or self._remote_paths(
+            client_sock, shell_type, token
+        )
         path_esc = self.h._escape_path(agent_path, shell_type)
         token_esc = token.replace("'", "'\\''")
 
-        if shell_type == 'windows':
-            cleanup_ps = (
-                f"Get-CimInstance Win32_Process -Filter \"CommandLine LIKE '%.tornado_agent_{token}.py%'\" "
-                f"| ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }};"
-                f"Remove-Item -LiteralPath '{path_esc}' -Force -ErrorAction SilentlyContinue;"
-                f"'{TUNNEL_MARK_START}OK{TUNNEL_MARK_END}'"
-            )
-            result = self._tunnel_marked(client_sock, '', cleanup_ps, 'windows', timeout=20.0)
-        else:
-            unix_cmd = (
-                f"pkill -f '.tornado_agent_{token_esc}.py' 2>/dev/null; "
-                f"rm -f '{path_esc}' 2>/dev/null; "
-                f"printf '%sOK%s' '{TUNNEL_MARK_START}' '{TUNNEL_MARK_END}'"
-            )
-            result = self._tunnel_marked(client_sock, unix_cmd, '', shell_type, timeout=20.0)
+        result = None
+        for _attempt in range(2):
+            if shell_type == 'windows':
+                cleanup_ps = (
+                    f"Get-CimInstance Win32_Process -Filter "
+                    f"\"CommandLine LIKE '%.tornado_agent_{token}.py%'\" "
+                    f"| ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force "
+                    f"-ErrorAction SilentlyContinue }};"
+                    f"Remove-Item -LiteralPath '{path_esc}' -Force "
+                    f"-ErrorAction SilentlyContinue;"
+                    f"'{TUNNEL_MARK_START}OK{TUNNEL_MARK_END}'"
+                )
+                result = self._tunnel_marked(
+                    client_sock, '', cleanup_ps, 'windows', timeout=20.0
+                )
+            else:
+                unix_cmd = (
+                    f"pkill -9 -f '.tornado_agent_{token_esc}.py' 2>/dev/null; "
+                    f"rm -f '{path_esc}' 2>/dev/null; "
+                    f"printf '%sOK%s' '{TUNNEL_MARK_START}' '{TUNNEL_MARK_END}'"
+                )
+                result = self._tunnel_marked(
+                    client_sock, unix_cmd, '', shell_type, timeout=20.0
+                )
+            if result == 'OK':
+                break
+            time.sleep(0.5)
 
         self._drop_pool(client_sock)
         with self._lock:
@@ -1200,7 +1214,10 @@ class TunnelManager:
             self._deploy_locks.pop(client_sock, None)
 
         ok = result == 'OK'
-        msg = f"Remote tunnel cleanup ({reason}): {'removed' if ok else (result or 'no response')}"
+        msg = (
+            f"Remote tunnel cleanup ({reason}): "
+            f"{'removed' if ok else (result or 'no response')}"
+        )
         color = self.h.colors['green'] if ok else self.h.colors['yellow']
         print(f"{color}{msg}{self.h.colors['end']}")
         self._log(client_sock, msg)
@@ -1303,14 +1320,22 @@ class TunnelManager:
             if worker:
                 worker.drain()
 
-    def _socks_reset(self, client_sock):
-        """Fully reset tunnel: abort local relays, purge remote streams, restore clean state."""
+    def _socks_reset(self, client_sock, hard=False):
+        """Soft reset: purge streams, abort relays, reset counters and load balancers.
+        Hard reset: kill and redeploy the remote agent for a fresh state."""
         info = self.h._client_info(client_sock)
         if not info:
             print(f"{self.h.colors['red']}Session not active{self.h.colors['end']}")
             return True
+
+        if hard:
+            return self._socks_reset_hard(client_sock)
+
         if not self._has_channels(client_sock):
-            print(f"{self.h.colors['red']}No active tunnel channels for #{info['id']}{self.h.colors['end']}")
+            print(
+                f"{self.h.colors['red']}No active tunnel channels for "
+                f"#{info['id']}{self.h.colors['end']}"
+            )
             return True
 
         self._bump_reset_gen(client_sock)
@@ -1319,37 +1344,87 @@ class TunnelManager:
 
         with self._lock:
             self._session_stream_counters[client_sock] = 0
+            self._channel_rr[client_sock] = 0
             for conn in self._alive_conns(client_sock):
                 self._channel_load[id(conn)] = 0
 
         ok = self._purge_all_channels(client_sock, timeout=10.0)
         self._gc_all_channels(client_sock, timeout=5.0)
 
-        alive = self._alive_conns(client_sock)
         ping_ok = False
-        for conn in alive:
+        for conn in self._alive_conns(client_sock):
             resp, hard_fail = self._request_on(conn, {'op': 'ping'}, timeout=5.0)
             if resp and resp.get('ok'):
                 ping_ok = True
             elif hard_fail:
                 self._remove_conn(client_sock, conn)
 
-        if ok and ping_ok:
-            n = len(self._alive_conns(client_sock))
+        healthy = self._alive_conns(client_sock)
+        if len(healthy) < max(1, TUNNEL_POOL_SIZE // 4):
+            agent = self._session_agents.get(client_sock) or {}
+            self._wait_for_channel(client_sock, agent.get('token', ''), timeout=15.0)
+            healthy = self._alive_conns(client_sock)
+
+        n = len(healthy)
+        if ok and ping_ok and n > 0:
             print(
                 f"{self.h.colors['green']}Tunnel reset OK for #{info['id']} "
-                f"({n} channel(s), relays aborted, buffers cleared){self.h.colors['end']}"
+                f"({n} channel(s) clean, streams purged, buffers cleared)"
+                f"{self.h.colors['end']}"
             )
             self._log(client_sock, f'SOCKS tunnel reset: {n} channel(s) clean')
         else:
             err = self._last_error or 'partial reset'
-            n = len(self._alive_conns(client_sock))
             color = self.h.colors['yellow'] if n else self.h.colors['red']
             print(
-                f"{color}Tunnel reset {'partial' if n else 'failed'} for #{info['id']}: "
-                f"{n} channel(s) remaining{self.h.colors['end']}"
+                f"{color}Tunnel reset {'partial' if n else 'failed'} for "
+                f"#{info['id']}: {n} channel(s) remaining{self.h.colors['end']}"
             )
-            self._log(client_sock, f'SOCKS tunnel reset {"partial" if n else "failed"}: {err}')
+            self._log(
+                client_sock,
+                f'SOCKS tunnel reset {"partial" if n else "failed"}: {err}'
+            )
+        return True
+
+    def _socks_reset_hard(self, client_sock):
+        """Kill and redeploy the remote agent for a completely fresh tunnel state."""
+        info = self.h._client_info(client_sock)
+        if not info:
+            print(f"{self.h.colors['red']}Session not active{self.h.colors['end']}")
+            return True
+
+        print(
+            f"{self.h.colors['yellow']}Hard reset: redeploying tunnel agent "
+            f"for #{info['id']}...{self.h.colors['end']}"
+        )
+
+        self._bump_reset_gen(client_sock)
+        self._abort_session_relays(client_sock, timeout=RELAY_JOIN_TIMEOUT)
+        self._purge_all_channels(client_sock, timeout=5.0)
+        self._drop_pool(client_sock)
+
+        with self._lock:
+            self._session_agents.pop(client_sock, None)
+            self._session_stream_counters[client_sock] = 0
+            self._session_reset_gen[client_sock] = 0
+
+        with self._deploy_lock(client_sock):
+            agent = self._deploy_agent(client_sock)
+
+        if not agent:
+            print(
+                f"{self.h.colors['red']}Hard reset failed: "
+                f"{self._last_error or 'agent redeploy failed'}{self.h.colors['end']}"
+            )
+            self._log(client_sock, 'SOCKS hard reset failed: agent redeploy failed')
+            return True
+
+        n = len(self._alive_conns(client_sock))
+        print(
+            f"{self.h.colors['green']}Hard reset OK for #{info['id']} "
+            f"({n} fresh channel(s)){self.h.colors['end']}"
+        )
+        self._log(client_sock, f'SOCKS hard reset: {n} fresh channel(s)')
         return True
 
     def _socks_test(self, client_sock, host, port):
@@ -1723,15 +1798,32 @@ class TunnelManager:
             proxy = self._proxies.pop(proxy_id, None)
         if not proxy:
             return False
+
         proxy['stop_event'].set()
         try:
             proxy['listener'].close()
         except OSError:
             pass
+
         cs = proxy.get('client_sock')
+        session_id = proxy.get('session_id')
         print(f"{self.h.colors['yellow']}SOCKS5 {proxy_id} stopped ({reason}){self.h.colors['end']}")
-        if cs and cleanup_remote and not any(p.get('client_sock') == cs for p in self._proxies.values()):
-            self._cleanup_remote_tunnel_artifacts(cs, reason=reason)
+
+        if cs and cleanup_remote:
+            with self._lock:
+                remaining = any(p.get('client_sock') == cs for p in self._proxies.values())
+            if not remaining:
+                ok = self._cleanup_remote_tunnel_artifacts(cs, reason=reason)
+                if ok:
+                    print(
+                        f"{self.h.colors['green']}Remote agent artifact removed for "
+                        f"#{session_id}{self.h.colors['end']}"
+                    )
+                else:
+                    print(
+                        f"{self.h.colors['yellow']}Warning: could not fully remove remote "
+                        f"agent artifact ({self._last_error or 'no response'}){self.h.colors['end']}"
+                    )
         return True
 
     def shutdown_all(self):
@@ -1793,7 +1885,8 @@ class TunnelManager:
         cmd = cmd_parts[0].lower()
 
         if cmd == 'socks' and len(cmd_parts) >= 2 and cmd_parts[1].lower() == 'reset':
-            return self._socks_reset(client_sock)
+            hard = '--hard' in cmd_parts
+            return self._socks_reset(client_sock, hard=hard)
 
         if cmd == 'socks' and len(cmd_parts) >= 2 and cmd_parts[1].lower() == 'test':
             if len(cmd_parts) < 4:
@@ -1855,7 +1948,8 @@ class TunnelManager:
             if not cs:
                 print(f"{self.h.colors['red']}Client not active{self.h.colors['end']}")
                 return True
-            return self._socks_reset(cs)
+            hard = '--hard' in cmd_parts
+            return self._socks_reset(cs, hard=hard)
         if cmd == 'socks' and len(cmd_parts) >= 5 and cmd_parts[2].lower() == 'test':
             try:
                 session_id = int(cmd_parts[1])
