@@ -65,7 +65,7 @@ TornadoRevC2 is a modular post-exploitation framework that handles sessions over
 | **Enumeration** | Covering host triage, detection-environment preflight, network posture, credentials and browser metadata, Kerberos tickets, Linux internals (sudo configuration, writable filesystem targets, restricted-shell detection), Windows domain trusts, WMI persistence, loaded modules, and Windows domain and system configuration |
 | **Operational plugins** | Multi-pass secure file wiping · Hybrid file encryption · Shell history clearing · Windows event log clearing · Cross-platform keystroke capture with window context |
 | **Persistence** | Cross-platform backdoor installation using TLS-encrypted payloads — cron `@reboot` on Linux/Unix, Run registry on Windows |
-| **Extensibility** | Runtime plugin load, reload, and unload · External plugins via `TORNADOREVC2_PLUGIN_DIR` · Documented `SessionContext` API |
+| **Extensibility** | Runtime plugin load, reload, unload, and rescan (live discovery — no handler restart) · External plugins via `TORNADOREVC2_PLUGIN_DIR` · Documented `SessionContext` API |
 | **Reporting** | Per-session logging · Structured plugin output · HTML transcript export |
 | **Self-update** | Git-based `update` command with repository verification, fast-forward pull, and automatic handler restart |
 
@@ -354,9 +354,10 @@ ncat.exe -lvnp 4444 -e cmd.exe
 |---------|-------------|
 | `plugins` / `plugins list` | List registered plugins |
 | `plugins list --verbose` | Show module paths and load state |
-| `plugins load <name>` | Load an external plugin at runtime |
+| `plugins load <name>` | Load a plugin at runtime (builtin or external) |
 | `plugins unload <name>` | Disable or unload a plugin |
 | `plugins reload <name>` | Reload a plugin module |
+| `plugins rescan` | Re-scan `shared/`, `linux/`, `windows/`, and external plugin directories. Loads any new modules found and enables their commands. No handler restart required. |
 | `plugins info <name>` | Display plugin metadata |
 | `run <plugin> <ID> [args...]` | Execute a plugin against a session |
 
@@ -432,7 +433,7 @@ Supported types: `py`, `ps`, `exe`, `elf`, `bat`, `sh`
 
 ## Built-in Plugins
 
-TornadoRevC2 ships with **60 built-in plugins** organized by function. All enumeration-related plugins are read-only unless noted otherwise.
+TornadoRevC2 ships with **62 built-in plugins** organized by function. All enumeration-related plugins are read-only unless noted otherwise.
 
 ### Host assessment & environment
 
@@ -455,6 +456,7 @@ TornadoRevC2 ships with **60 built-in plugins** organized by function. All enume
 |--------|----------|-------------|
 | `firewall` | Cross-platform | Firewall status, profiles/zones, policies, and notable rules (WDF, UFW, firewalld, nftables, iptables) |
 | `ports` | Cross-platform | Listening ports, established connections, owning processes, and routing |
+| `netscan` | Cross-platform | Fast TCP connect scan of hosts and CIDRs. `--ip` accepts a single IP, a comma/space-separated list, or a CIDR (`10.0.0.0/24`). `--port` accepts nmap-style specs: `top10` / `top100` / `top1000` presets, ranges (`1-500`), lists (`22,80,443`), or mixed (`22,80,1000-2000`). Linux collector uses an asyncio non-blocking socket pool auto-tuned to `RLIMIT_NOFILE`; Windows collector uses a runspace pool plus batched parallel `BeginConnect` per host. Target expansion capped at 4096 hosts |
 | `proxy` | Cross-platform | System, environment, PAC/WPAD, and browser proxy settings |
 | `vpn` | Cross-platform | VPN clients, active connections, adapters, and configuration metadata |
 
@@ -463,6 +465,7 @@ TornadoRevC2 ships with **60 built-in plugins** organized by function. All enume
 | Plugin | Platform | Description |
 |--------|----------|-------------|
 | `credstore` | Cross-platform | Credential store metadata (no secret extraction): Credential Manager, keyrings, browser stores |
+| `lsassdump` | Windows | LSASS minidump via `MiniDumpWriteDump` (full-memory flags). Three techniques, tried in order: direct `OpenProcess`, handle duplication (`--duplicate`), and `NtCreateSection` + `NtCreateProcessEx` fork (`--fork`) for PPL-protected LSASS. `--elevate` toggles the `SeDebugPrivilege` acquisition step. The dump is staged at `%TEMP%\\lsass.dmp` on the target and **downloaded to the operator automatically** using a single-PowerShell-process streaming transfer with in-line SHA-256 hashing — no separate `download` step required. `--out <path>` sets the **operator-side** destination (default `./lsass.dmp`). |
 | `browser` | Cross-platform | Installed browsers, profiles, extensions, bookmarks, and enterprise policies |
 | `clipboard` | Cross-platform | Remote clipboard text capture |
 | `secrets` | Linux/Unix | Configuration files, environment variables, SSH keys, and cloud credentials |
@@ -570,6 +573,8 @@ The plugin system has four layers:
 
 At import time, the `@plugin.command` decorator registers each handler in a thread-safe global registry. At runtime, `PluginManager.run_plugin()` validates platform compatibility, constructs a `SessionContext`, and calls the handler with `(session, args)`.
 
+Built-in plugin directories are **re-scanned on demand** — `plugins rescan` (or an explicit `plugins load <name>`) re-walks `shared/`, `linux/`, and `windows/`, imports any module that was added after startup, and enables its commands. New plugin files created during an engagement are usable immediately without restarting the handler.
+
 Handlers return an integer exit code: `0` for success, non-zero for failure. The handler console displays warnings for non-zero returns.
 
 ### Plugin placement
@@ -578,12 +583,12 @@ Choose a location based on platform scope and whether the plugin ships with the 
 
 | Location | Scope | Loaded |
 |----------|-------|--------|
-| `tornadorevc2/plugins/shared/` | Cross-platform (internal Windows + Linux implementations) | Automatically at startup |
-| `tornadorevc2/plugins/linux/` | Linux/Unix only | Automatically at startup |
-| `tornadorevc2/plugins/windows/` | Windows only | Automatically at startup |
-| `./plugins/myplugin.py` | External (any scope you define) | On demand via `plugins load` |
-| `./plugins/myplugin/__init__.py` | External package | On demand via `plugins load` |
-| Path in `TORNADOREVC2_PLUGIN_DIR` | External (custom directory) | On demand via `plugins load` |
+| `tornadorevc2/plugins/shared/` | Cross-platform (internal Windows + Linux implementations) | Automatically at startup; picked up live by `plugins rescan` |
+| `tornadorevc2/plugins/linux/` | Linux/Unix only | Automatically at startup; picked up live by `plugins rescan` |
+| `tornadorevc2/plugins/windows/` | Windows only | Automatically at startup; picked up live by `plugins rescan` |
+| `./plugins/myplugin.py` | External (any scope you define) | On demand via `plugins load` or `plugins rescan` |
+| `./plugins/myplugin/__init__.py` | External package | On demand via `plugins load` or `plugins rescan` |
+| Path in `TORNADOREVC2_PLUGIN_DIR` | External (custom directory) | On demand via `plugins load` or `plugins rescan` |
 
 **Layout rules:**
 
@@ -902,10 +907,11 @@ export TORNADOREVC2_PLUGIN_DIR=/path/to/my/plugins
 **Workflow:**
 
 ```bash
-plugins load myplugin
+plugins load myplugin      # load a known plugin
+plugins rescan             # discover and load every new plugin on disk
 plugins info myplugin
 run myplugin 1
-plugins reload myplugin
+plugins reload myplugin    # reimport after editing the source
 plugins unload myplugin
 ```
 

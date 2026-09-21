@@ -258,7 +258,7 @@ class TORNADOREVC2:
             if cmd == 'run' and arg_i == 3 and words[1].lower() == 'inmemory':
                 return self._complete_paths(text)
             if cmd == 'plugins' and arg_i == 1:
-                subs = ('list', 'load', 'unload', 'reload', 'info', 'help')
+                subs = ('list', 'load', 'unload', 'reload', 'rescan', 'info', 'help')
                 return sorted(s for s in subs if s.startswith(text.lower()))
             if cmd == 'plugins' and arg_i == 2 and words[1].lower() in ('load', 'unload', 'reload', 'info'):
                 return sorted(p for p in self.plugins.completion_plugins(session_sock) if p.startswith(text.lower()))
@@ -276,7 +276,7 @@ class TORNADOREVC2:
         if cmd == 'run' and arg_i == 4 and words[1].lower() == 'inmemory':
             return self._complete_paths(text)
         if cmd == 'plugins' and arg_i == 1:
-            subs = ('list', 'load', 'unload', 'reload', 'info', 'help')
+            subs = ('list', 'load', 'unload', 'reload', 'rescan', 'info', 'help')
             return sorted(s for s in subs if s.startswith(text.lower()))
         if cmd == 'plugins' and arg_i == 2 and words[1].lower() in ('load', 'unload', 'reload', 'info'):
             return sorted(p for p in self.plugins.completion_plugins() if p.startswith(text.lower()))
@@ -1275,7 +1275,7 @@ class TORNADOREVC2:
 
     {self.colors['green']}PLUGINS:{self.colors['end']}
     plugins / plugins list                            List registered plugins
-    plugins load|unload|reload|info <name>              Manage plugins at runtime
+    plugins load|unload|reload|rescan|info <name>     Manage plugins at runtime
     run <plugin> [args...]                            Execute a plugin on this session
 
     {self.colors['green']}FILE TRANSFER:{self.colors['end']}
@@ -1501,7 +1501,7 @@ class TORNADOREVC2:
 
     {self.colors['green']}PLUGINS:{self.colors['end']}
     plugins / plugins list                                   List registered plugins
-    plugins load|unload|reload|info <name>                   Manage plugins at runtime
+    plugins load|unload|reload|rescan|info <name>            Manage plugins at runtime
     run <plugin> <ID>                                        Execute a plugin on a session
 
     {self.colors['green']}INTERNAL PIVOTING (SOCKS5):{self.colors['end']}

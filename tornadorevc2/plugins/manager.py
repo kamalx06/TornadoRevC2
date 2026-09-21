@@ -78,6 +78,54 @@ class PluginManager:
 
 
 
+    def rescan_plugins(self) -> tuple:
+        new_names = []
+        already_loaded = set(self._loader.loaded_modules().keys())
+
+        for module_path in self._loader.discover_builtin_modules():
+            is_new = module_path not in already_loaded
+            if not self._loader.load_module(module_path, source='builtin'):
+                continue
+            if not is_new:
+                continue
+            for name in self._loader.commands_for_module_path(module_path, 'builtin'):
+                with self._lock:
+                    if name not in self._enabled:
+                        self._enabled.add(name)
+                        new_names.append(name)
+
+        for path in self._loader.discover_external_modules():
+            is_new = path not in already_loaded
+            if not self._loader.load_module(path, source='external'):
+                continue
+            if not is_new:
+                continue
+            for name in self._loader.commands_for_module_path(path, 'external'):
+                with self._lock:
+                    if name not in self._enabled:
+                        self._enabled.add(name)
+                        new_names.append(name)
+
+        return len(new_names), sorted(new_names)
+
+
+    def _cmd_rescan(self):
+        c = self._colors()
+        count, names = self.rescan_plugins()
+        if count == 0:
+            print(
+                f"{c['yellow']}No new plugins found "
+                f"(use 'plugins reload <name>' for changes to an existing plugin)"
+                f"{c['end']}"
+            )
+            return
+        print(f"{c['green']}Loaded {count} new plugin(s):{c['end']}")
+        for name in names:
+            cmd = get_registry().get(name)
+            desc = f" — {cmd.description}" if cmd else ""
+            print(f"  {c['bold']}{name}{c['end']}{desc}")
+
+
     def list_plugins(self, show_all: bool = False, client_sock=None):
 
         c = self._colors()
@@ -573,8 +621,9 @@ class PluginManager:
             self.unload_plugin(cmd_parts[2])
 
         elif sub == 'reload' and len(cmd_parts) >= 3:
-
             self.reload_plugin(cmd_parts[2])
+        elif sub in ('rescan', 'refresh', 'scan'):
+            self._cmd_rescan()
 
         elif sub == 'info' and len(cmd_parts) >= 3:
 
@@ -613,7 +662,7 @@ class PluginManager:
     plugins unload <name>               Unload/disable a plugin
 
     plugins reload <name>               Reload a plugin module
-
+    plugins rescan                      Re-scan plugin dirs, load new plugins
     plugins info <name>                 Show plugin details
 
     run <plugin> [args...]              Execute a plugin on this session
@@ -652,7 +701,7 @@ class PluginManager:
     plugins unload <name>               Unload/disable a plugin
 
     plugins reload <name>               Reload a plugin module
-
+    plugins rescan                      Re-scan plugin dirs, load new plugins
     plugins info <name>                 Show plugin details
 
     run <plugin> <session_id> [args...]   Execute plugin on a session

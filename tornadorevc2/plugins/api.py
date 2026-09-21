@@ -92,9 +92,16 @@ class SessionContext:
     """Clean API surface exposed to plugins for a single session."""
 
     def __init__(self, handler, client_sock):
+        if handler is None:
+            raise ValueError("SessionContext requires a handler")
+        if client_sock is None:
+            raise ValueError("SessionContext requires a client socket")
         self._handler = handler
         self._client_sock = client_sock
-        self._info = handler._client_info(client_sock) or {}
+        try:
+            self._info = handler._client_info(client_sock) or {}
+        except Exception:
+            self._info = {}
 
     @property
     def socket(self):

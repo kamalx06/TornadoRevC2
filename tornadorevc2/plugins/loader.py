@@ -16,7 +16,7 @@ EXTERNAL_PLUGIN_DIR = os.environ.get(
 )
 
 
-def _discover_builtin_plugin_modules() -> tuple:
+def _scan_builtin_plugin_modules() -> tuple:
     root = os.path.dirname(os.path.abspath(__file__))
     skip_shared = {'common', 'runner', '__init__'}
     modules = []
@@ -35,7 +35,7 @@ def _discover_builtin_plugin_modules() -> tuple:
     return tuple(dict.fromkeys(modules))
 
 
-BUILTIN_PLUGIN_MODULES = _discover_builtin_plugin_modules()
+BUILTIN_PLUGIN_MODULES = _scan_builtin_plugin_modules()
 
 
 def _external_spec_name(path: str) -> str:
@@ -54,7 +54,7 @@ class PluginLoader:
         self._external_paths: Dict[str, str] = {}
 
     def discover_builtin_modules(self) -> List[str]:
-        return list(BUILTIN_PLUGIN_MODULES)
+        return list(_scan_builtin_plugin_modules())
 
     def discover_external_modules(self) -> List[str]:
         found = []
@@ -195,7 +195,7 @@ class PluginLoader:
 
     def builtin_path_for_name(self, plugin_name: str) -> Optional[str]:
         matches = [
-            mod for mod in BUILTIN_PLUGIN_MODULES
+            mod for mod in _scan_builtin_plugin_modules()
             if mod.endswith(f'.{plugin_name}')
         ]
         if not matches:
