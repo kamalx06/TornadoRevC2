@@ -56,10 +56,10 @@ TornadoRevC2 is a modular post-exploitation framework that handles sessions over
 | Category | Capabilities |
 |----------|-------------|
 | **Session handling** | Multi-client TCP / TLS / mTLS listeners with automatic PKI bootstrapping · On-demand mTLS upgrade for live sessions · **Bind shell support** — dial a target listening on TCP or TLS · Interactive PTY/TTY shells · Session fingerprinting and reconnect tracking |
-| **Operational security** | Shell history suppression on Linux and Windows · No `pty.spawn` or `Invoke-Expression` in command paths · Session-scoped probe markers · Jitter between automated commands · Host deny-list guardrails that refuse production-looking targets · PTY upgrade verification (falls back to the original shell when bash handoff fails) |
+| **Operational security** | Shell history suppression on Linux and Windows · No `pty.spawn` or `Invoke-Expression` in command paths · Session-scoped probe markers · Jitter between automated commands · PTY upgrade verification (falls back to the original shell when bash handoff fails) |
 | **File transfer** | Chunked upload with resume · Chunked download with resume · SHA-256 integrity verification · Optional HTTPS transport for upload (`--https`) and push-style download (`--https-push`), with target-interface binding and callback address override |
 | **Payload execution** | In-memory execution for `py`, `ps`, `exe`, `elf`, `bat`, and `sh` — with memfd-based ELF execution (modern and legacy fallbacks) and subsystem-aware PE loading |
-| **Pivoting & tunneling** | SOCKS5 proxy through compromised sessions with automatic remote agent cleanup on stop · Soft and hard tunnel reset (`socks reset [--hard]`) · Ligolo-NG and Chisel agent deployment with background persistence |
+| **Pivoting & tunneling** | SOCKS5 proxy through compromised sessions · Windows tunnel agent runs in-memory (C#, no disk artifact); Unix uses a Python agent under `/tmp` · `socks test` requires an already-running proxy and does not deploy the agent implicitly · Soft and hard tunnel reset (`socks reset [--hard]`) · Automatic remote agent cleanup on `socks stop` and session disconnect · Ligolo-NG and Chisel agent deployment with background persistence |
 | **Remote session establishment** | `make_token` — establish new sessions over SSH, WinRM, SMB, WMI, MSSQL, DCOM, or MySQL/MariaDB from the operator side, with password / NTLM-hash / SSH-key / WinRM-client-certificate authentication, MySQL UDF auto-loading, custom-command execution, and netexec integration |
 | **Impersonation** | `runas` — execute commands or spawn a TLS-encrypted shell as another user, local or remote, with domain support and netexec integration · `steal_token` — list processes and owners, impersonate another process's token, or spawn a cmd / reverse shell running as the token owner |
 | **Enumeration** | Covering host triage, detection-environment preflight, network posture, credentials and browser metadata, Kerberos tickets, Linux internals (sudo configuration, writable filesystem targets, restricted-shell detection), Windows domain trusts, WMI persistence, loaded modules, and Windows domain and system configuration |
@@ -90,7 +90,7 @@ Operational plugins intentionally place artifacts on the target and document the
 - `ligolong` / `chisel` — deploy tunneling agents with background persistence.
 - `persistence` — installs a reverse shell backdoor (cron `@reboot` / Run registry).
 - `upgrade_mtls` — pushes `client.pem`, `client.key`, and `ca.pem` to the target (removed by default once the new mTLS session is up).
-- SOCKS5 pivoting — deploys a Python agent to `/tmp` (Linux) or the Windows staging path, removed automatically on `socks stop` and on session cleanup.
+- SOCKS5 pivoting — on Windows, the tunnel agent is compiled in-memory from C# via `Add-Type` inside a detached PowerShell child; no file is written to disk. On Linux/Unix, a Python agent is staged under `/tmp`. In both cases the remote agent is torn down automatically on `socks stop` (when it was the last proxy for the session) and on session disconnect. On Unix, the `/tmp/.tornado_agent_*.py` file is deleted as part of that cleanup.
 - Bind shell sessions — no artifact is placed on the target by the handler. The target already runs the listener; the handler only connects and manages the session.
 
 ### Graceful degradation
@@ -133,16 +133,6 @@ The handler and its plugins avoid command patterns that are widely known as red-
 
 Plugin collectors insert a random 0.5–2.5 s delay at the start of each run and between fallback probes. This breaks the tight command-burst pattern that defenders associate with automated tooling.
 
-### Guardrails
-
-The handler refuses to operate on hosts that match a deny list of production-looking patterns:
-
-- Hostnames containing `prod`, `prd`, or `dc1`-style prefixes
-- Domains containing `.corp.`
-- Known test hostnames (`localhost`, `sandbox`, `test-vm`, `testvm`, `kali`, `ubuntu`, `metasploitable`, `dvwa`)
-
-When a session is blocked, the operator console shows the reason and every subsequent command is refused until the block is cleared manually. This prevents accidental impact on production infrastructure during an engagement.
-
 ### Session log hygiene
 
 Session logs are written through an error-safe path (logging failures never abort a session) and ANSI/OSC/DCS terminal control sequences are stripped from target output so logs remain readable in any editor. Operator commands are stored verbatim.
@@ -163,7 +153,7 @@ TornadoRevC2 does **not** claim to evade EDR, AMSI, ScriptBlock logging, or memo
 ┌─────────────────────────────────────────────────────────────────┐
 │                     Operator Console (handler)                  │
 │  Sessions · Transfers · SOCKS · Plugins · Logging · Export ·    │
-│  update · Guardrails                                            │
+│  update                                                         │
 └────────────────────────────┬────────────────────────────────────┘
                              │
         REVERSE  TCP / TLS / mTLS        BIND  TCP / TLS
@@ -230,14 +220,21 @@ Collectors emit JSON wrapped in marker tokens (`__T_PLUGIN_START__` / `__T_PLUGI
 
 ### SOCKS5 pivoting lifecycle
 
-Each SOCKS proxy runs through a remote Python agent deployed on demand. The agent connects back to the handler over a dedicated tunnel listener (default: `revshell_port + 1`) and maintains a pool of channels for stream multiplexing. The operator controls the tunnel with four commands:
+Each SOCKS proxy runs through a remote tunnel agent that connects back to the handler over a dedicated tunnel listener (default: `revshell_port + 1`) and maintains a pool of channels for stream multiplexing.
+
+Agent transport by platform:
+
+- **Windows** — C# agent compiled in-memory with `Add-Type` inside a detached PowerShell child. No disk artifact is created. Cleanup terminates the child by its `TNB_<token>` process marker.
+- **Linux/Unix** — Python agent staged under `/tmp/.tornado_agent_<token>.py` and executed via the interpreter discovered on the target (Python 3 preferred, Python 2 fallback). Cleanup removes both the process and the script file.
+
+The operator controls the tunnel with four commands:
 
 - `socks <listen_port>` — start a SOCKS5 proxy bound to `127.0.0.1:<listen_port>`
-- `socks test <host> <port>` — verify TCP reachability through the agent
-- `socks reset [--hard]` — soft reset (abort relays, purge streams, clear buffers, rebalance channels) or hard reset (kill + redeploy agent)
-- `socks stop <proxy_id>` — stop a proxy; if it was the last proxy on the session, the remote agent is terminated and its `.tornado_agent_*.py` artifact is deleted from the target
+- `socks test <host> <port>` — verify TCP reachability through an **already-running** proxy. Does not deploy the agent implicitly; if no proxy exists for the session, the command prints how to start one and returns.
+- `socks reset [--hard]` — soft reset (abort relays, purge remote streams, clear buffers, rebalance channels) or hard reset (kill and redeploy the agent for a fully fresh state)
+- `socks stop <proxy_id>` — stop a proxy; if it was the last proxy on the session, the remote agent is terminated and any on-disk artifact (Unix only) is removed from the target
 
-The agent is **shared across proxies on the same session** and is cleaned up only when the last proxy on that session stops.
+The agent is **shared across proxies on the same session** and is cleaned up only when the last proxy on that session stops or the session disconnects.
 
 ---
 
@@ -432,12 +429,13 @@ Supported types: `py`, `ps`, `exe`, `elf`, `bat`, `sh`
 
 | Command | In-session form | Description |
 |---------|-----------------|-------------|
-| `socks <ID> <listen_port>` | `socks <listen_port>` | Start a SOCKS5 proxy through a session (local listener on `127.0.0.1:<listen_port>`) |
-| `socks <ID> test <host> <port>` | `socks test <host> <port>` | Test TCP reachability to an internal host through the tunnel agent |
+| `socks <ID> <listen_port>` | `socks <listen_port>` | Start a SOCKS5 proxy through a session (local listener on `127.0.0.1:<listen_port>`). Deploys the tunnel agent on first use. |
+| `socks <ID> test <host> <port>` | `socks test <host> <port>` | Test TCP reachability to an internal host through an existing proxy. Requires a proxy already running for the session; will not deploy the agent. |
 | `socks <ID> reset` | `socks reset` | **Soft reset** — abort local relays, purge remote streams, clear buffers, and rebalance channels. Active SOCKS listeners remain bound. |
-| `socks <ID> reset --hard` | `socks reset --hard` | **Hard reset** — kill and redeploy the remote tunnel agent for a fully fresh state |
-| `socks stop <proxy_id>` | `socks stop <proxy_id>` | Stop a SOCKS proxy. When it was the last proxy on that session, the remote agent process is killed and its `.tornado_agent_*.py` artifact is removed from the target. |
-| `tunnels` | `tunnels` | List active SOCKS proxies, channel count, and status |
+| `socks <ID> reset --hard` | `socks reset --hard` | **Hard reset** — kill and redeploy the remote tunnel agent for a fully fresh state. |
+| `socks <ID> stop [<proxy_id>]` | `socks stop <proxy_id>` | Stop a SOCKS proxy for the session. With no `<proxy_id>`, stops every proxy owned by that session. When the last proxy on a session stops, the remote agent is terminated and any on-disk artifact (Unix only) is removed. |
+| `socks stop <proxy_id>` | — | Stop a proxy by ID from the main menu, regardless of session. |
+| `tunnels` | `tunnels` | List active SOCKS proxies, session ID, channel count, and status. |
 
 ### General
 
@@ -553,7 +551,7 @@ TornadoRevC2 ships with **62 built-in plugins** organized by function. All enume
 
 > **`steal_token` vs `runas`:** `runas` requires credentials. `steal_token` reuses an existing logon token from another process on the same host — no credential input required, but admin/SYSTEM access is typically needed to reach the interesting tokens. `--pid` / `--user` impersonate the current thread (persistent only in interactive PowerShell sessions); `--spawn` / `--spawn-cmd` / `--spawn-shell` create an independent process that runs as the token owner and are the recommended, reliable modes.
 
-> **SOCKS reset modes:** `socks reset` performs a soft reset (relays aborted, remote streams purged, buffers cleared). `socks reset --hard` additionally kills the remote tunnel agent and redeploys it for a clean slate. Stopping a SOCKS proxy with `socks stop <proxy_id>` automatically removes the remote agent artifact and process when no other proxy uses the session.
+> **SOCKS reset modes:** `socks reset` performs a soft reset (relays aborted, remote streams purged, buffers cleared). `socks reset --hard` additionally kills the remote tunnel agent and redeploys it for a clean slate. `socks test` requires an already-running proxy for the session and will not deploy the agent on its own — start a proxy first with `socks <ID> <listen_port>`. Stopping the last proxy for a session with `socks stop` automatically terminates the agent (Windows: kill the `TNB_<token>` PowerShell child; Unix: `pkill` + `rm /tmp/.tornado_agent_*.py`).
 
 > **`preflight` is a pre-action check.** Run it before `steal_token`, `runas`, or any `inmemory` command. Its risk-assessment block tells the operator what will log the action before the action happens. If ScriptBlock logging is enabled, prefer `--spawn-shell` over PS-based flows; if AMSI is loaded and signed tooling is a concern, consider a different vector.
 
@@ -1062,7 +1060,6 @@ TornadoRevC2/
 ├── tornadorevc2.py                 Entry point
 ├── tornadorevc2/
 │   ├── handler.py                  Listeners, sessions, operator console
-│   ├── guardrails.py               Host deny list and operational guardrails
 │   ├── updater.py                  Git-based self-update and restart
 │   ├── sysinfo.py                  Host information collection
 │   ├── terminal.py                 PTY/TTY management (OPSEC-aware)
