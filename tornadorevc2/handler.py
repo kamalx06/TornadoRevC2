@@ -853,10 +853,16 @@ class TORNADOREVC2:
             rh_port=rh_port,
         )
 
-    def download_file(self, client_sock, remote_path, local_path, resume=False):
+    def download_file(self, client_sock, remote_path, local_path, resume=False,
+                      use_https_push=False, https_bind=None, rh_host=None,
+                      rh_port=None):
         return self.transfer.download_file(
             client_sock, remote_path, local_path,
             resume=resume,
+            use_https_push=use_https_push,
+            https_bind=https_bind,
+            rh_host=rh_host,
+            rh_port=rh_port,
         )
 
     def verify_file(self, client_sock, remote_path):
@@ -1111,6 +1117,7 @@ class TORNADOREVC2:
         opts = {
             'resume': False,
             'https': False,
+            'https_push': False,
             'https_bind': None,
             'rh_host': None,
             'rh_port': None,
@@ -1125,6 +1132,15 @@ class TORNADOREVC2:
 
             elif part in ('--https', '--http'):
                 opts['https'] = True
+                if i + 1 < len(cmd_parts):
+                    nxt = cmd_parts[i + 1]
+                    if (re.match(r'^[A-Za-z][A-Za-z0-9_-]*$', nxt)
+                            and len(nxt) < 20):
+                        opts['https_bind'] = nxt
+                        i += 1
+
+            elif part == '--https-push':
+                opts['https_push'] = True
                 if i + 1 < len(cmd_parts):
                     nxt = cmd_parts[i + 1]
                     if (re.match(r'^[A-Za-z][A-Za-z0-9_-]*$', nxt)
@@ -1233,11 +1249,18 @@ class TORNADOREVC2:
                         t_opts = self._parse_transfer_args(cmd_parts)
                         t_args = t_opts['args']
                         if len(t_args) >= 2:
-                            self.download_file(client_sock, t_args[0], t_args[1],
-                                               resume=t_opts['resume'])
+                            self.download_file(
+                                client_sock, t_args[0], t_args[1],
+                                resume=t_opts['resume'],
+                                use_https_push=t_opts['https_push'],
+                                https_bind=t_opts['https_bind'],
+                                rh_host=t_opts['rh_host'],
+                                rh_port=t_opts['rh_port'],
+                            )
                         else:
                             print(f"{self.colors['red']}Usage: download "
-                                  f"[--resume] <remote> <local>"
+                                  f"[--resume] [--https-push [iface]] "
+                                  f"[-RH host[:port]] <remote> <local>"
                                   f"{self.colors['end']}")
                         continue
 
@@ -1282,6 +1305,7 @@ class TORNADOREVC2:
     upload [--resume] <local> <remote>                Chunked upload with SHA256 verify
     upload --https [iface] [-RH host[:port]] <local> <remote>  HTTPS upload
     download [--resume] <remote> <local>              Chunked download with SHA256 verify
+    download --https-push [iface] [-RH host[:port]] <remote> <local>  HTTPS push download
     verify/hash <remote>                              Remote file size and SHA256""")
                         continue
 
@@ -1453,7 +1477,8 @@ class TORNADOREVC2:
                     t_args = t_opts['args']
                     if len(t_args) < 3:
                         print(f"{self.colors['red']}Usage: download "
-                              f"[--resume] <ID> <remote> <local>"
+                              f"[--resume] [--https-push [iface]] "
+                              f"[-RH host[:port]] <ID> <remote> <local>"
                               f"{self.colors['end']}")
                         continue
                     try:
@@ -1462,8 +1487,14 @@ class TORNADOREVC2:
                             print(f"{self.colors['red']}Client #{t_args[0]} "
                                   f"not active{self.colors['end']}")
                             continue
-                        self.download_file(client_sock, t_args[1], t_args[2],
-                                           resume=t_opts['resume'])
+                        self.download_file(
+                            client_sock, t_args[1], t_args[2],
+                            resume=t_opts['resume'],
+                            use_https_push=t_opts['https_push'],
+                            https_bind=t_opts['https_bind'],
+                            rh_host=t_opts['rh_host'],
+                            rh_port=t_opts['rh_port'],
+                        )
                     except ValueError:
                         print(f"{self.colors['red']}Invalid ID{self.colors['end']}")
                 elif cmd_lower in ('verify', 'hash'):
@@ -1519,6 +1550,7 @@ class TORNADOREVC2:
     upload [--resume] <ID> <local> <remote>                     Chunked upload with SHA256 verify
     upload --https [iface] [-RH host[:port]] <ID> <local> <remote>  HTTPS upload
     download [--resume] <ID> <remote> <local>                   Chunked download with SHA256 verify
+    download --https-push [iface] [-RH host[:port]] <ID> <remote> <local>  HTTPS push download
     verify/hash <ID> <remote>                                   Remote file size and SHA256
 
     {self.colors['yellow']}Inside a client shell, omit <ID> for session-targeted commands{self.colors['end']}""")

