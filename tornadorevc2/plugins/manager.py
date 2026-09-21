@@ -2,10 +2,9 @@
 
 
 
+import importlib
 import os
-
 import threading
-
 from typing import List, Optional, Set
 
 
@@ -79,15 +78,21 @@ class PluginManager:
 
 
     def rescan_plugins(self) -> tuple:
+        # Live discovery: files added after the handler started are not in
+        # Python's FileFinder caches, so importlib would raise
+        # ModuleNotFoundError for them even though os.listdir sees them.
+        # Invalidate every finder's directory snapshot before the scan.
+        importlib.invalidate_caches()
+
         new_names = []
-        already_loaded = set(self._loader.loaded_modules().keys())
 
         for module_path in self._loader.discover_builtin_modules():
-            is_new = module_path not in already_loaded
             if not self._loader.load_module(module_path, source='builtin'):
                 continue
-            if not is_new:
-                continue
+            # Enable any command the module registered that isn't enabled
+            # yet. This no longer keys off whether the module path was
+            # already known: after a repair re-import (see load_module),
+            # the path can be cached while its commands are not yet enabled.
             for name in self._loader.commands_for_module_path(module_path, 'builtin'):
                 with self._lock:
                     if name not in self._enabled:
@@ -95,10 +100,7 @@ class PluginManager:
                         new_names.append(name)
 
         for path in self._loader.discover_external_modules():
-            is_new = path not in already_loaded
             if not self._loader.load_module(path, source='external'):
-                continue
-            if not is_new:
                 continue
             for name in self._loader.commands_for_module_path(path, 'external'):
                 with self._lock:
@@ -308,10 +310,9 @@ class PluginManager:
 
 
 
+        importlib.invalidate_caches()
         if not self._loader.load_module(mod, source=source):
-
             print(f"{c['red']}Failed to load plugin '{name}'{c['end']}")
-
             return False
 
 

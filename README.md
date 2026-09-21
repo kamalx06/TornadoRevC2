@@ -62,6 +62,7 @@ TornadoRevC2 is a modular post-exploitation framework that handles sessions over
 | **Pivoting & tunneling** | SOCKS5 proxy through compromised sessions · Windows tunnel agent runs in-memory (C#, no disk artifact); Unix uses a Python agent under `/tmp` · `socks test` requires an already-running proxy and does not deploy the agent implicitly · Soft and hard tunnel reset (`socks reset [--hard]`) · Automatic remote agent cleanup on `socks stop` and session disconnect · Ligolo-NG and Chisel agent deployment with background persistence |
 | **Remote session establishment** | `make_token` — establish new sessions over SSH, WinRM, SMB, WMI, MSSQL, DCOM, or MySQL/MariaDB from the operator side, with password / NTLM-hash / SSH-key / WinRM-client-certificate authentication, MySQL UDF auto-loading, custom-command execution, and netexec integration |
 | **Impersonation** | `runas` — execute commands or spawn a TLS-encrypted shell as another user, local or remote, with domain support and netexec integration · `steal_token` — list processes and owners, impersonate another process's token, or spawn a cmd / reverse shell running as the token owner |
+| **Token privileges** | `enablepriv` — enable, disable, list, or toggle every privilege on the current Windows token via in-memory C# (`AdjustTokenPrivileges`), with `--list` / `--list-all` / `--all` modes |
 | **Enumeration** | Covering host triage, detection-environment preflight, network posture, credentials and browser metadata, Kerberos tickets, Linux internals (sudo configuration, writable filesystem targets, restricted-shell detection), Windows domain trusts, WMI persistence, loaded modules, and Windows domain and system configuration |
 | **Operational plugins** | Multi-pass secure file wiping · Hybrid file encryption · Shell history clearing · Windows event log clearing · Cross-platform keystroke capture with window context |
 | **Persistence** | Cross-platform backdoor installation using TLS-encrypted payloads — cron `@reboot` on Linux/Unix, Run registry on Windows |
@@ -451,7 +452,7 @@ Supported types: `py`, `ps`, `exe`, `elf`, `bat`, `sh`
 
 ## Built-in Plugins
 
-TornadoRevC2 ships with **62 built-in plugins** organized by function. All enumeration-related plugins are read-only unless noted otherwise.
+TornadoRevC2 ships with **63 built-in plugins** organized by function. All enumeration-related plugins are read-only unless noted otherwise.
 
 ### Host assessment & environment
 
@@ -541,6 +542,7 @@ TornadoRevC2 ships with **62 built-in plugins** organized by function. All enume
 | `historydel` | Cross-platform | Clear current user shell history files and related storage |
 | `eventlogdel` | Windows | Clear Windows Event Logs: defaults (Security, System, Application, PowerShell), a custom log list, or every log with records; optional .evtx backup |
 | `runas` | Windows | Execute commands or launch a TLS-encrypted reverse shell *on the current host* as another user, with saved credential management and domain support |
+| `enablepriv` | Windows | Enable or disable any privilege on the current process token via `AdjustTokenPrivileges`. The C# helper is compiled in memory with `Add-Type`; no file is written to disk. Modes: `--list` (privileges present in the token), `--list-all` (standard `SeXxxPrivilege` catalogue merged with token state), `--vuln` (held privileges grouped by security significance), a single privilege by name, and `--all` / `--all --disable` for the whole token in one round trip. Names normalise in C# (`debug` → `SeDebugPrivilege`). Changes are token-scoped and revert when the shell exits. |
 | `ligolong` | Cross-platform | Deploy Ligolo-NG tunneling agent to Linux/Windows targets with background persistence |
 | `chisel` | Cross-platform | Deploy Chisel tunneling agent in reverse (client) or bind (server) mode; supports SOCKS5 and background persistence |
 | `persistence` | Cross-platform | Install a persistent reverse shell backdoor (cron @reboot / Run registry) using TLS-encrypted payload |

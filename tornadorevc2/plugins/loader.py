@@ -54,9 +54,11 @@ class PluginLoader:
         self._external_paths: Dict[str, str] = {}
 
     def discover_builtin_modules(self) -> List[str]:
+        importlib.invalidate_caches()
         return list(_scan_builtin_plugin_modules())
 
     def discover_external_modules(self) -> List[str]:
+        importlib.invalidate_caches()
         found = []
         if not os.path.isdir(EXTERNAL_PLUGIN_DIR):
             return found
@@ -70,10 +72,38 @@ class PluginLoader:
                 found.append(path)
         return found
 
+    def _module_has_commands(self, module_path: str, source: str) -> bool:
+        """True if the registry holds at least one command from this module."""
+        if source == 'builtin':
+            name = module_path
+        else:
+            name = _external_spec_name(module_path)
+        for cmd in get_registry().all_commands().values():
+            if cmd.module == name:
+                return True
+        return False
+
     def load_module(self, module_path: str, source: str = 'builtin') -> bool:
         with self._lock:
-            if module_path in self._loaded_modules:
+            cached = module_path in self._loaded_modules
+            # A cache hit is only trusted when the registry actually holds
+            # commands from the module. Otherwise the module was imported
+            # earlier in a state that never reached @plugin.command (or
+            # was edited since), and returning True here would mask that.
+            if cached and self._module_has_commands(module_path, source):
                 return True
+            if cached:
+                # Evict our own bookkeeping and the interpreter's cache so
+                # the next import re-executes the file from disk.
+                self._loaded_modules.pop(module_path, None)
+                if source == 'builtin':
+                    sys.modules.pop(module_path, None)
+                else:
+                    name = os.path.splitext(os.path.basename(module_path))[0]
+                    if os.path.isdir(module_path):
+                        name = os.path.basename(module_path.rstrip(os.sep))
+                    self._external_paths.pop(name, None)
+                    sys.modules.pop(_external_spec_name(module_path), None)
             try:
                 if source == 'builtin':
                     importlib.import_module(module_path)
