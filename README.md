@@ -1,6 +1,6 @@
 # TornadoRevC2
 
-A lightweight, modular post-exploitation framework for authorized security research, red-team operations, and penetration testing. TornadoRevC2 manages reverse shell sessions on Linux and Windows hosts through a unified operator console, extending core session handling with a cross-platform plugin architecture for host enumeration, situational awareness, and operational tasks.
+A lightweight, modular post-exploitation framework for authorized security research, red-team operations, and penetration testing. TornadoRevC2 manages interactive reverse shell and bind shell sessions on Linux and Windows hosts through a unified operator console, across plain TCP, server-authenticated TLS, and mutually authenticated TLS transports. Core session handling is extended by a cross-platform plugin architecture for host enumeration, situational awareness, and operational tasks.
 
 > **Important:** TornadoRevC2 is a session handler and post-exploitation framework—not a beacon-style command-and-control platform. It prioritizes reliable interactive shells, structured operator workflows, and on-demand plugin execution over persistent agent infrastructure.
 
