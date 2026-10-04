@@ -9,3 +9,4 @@ chisel_binaries/
 mtls_certs/
 tls_certs/
 winrm-certs/
+Beacon-Object-File-Library/
