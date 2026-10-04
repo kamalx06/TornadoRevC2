@@ -536,6 +536,7 @@ TornadoRevC2 ships with **63 built-in plugins** organized by function. All enume
 | Plugin | Platform | Description |
 |--------|----------|-------------|
 | `inmemory` | Cross-platform | In-memory payload execution (`py`, `ps`, `exe`, `elf`, `bat`, `sh`) |
+| `bofloader` | Windows | In-memory BOF (COFF) execution via a C# loader compiled once per session. Operator subcommands: `import <cna>`, `delete`, `list`, `compile`, `info`, `execute`. Registers CNA aliases as `bof <name>` commands (persisted to `.tornadorevc2_bofs.json`). Full AMD64 COFF support with Beacon API surface (`BeaconPrintf`, `BeaconData*`, `BeaconFormat*`, token/admin helpers). OPSEC: AMSI/ETW patches, no RWX, COFF zeroed, VEH, randomized markers |
 | `make_token` | Cross-platform | Establish C2 sessions *to other hosts* over SSH, WinRM, SMB, WMI, MSSQL, DCOM, or MySQL/MariaDB using passwords, NTLM hashes, SSH keys, WinRM client certs, netexec, and MySQL UDF auto-loading. Supports custom commands (`-C`). |
 | `nullcrypt` | Cross-platform | Hybrid encrypt a file (AES-GCM + RSA-wrapped key) then securely wipe the original via wiper |
 | `wiper` | Cross-platform | Configurable multi-pass secure overwrite (rename, truncate, delete); profiles: quick, standard, dod, thorough, shred |

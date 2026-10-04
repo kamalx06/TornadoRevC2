@@ -1275,6 +1275,16 @@ class TORNADOREVC2:
                     if cmd_lower in ('run', 'plugins'):
                         if self.plugins.handle_command(cmd_parts, client_sock=client_sock):
                             continue
+                    if cmd_lower == 'bof':
+                        try:
+                            from .plugins.windows.bofloader import dispatch_bof_command
+                            dispatch_bof_command(self, cmd_parts, client_sock=client_sock)
+                        except ImportError:
+                            print(f"{self.colors['red']}bofloader plugin is not loaded — "
+                                  f"'bof' unavailable{self.colors['end']}")
+                        except Exception as e:
+                            print(f"{self.colors['red']}BOF dispatch error: {e}{self.colors['end']}")
+                        continue
 
                     if cmd_lower == 'help':
                         print(f"""
@@ -1300,6 +1310,7 @@ class TORNADOREVC2:
     plugins / plugins list                            List registered plugins
     plugins load|unload|reload|rescan|info <name>     Manage plugins at runtime
     run <plugin> [args...]                            Execute a plugin on this session
+    bof <name> [args...]          Run a registered BOF from inside a session
 
     {self.colors['green']}FILE TRANSFER:{self.colors['end']}
     upload [--resume] <local> <remote>                Chunked upload with SHA256 verify
@@ -1440,6 +1451,15 @@ class TORNADOREVC2:
                     pass
                 elif self.tunnels.handle_main_command(cmd_parts):
                     pass
+                elif cmd_lower == 'bof':
+                    try:
+                        from .plugins.windows.bofloader import dispatch_bof_command
+                        dispatch_bof_command(self, cmd_parts, client_sock=None)
+                    except ImportError:
+                        print(f"{self.colors['red']}bofloader plugin is not loaded — "
+                              f"'bof' unavailable{self.colors['end']}")
+                    except Exception as e:
+                        print(f"{self.colors['red']}BOF dispatch error: {e}{self.colors['end']}")
                 elif cmd_lower == 'upload':
                     t_opts = self._parse_transfer_args(cmd_parts)
                     t_args = t_opts['args']
@@ -1527,6 +1547,7 @@ class TORNADOREVC2:
     plugins / plugins list                                   List registered plugins
     plugins load|unload|reload|rescan|info <name>            Manage plugins at runtime
     run <plugin> <ID>                                        Execute a plugin on a session
+    bof <ID> <name> [args...]     Run a registered BOF from a session
 
     {self.colors['green']}INTERNAL PIVOTING (SOCKS5):{self.colors['end']}
     socks <ID> <listen_port>                                 Start SOCKS5 proxy via session
