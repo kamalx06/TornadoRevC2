@@ -45,7 +45,7 @@ Use this software only on systems you own or on systems where you have **explici
 
 ## Introduction
 
-TornadoRevC2 is a modular post-exploitation framework that handles sessions over two transports: **reverse shells** (target dials the handler over plain TCP, server-authenticated TLS, or mutual TLS with client-certificate verification) and **bind shells** (the handler dials the target, over plain TCP or TLS). Both transports produce sessions that flow through the same probe, plugin, transfer, and reporting pipeline — there is no functional difference to the operator once a session is established. The framework provides a unified operator console for session management, host reconnaissance, chunked file transfer, in-memory payload execution, SOCKS5 pivoting, plugin-driven post-exploitation, structured reporting, and a built-in `update` command for automatic Git-based updates and seamless handler restarts. Originally developed as a lightweight reverse shell handler, the project has evolved into an extensible framework in which capabilities such as firewall enumeration, credential store metadata collection, network mapping, browser profiling, and additional post-exploitation functionality are implemented as independent, modular plugins. The framework also includes the `make_token` plugin for establishing new C2 sessions via remote protocols (SSH, WinRM, SMB, WMI, MSSQL, DCOM, and MySQL/MariaDB) using command-line tools from the operator side, and an `upgrade_mtls` plugin that migrates a live session onto the mutual-TLS listener by pushing the handler's client certificate bundle to the target.
+TornadoRevC2 is a modular post-exploitation framework that handles sessions over two directions — **reverse shells** (target dials the handler over plain TCP, server-authenticated TLS, or mutual TLS with client-certificate verification) and **bind shells** (the handler dials the target, over plain TCP or TLS) — and, for any established session, a **switchable secondary transport** over HTTPS: HTTP/2 on modern clients, HTTP/1.1 chunked on legacy clients, both over TLS on a dedicated listener. All three flows produce sessions that pass through the same probe, plugin, transfer, and reporting pipeline — there is no functional difference to the operator once a session is established, and the operator can move a live session between the primary shell channel and the HTTPS channel with `http2switch` / `backtoshell`. The framework provides a unified operator console for session management, host reconnaissance, chunked file transfer, in-memory payload execution, SOCKS5 pivoting, plugin-driven post-exploitation, structured reporting, and a built-in `update` command for automatic Git-based updates and seamless handler restarts. Originally developed as a lightweight reverse shell handler, the project has evolved into an extensible framework in which capabilities such as firewall enumeration, credential store metadata collection, network mapping, browser profiling, and additional post-exploitation functionality are implemented as independent, modular plugins. The framework also includes the `make_token` plugin for establishing new C2 sessions via remote protocols (SSH, WinRM, SMB, WMI, MSSQL, DCOM, and MySQL/MariaDB) using command-line tools from the operator side, and an `upgrade_mtls` plugin that migrates a live session onto the mutual-TLS listener by pushing the handler's client certificate bundle to the target.
 
 **Supported target platforms:** Linux and Windows (primary), with compatibility for generic Unix and BSD environments where applicable.
 
@@ -56,6 +56,7 @@ TornadoRevC2 is a modular post-exploitation framework that handles sessions over
 | Category | Capabilities |
 |----------|-------------|
 | **Session handling** | Multi-client TCP / TLS / mTLS listeners with automatic PKI bootstrapping · On-demand mTLS upgrade for live sessions · **Bind shell support** — dial a target listening on TCP or TLS · Interactive PTY/TTY shells · Session fingerprinting and reconnect tracking |
+| **Secondary transport** | **Switchable HTTPS channel** — `http2switch <ID>` spawns an HTTP/2 or HTTP/1.1 agent on the target and flips the active transport; `backtoshell <ID>` closes the stream and reverts; `transport <ID>` shows the live state of both channels · Dual-stack listener negotiates h2 and http/1.1 via ALPN · Windows agents run in `Start-Job`, Linux agents in their own session group, so the primary shell is never blocked · Bind interface can be an IP or an interface name (`tun0`, `eth0`); auto-detected when omitted |
 | **Operational security** | Shell history suppression on Linux and Windows · No `pty.spawn` or `Invoke-Expression` in command paths · Session-scoped probe markers · Jitter between automated commands · PTY upgrade verification (falls back to the original shell when bash handoff fails) |
 | **File transfer** | Chunked upload with resume · Chunked download with resume · SHA-256 integrity verification · Optional HTTPS transport for upload (`--https`) and push-style download (`--https-push`), with target-interface binding and callback address override |
 | **Payload execution** | In-memory execution for `py`, `ps`, `exe`, `elf`, `bat`, and `sh` — with memfd-based ELF execution (modern and legacy fallbacks) and subsystem-aware PE loading |
@@ -154,15 +155,16 @@ TornadoRevC2 does **not** claim to evade EDR, AMSI, ScriptBlock logging, or memo
 ┌─────────────────────────────────────────────────────────────────┐
 │                     Operator Console (handler)                  │
 │  Sessions · Transfers · SOCKS · Plugins · Logging · Export ·    │
-│  update                                                         │
-└────────────────────────────┬────────────────────────────────────┘
-                             │
-        REVERSE  TCP / TLS / mTLS        BIND  TCP / TLS
-        target ──────────────► handler   handler ──────────────► target
-                             │
-                             │  (both directions produce
-                             │   identical session objects)
-                             ▼
+│  transport switching · update                                   │
+└──────────┬──────────────────┬───────────────────┬───────────────┘
+           │                  │                     │
+  REVERSE  TCP/TLS/mTLS   BIND  TCP/TLS      HTTPS  h2 or http/1.1
+  target ──► handler    handler ──► target  (switchable, same session)
+           │                  │                   │
+           └──────────┬───────┴───────────────────┘
+                      │  (all directions produce
+                      │   identical session objects)
+                      ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                        Target Host                              │
 │  Native commands · PowerShell · inline collectors               │
@@ -176,11 +178,14 @@ TornadoRevC2 runs **three independent listeners simultaneously**, so implants ca
 
 | Listener | Default port | Flag | Authentication | Certificates |
 |----------|--------------|------|----------------|--------------|
-| TCP      | `4444`       | `-p` | None           | None |
+| TCP      | `4444`       | `-p`  | None           | None |
 | TLS      | `8443`       | `-tp` | Server-authenticated | `tls_certs/server.pem`, `tls_certs/server.key` |
 | mTLS     | `9443`       | `-mp` | Mutual (client cert required) | `mtls_certs/` bundle (CA + server + client) |
+| HTTPS    | *(disabled)* | `--h2-port` | Server-authenticated (target skips verify) | Reuses `tls_certs/server.pem` and `server.key` |
 
-The `-H` flag sets the bind address shared by all three listeners. All three can be enabled at once; disabling one is not currently required — leave the port free or unbound to ignore it.
+The `-H` flag sets the bind address shared by all listeners. All four can be enabled at once; disabling one is not currently required — leave the port free or unbound to ignore it.
+
+The **HTTPS listener** is opt-in and only started when `--h2-port` is passed. It terminates HTTP/2 and HTTP/1.1 over TLS in one context; ALPN decides which. It is not a reverse-shell listener — it accepts only `POST /c2/<token>`, where `<token>` matches a session the operator has already switched with `http2switch`. See [Transport switching](#transport-switching).
 
 The three listeners handle inbound **reverse shells**. **Bind shells** use the opposite flow — the handler dials a target that is already listening. They are initiated from the main handler prompt with `bind <host> <port>`, over plain TCP or TLS. Bind shell sessions use the same `handle_client` code path as reverse shells, so probes, plugins, file transfers, SOCKS pivoting, and logging all work identically without additional setup. Only the direction flag differs, and it is displayed in `status`.
 
@@ -297,6 +302,9 @@ run credstore 1                   # Credential store metadata
 run memorymap 1 1234              # Process memory maps (requires PID)
 run inmemory 1 sh ./linpeas.sh    # In-memory script execution
 run upgrade_mtls 1 --port 9443    # Migrate session to the mTLS listener
+http2switch 1                     # Switch session 1 to the HTTPS secondary channel
+transport 1                       # Show which channel is active
+backtoshell 1                     # Close the HTTPS channel, revert to the shell
 upload --https eth0 1 ./tool "C:\Temp\tool.exe"       # HTTPS upload
 download --https-push 1 /var/log/auth.log ./auth.log  # HTTPS push download
 update                            # Pull latest from GitHub and restart (Git installs)
@@ -322,6 +330,29 @@ The `update` command is available from the main handler prompt only. It verifies
 | `rename <ID> <name>` / `rn <ID> <name>` | Assign a friendly name |
 | `sysinfo <ID> [--stealth\|--full]` | Collect or refresh host information |
 | `export <ID>` | Export an HTML session transcript |
+
+### Transport switching
+
+A session's primary channel is the reverse or bind shell. HTTP/2 and HTTP/1.1 are optional **secondary** channels that carry the same commands and output, over a dedicated TLS listener. The primary channel is never torn down during a switch; both stay attached to the same logical session, and the operator chooses which carries commands with two commands.
+
+| Command | In-session form | Description |
+|---------|-----------------|-------------|
+| `http2switch <ID> [--rh <ip\|iface>]` | `http2switch [--rh <ip\|iface>]` | Spawn the HTTPS agent on the target and flip the active transport. If `--rh` is omitted the handler asks the kernel which local address reaches the target, then falls back to the session's local endpoint. `--rh` accepts an IPv4 address or an interface name (`tun0`, `eth0`). |
+| `backtoshell <ID>` | `backtoshell` | Send an `exit` on the HTTPS stream, close it, and revert the active transport to the shell. |
+| `transport <ID>` | `transport` | Print the current active transport and the alive/dead state of both sockets, including the peer address of the last send. |
+
+**Agent selection is automatic** based on a preflight probe of the target:
+
+| Target | Agent |
+|--------|-------|
+| Windows, PowerShell 7+ | HTTP/2 via `HttpClient` inside a `Start-Job` |
+| Windows, PowerShell 5.x | HTTP/1.1 chunked via `HttpWebRequest` inside a `Start-Job` |
+| Linux / Unix with `python3` | Python `h2` agent, `pip install --user` if the library is missing |
+| Linux / Unix without `h2` and without pip | Python agent falls back to a stdlib-only HTTP/1.1 chunked transport |
+
+**Session-log evidence.** Every command is tagged with the transport that actually carried it. `logs/<session>/session.log` shows `cmd[shell] …` and `cmd[http2] …` lines correlated with the operator's input, so the switch can be verified without trusting the handler's own bookkeeping.
+
+**Auto-revert.** If the HTTP/2 stream closes for any reason, the handler calls `cleanup_client` on the bridge, reverts `active_transport` to `shell`, and prints `Secondary transport on #N closed — reverted to shell`. If the primary shell dies while HTTP/2 is still up, the handler promotes HTTP/2 automatically and prints `Primary shell closed on #N — HTTP/2 transport still active`.
 
 ### Bind shells
 
@@ -388,10 +419,6 @@ Both HTTPS transports use the handler's existing `tls_certs/server.pem` and `tls
 
 **Remote path resolution:** if the remote path refers to a directory (either ends with a separator, or exists as a directory on the target), the local file's basename is appended automatically. So `upload 1 ./report.md /tmp/` writes to `/tmp/report.md`, and `upload 1 ./report.md C:\Users\Alice` writes to `C:\Users\Alice\report.md`.
 
-
-**REPLACE WITH:**
-
-```markdown
 **Example:**
 
 ```bash
@@ -452,7 +479,7 @@ Supported types: `py`, `ps`, `exe`, `elf`, `bat`, `sh`
 
 ## Built-in Plugins
 
-TornadoRevC2 ships with **63 built-in plugins** organized by function. All enumeration-related plugins are read-only unless noted otherwise.
+TornadoRevC2 ships with **65 built-in plugins** organized by function. All enumeration-related plugins are read-only unless noted otherwise.
 
 ### Host assessment & environment
 
@@ -536,7 +563,7 @@ TornadoRevC2 ships with **63 built-in plugins** organized by function. All enume
 | Plugin | Platform | Description |
 |--------|----------|-------------|
 | `inmemory` | Cross-platform | In-memory payload execution (`py`, `ps`, `exe`, `elf`, `bat`, `sh`) |
-| `bofloader` | Windows | In-memory BOF (COFF) execution via a C# loader compiled once per session. Operator subcommands: `import <cna>`, `delete`, `list`, `compile`, `info`, `execute`. Registers CNA aliases as `bof <name>` commands (persisted to `.tornadorevc2_bofs.json`). Full AMD64 COFF support with Beacon API surface (`BeaconPrintf`, `BeaconData*`, `BeaconFormat*`, token/admin helpers). OPSEC: AMSI/ETW patches, no RWX, COFF zeroed, VEH, randomized markers |
+| `bofloader` | Windows | In-memory BOF (COFF) execution via a C# loader compiled once per session. Operator subcommands: `import <cna>` / `import <file.o>` / `import <dir>`, `delete`, `list`, `compile` (C and C++, x64 and x86 via mingw, `--arch x64|x86|both`), `info`, `execute`. Registers CNA aliases and compiled `.o` files as `bof <name>` commands (persisted to `.vscode` / `logs/.tornadorevc2_bofs.json`). Source-driven pre-flight probes only the `#include` lines present in the source and reports missing headers with per-distro install commands. AMSI bypass is delegated to the `amsi_bypass` plugin and skipped when the session already carries a matching mode. OPSEC: no RWX, COFF zeroed, VEH, randomized markers, gzip+deflate payloads |
 | `make_token` | Cross-platform | Establish C2 sessions *to other hosts* over SSH, WinRM, SMB, WMI, MSSQL, DCOM, or MySQL/MariaDB using passwords, NTLM hashes, SSH keys, WinRM client certs, netexec, and MySQL UDF auto-loading. Supports custom commands (`-C`). |
 | `nullcrypt` | Cross-platform | Hybrid encrypt a file (AES-GCM + RSA-wrapped key) then securely wipe the original via wiper |
 | `wiper` | Cross-platform | Configurable multi-pass secure overwrite (rename, truncate, delete); profiles: quick, standard, dod, thorough, shred |
@@ -544,6 +571,7 @@ TornadoRevC2 ships with **63 built-in plugins** organized by function. All enume
 | `eventlogdel` | Windows | Clear Windows Event Logs: defaults (Security, System, Application, PowerShell), a custom log list, or every log with records; optional .evtx backup |
 | `runas` | Windows | Execute commands or launch a TLS-encrypted reverse shell *on the current host* as another user, with saved credential management and domain support |
 | `enablepriv` | Windows | Enable or disable any privilege on the current process token via `AdjustTokenPrivileges`. The C# helper is compiled in memory with `Add-Type`; no file is written to disk. Modes: `--list` (privileges present in the token), `--list-all` (standard `SeXxxPrivilege` catalogue merged with token state), `--vuln` (held privileges grouped by security significance), a single privilege by name, and `--all` / `--all --disable` for the whole token in one round trip. Names normalise in C# (`debug` → `SeDebugPrivilege`). Changes are token-scoped and revert when the shell exits. |
+| `amsi_bypass` | Windows | Apply, inspect, or clear the AMSI bypass on a live session. Modes: `context` (default — nulls `amsiContext` and sets `amsiInitFailed`; works on PS 5.1 and PS 7), `hwbp` (hardware breakpoint on `AmsiScanBuffer` + VEH — no code bytes modified, defeats code-integrity scanners), and `none`. Subcommands: `apply`, `status`, `list`, `clear`. Per-session state is shared with `bofloader`, which delegates to this plugin and skips re-applying a matching mode. |
 | `ligolong` | Cross-platform | Deploy Ligolo-NG tunneling agent to Linux/Windows targets with background persistence |
 | `chisel` | Cross-platform | Deploy Chisel tunneling agent in reverse (client) or bind (server) mode; supports SOCKS5 and background persistence |
 | `persistence` | Cross-platform | Install a persistent reverse shell backdoor (cron @reboot / Run registry) using TLS-encrypted payload |
@@ -1075,6 +1103,7 @@ TornadoRevC2/
 │   ├── terminal_sanitize.py        ANSI/OSC/DCS sequence stripping
 │   ├── export.py                   HTML transcript export
 │   ├── payloads.py                 Built-in payload catalog
+│   ├── http2_transport.py          HTTP/2 + HTTP/1.1 dual-stack secondary listener
 │   └── plugins/
 │       ├── api.py                  SessionContext and plugin registration
 │       ├── manager.py              Plugin lifecycle and execution
@@ -1090,13 +1119,18 @@ TornadoRevC2/
 
 ## TLS & mTLS Configuration
 
-TornadoRevC2 runs three isolated listeners, each with its own certificate source. Everything under `tls_certs/` and `mtls_certs/` is auto-generated on first run and never overwritten once the full bundle is present.
+TornadoRevC2 runs three isolated reverse-shell listeners plus an optional HTTPS secondary listener. Everything under `tls_certs/` and `mtls_certs/` is auto-generated on first run and never overwritten once the full bundle is present.
 
 | Listener | Port | Client auth | Certificates |
 |----------|------|-------------|--------------|
 | TCP | `4444` | none | — |
 | TLS | `8443` | server-only | `tls_certs/server.pem`, `tls_certs/server.key` |
 | mTLS | `9443` | mutual (client certificate required) | `mtls_certs/` bundle |
+| HTTPS (h2 + http/1.1) | `--h2-port` (default: disabled) | server-only; target skips verify | reuses `tls_certs/server.pem` + `server.key` |
+
+### HTTPS secondary listener
+
+Started only when `--h2-port <port>` is passed. The listener terminates HTTP/2 and HTTP/1.1 over TLS on a single socket and negotiates the protocol via ALPN (`h2` preferred; `http/1.1` accepted as a fallback for PowerShell 5.1 targets). Both protocols run over the same hardened TLS context as the primary TLS listener: TLS 1.2 floor, TLS 1.3 ceiling where available, the same cipher list, and the same `OP_NO_COMPRESSION` / `OP_NO_RENEGOTIATION` flags.
 
 ### TLS
 
@@ -1175,6 +1209,7 @@ run upgrade_mtls
 |------|---------|
 | `-H` / `--host` | `0.0.0.0` |
 | `-p` / `--port` | `4444` |
+| `--h2-port` | *(disabled)* |
 | `-tp` / `--tls-port` | `8443` |
 | `-mp` / `--mtls-port` | `9443` |
 | `-c` / `--cert`, `-k` / `--key` | `tls_certs/server.{pem,key}` |
