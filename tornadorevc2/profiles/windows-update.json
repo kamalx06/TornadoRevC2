@@ -1,0 +1,10 @@
+{
+  "http2": {
+    "user_agent": "Windows-Update-Agent/10.0.10011.16384 Client-Protocol/2.50",
+    "linux_user_agent": "Windows-Update-Agent/10.0.10011.16384 Client-Protocol/2.50",
+    "uri_pattern": "/msdownload/update/software/defu/{token}?s={proof}&rev=1"
+  },
+  "http1": {
+    "user_agent": "Windows-Update-Agent/10.0.10011.16384 Client-Protocol/2.50"
+  }
+}

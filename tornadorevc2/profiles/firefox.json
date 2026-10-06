@@ -1,0 +1,10 @@
+{
+  "http2": {
+    "user_agent": "Mozilla/5.0 (X11; Linux x86_64; rv:115.0) Gecko/20100101 Firefox/115.0",
+    "linux_user_agent": "Mozilla/5.0 (X11; Linux x86_64; rv:115.0) Gecko/20100101 Firefox/115.0",
+    "uri_pattern": "/v1/fxaccounts/profile/{token}?s={proof}&service=sync"
+  },
+  "http1": {
+    "user_agent": "Mozilla/5.0 (X11; Linux x86_64; rv:115.0) Gecko/20100101 Firefox/115.0"
+  }
+}

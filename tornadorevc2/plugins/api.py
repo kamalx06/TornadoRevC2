@@ -168,16 +168,51 @@ class SessionContext:
                 self._client_sock, '', "$PWD.Path", 'windows', timeout=5.0, strip_ws=False,
             )
         else:
+            # `pwd` on its own matches the in-process `__pwd` verb and is
+            # served by the Linux HTTP/2 agent without spawning a child.
+            # The redirect that used to be here broke the regex match.
             payload = self._handler._run_marked(
-                self._client_sock, 'pwd 2>/dev/null', '', 'unix', timeout=5.0, strip_ws=False,
+                self._client_sock, 'pwd', '', 'unix', timeout=5.0, strip_ws=False,
             )
         return (payload or '').strip()
 
     def run_shell(self, cmd: str, timeout: float = 15.0) -> str:
         self._handler._flush_shell(self._client_sock)
+        # Try the in-process route first. Commands that match a supported
+        # verb (cat, ls, env, ps, pwd, whoami, id, hostname, uname) are
+        # served by the HTTP/2 agent without spawning a child process.
+        # Everything else falls through to the shell exactly as before.
+        data, used_inproc = self._handler.run_command_smart(
+            self._client_sock, cmd, timeout=timeout,
+        )
+        if used_inproc:
+            return data.decode('utf-8', errors='replace')
         if not self._handler.send_to_revshell(self._client_sock, cmd):
             return ''
         return self._handler.recv_output(self._client_sock, timeout=timeout)
+
+    def inproc_read_file(self, path: str, timeout: float = 10.0):
+        """
+        Read a remote file via the in-process agent. Returns bytes, or
+        None when the active transport is not an HTTP/2 bridge to a
+        Linux agent. Callers should fall back to `run_shell("cat <path>")`
+        when None is returned.
+        """
+        return self._handler._inproc_read_file(
+            self._client_sock, path, timeout=timeout,
+        )
+
+    def inproc_list(self, path: str = '/', timeout: float = 5.0):
+        """
+        List a remote directory via the in-process agent. Returns a list
+        of {name, type, size, mode} dicts, or None when the active
+        transport is not an HTTP/2 bridge to a Linux agent. Callers
+        should fall back to `run_shell("ls <path>")` when None is
+        returned.
+        """
+        return self._handler._inproc_list(
+            self._client_sock, path, timeout=timeout,
+        )
 
     def run_shell_streaming(
         self,

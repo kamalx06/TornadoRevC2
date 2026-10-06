@@ -22,11 +22,11 @@ MAIN_COMMANDS = (
     'rename', 'rn', 'upload', 'download', 'verify', 'hash', 'sysinfo',
     'clear', 'cls', 'bof', 'http2switch', 'backtoshell', 'transport',
     'socks', 'tunnels', 'export', 'plugins', 'run', 'update',
-    'help', 'exit', 'quit', 'e', 'q',
+    'help', 'exit', 'quit', 'e', 'q', 'smblateral', 'smbswitch', 'profiles',
 )
 CLIENT_COMMANDS = (
     'upload', 'download', 'verify', 'hash', 'sysinfo', 'help',
-    'socks', 'tunnels', 'export', 'plugins', 'run',
+    'socks', 'tunnels', 'export', 'plugins', 'run', 'smbswitch', 'profiles',
     'exit', 'quit', 'e', 'q', 'bof', 'http2switch', 'backtoshell', 'transport',
 )
 ID_COMMANDS = {
