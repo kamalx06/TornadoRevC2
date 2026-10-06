@@ -20,14 +20,14 @@ CHUNK_SIZE = {'windows': 5632, 'unix': 262144, 'unknown': 65536}
 MAIN_COMMANDS = (
     'switch', 'kill', 'status', 'ls', 'sessions', 'reconnects', 'bind', 'payloads',
     'rename', 'rn', 'upload', 'download', 'verify', 'hash', 'sysinfo',
-    'clear', 'cls', 'bof',
+    'clear', 'cls', 'bof', 'http2switch', 'backtoshell', 'transport',
     'socks', 'tunnels', 'export', 'plugins', 'run', 'update',
     'help', 'exit', 'quit', 'e', 'q',
 )
 CLIENT_COMMANDS = (
     'upload', 'download', 'verify', 'hash', 'sysinfo', 'help',
     'socks', 'tunnels', 'export', 'plugins', 'run',
-    'exit', 'quit', 'e', 'q', 'bof',
+    'exit', 'quit', 'e', 'q', 'bof', 'http2switch', 'backtoshell', 'transport',
 )
 ID_COMMANDS = {
     'switch', 'kill', 'rename', 'rn', 'upload', 'download', 'verify',

