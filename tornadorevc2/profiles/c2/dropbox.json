@@ -1,0 +1,18 @@
+{
+  "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Dropbox/180.4.4913 Chrome/120.0.6099.291 Electron/28.2.0 Safari/537.36",
+  "linux_user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Dropbox/180.4.4913 Chrome/120.0.6099.291 Electron/28.2.0 Safari/537.36",
+  "beacon_path": "/api/2/users/get_current_account",
+  "tasks_path": "/api/2/files/list_folder",
+  "results_path": "/api/2/files/upload",
+  "extra_headers": {
+    "Accept": "application/json",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Origin": "https://www.dropbox.com",
+    "Referer": "https://www.dropbox.com/home",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin"
+  },
+  "request_headers": {}
+}
