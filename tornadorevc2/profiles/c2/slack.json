@@ -1,0 +1,15 @@
+{
+  "user_agent": "Slack/4.36.140 (Windows NT 10.0; Win64; x64)",
+  "linux_user_agent": "Slack/4.36.140 (Linux 6.5.0; x86_64)",
+
+  "beacon_path":  "/api/client.connect",
+  "tasks_path":   "/api/rtm.start",
+  "results_path": "/api/events.send",
+
+  "extra_headers": {
+    "Accept": "*/*",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Origin": "app.slack.com"
+  },
+  "request_headers": {}
+}

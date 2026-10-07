@@ -23,6 +23,24 @@ MAIN_COMMANDS = (
     'clear', 'cls', 'bof', 'http2switch', 'backtoshell', 'transport',
     'socks', 'tunnels', 'export', 'plugins', 'run', 'update',
     'help', 'exit', 'quit', 'e', 'q', 'smblateral', 'smbswitch', 'profiles',
+    'beacons', 'bl', 'beacon', 'beacon-build', 'bbuild',
+    'beacon-rm', 'beacon-forget',
+)
+
+# Commands offered by TAB completion inside the beacon submenu
+# (`beacon <ID>`). Native verbs (ls, cat, ps, id, ...) are
+# intentionally omitted — operators type those without prompting.
+# This list is only the meta commands and the non-native verbs that
+# are easy to forget.
+BEACON_COMMANDS = (
+    'help', 'exit', 'quit', 'detach',
+    'info', 'tasks', 'wait',
+    'sleep', 'workhours', 'wh',
+    'kill', 'forget', 'remove',
+    'upload', 'download',
+    'execmem', 'bof', 'bof-list',
+    'pyexec', 'psexec', 'shexec',
+    'exec', 'export',
 )
 CLIENT_COMMANDS = (
     'upload', 'download', 'verify', 'hash', 'sysinfo', 'help',

@@ -2,7 +2,7 @@
 
 A lightweight, modular post-exploitation framework for authorized security research, red-team operations, and penetration testing. TornadoRevC2 manages interactive reverse shell and bind shell sessions on Linux and Windows hosts through a unified operator console, across plain TCP, server-authenticated TLS, and mutually authenticated TLS transports. Core session handling is extended by a cross-platform plugin architecture for host enumeration, situational awareness, and operational tasks.
 
-> **Important:** TornadoRevC2 is a session handler and post-exploitation framework—not a beacon-style command-and-control platform. It prioritizes reliable interactive shells, structured operator workflows, and on-demand plugin execution over persistent agent infrastructure.
+> **Important:** TornadoRevC2 runs two complementary session models in the same process. The **shell handler** prioritizes reliable interactive sessions, structured operator workflows, and on-demand plugin execution. The **beacon subsystem** adds a pull-based compiled agent for long-haul engagements that need scheduling, self-destruct, and network resilience rather than a live socket. Both share the operator console, TLS material, and logging infrastructure; neither requires the other. See [Beacon Subsystem](#beacon-subsystem).
 
 ---
 
@@ -35,6 +35,7 @@ Use this software only on systems you own or on systems where you have **explici
 - [Quick Start](#quick-start)
 - [Operator Reference](#operator-reference)
 - [Built-in Plugins](#built-in-plugins)
+- [Beacon Subsystem](#beacon-subsystem)
 - [Plugin Development](#plugin-development)
 - [Session Logging](#session-logging)
 - [Project Structure](#project-structure)
@@ -45,7 +46,41 @@ Use this software only on systems you own or on systems where you have **explici
 
 ## Introduction
 
-TornadoRevC2 is a modular post-exploitation framework that handles sessions over two directions — **reverse shells** (target dials the handler over plain TCP, server-authenticated TLS, or mutual TLS with client-certificate verification) and **bind shells** (the handler dials the target, over plain TCP or TLS) — and, for any established session, one of two **switchable secondary transports**: HTTPS (HTTP/2 on modern clients, HTTP/1.1 chunked on legacy clients, both over TLS on a dedicated listener) or an SMB named pipe hosted on the target. The operator can attach or detach either transport at runtime with `http2switch` / `smbswitch` and revert with `backtoshell`. All three flows produce sessions that pass through the same probe, plugin, transfer, and reporting pipeline — there is no functional difference to the operator once a session is established, and the operator can move a live session between the primary shell channel and the HTTPS channel with `http2switch` / `backtoshell`. The framework provides a unified operator console for session management, host reconnaissance, chunked file transfer, in-memory payload execution, SOCKS5 pivoting, plugin-driven post-exploitation, structured reporting, and a built-in `update` command for automatic Git-based updates and seamless handler restarts. Originally developed as a lightweight reverse shell handler, the project has evolved into an extensible framework in which capabilities such as firewall enumeration, credential store metadata collection, network mapping, browser profiling, and additional post-exploitation functionality are implemented as independent, modular plugins. The framework also includes the `make_token` plugin for establishing new C2 sessions via remote protocols (SSH, WinRM, SMB, WMI, MSSQL, DCOM, and MySQL/MariaDB) using command-line tools from the operator side, and an `upgrade_mtls` plugin that migrates a live session onto the mutual-TLS listener by pushing the handler's client certificate bundle to the target.
+TornadoRevC2 is a modular post-exploitation framework that supports two
+session models in a single process, sharing one operator console and one
+set of infrastructure components (TLS certificate material, malleable
+profiles, session logging):
+
+- **Interactive shell sessions** — reverse shells (target dials the
+  handler over plain TCP, server-authenticated TLS, or mutual TLS with
+  client-certificate verification) and bind shells (the handler dials
+  the target, over plain TCP or TLS). Either can be moved at runtime
+  onto an HTTPS secondary transport (HTTP/2 or HTTP/1.1 over TLS) or an
+  SMB named pipe hosted on the target, and reverted with
+  `backtoshell`. All flows produce identical session objects and pass
+  through the same probe, plugin, transfer, and reporting pipeline.
+
+- **Compiled beacon sessions** — a Go agent cross-compiled from the
+  operator machine, with no runtime configuration on disk. The agent
+  checks in on a schedule, retrieves queued tasks, executes them via
+  in-process native handlers or a shell, and returns to sleep. Tasks
+  and results are ECDSA-signed end to end, transport is HTTPS with
+  optional mutual TLS, and every behavioural property is baked in at
+  build time.
+
+The framework provides a unified operator console for session
+management, host reconnaissance, chunked file transfer, in-memory
+payload execution, SOCKS5 pivoting, plugin-driven post-exploitation,
+structured reporting, and a built-in `update` command for automatic
+Git-based updates and seamless handler restarts. Capabilities such as
+firewall enumeration, credential store metadata collection, network
+mapping, browser profiling, Windows domain trust analysis, and
+additional post-exploitation functionality are implemented as 65
+independent, modular plugins. The `make_token` plugin establishes new
+C2 sessions over remote protocols (SSH, WinRM, SMB, WMI, MSSQL, DCOM,
+and MySQL/MariaDB) from the operator side; `upgrade_mtls` migrates a
+live session onto the mutual-TLS listener by pushing the handler's
+client certificate bundle to the target.
 
 **Supported target platforms:** Linux and Windows (primary), with compatibility for generic Unix and BSD environments where applicable.
 
@@ -70,14 +105,21 @@ TornadoRevC2 is a modular post-exploitation framework that handles sessions over
 | **Extensibility** | Runtime plugin load, reload, unload, and rescan (live discovery — no handler restart) · External plugins via `TORNADOREVC2_PLUGIN_DIR` · Documented `SessionContext` API |
 | **Reporting** | Per-session logging · Structured plugin output · HTML transcript export |
 | **Self-update** | Git-based `update` command with repository verification, fast-forward pull, and automatic handler restart |
+| **Beacon subsystem** | Compiled Go agent, cross-compiled from the operator machine · HTTPS / mTLS transport · uTLS browser ClientHello fingerprinting (`chrome`, `firefox`, `safari`) · ECDSA P-256 task and result signing with trust-on-first-use public key pinning · Cookie-based session tokens with HMAC proof · Native in-process verbs (`cat`, `ls`, `ps`, `id`, `env`, `pwd`, `whoami`, `hostname`, `uname`) with no `fork` or `execve` · **Chunked file transfer** with SHA-256 verification · **In-memory PE (Windows) and ELF (Linux) execution** · **BOF/COFF loading** on Windows via an embedded C# loader shared with the shell handler's `bofloader` plugin · **Inline script execution** (`pyexec`, `psexec`, `shexec`) with source piped via stdin · Compile-time OPSEC profiles (anti-sandbox, anti-debug, anti-VM, AMSI/ETW patching, string obfuscation, garble, UPX) · Named C2 profiles for HTTP fingerprinting · Runtime-configurable sleep and working-hours · Automatic reconnection on 4xx/5xx · Kill date / self-destruct · Background session reaper · Response padding to random buckets · Interactive `beacon-build` wizard |
 
-**Not supported:** Task scheduling, or beacon-style callback infrastructure.
+**Not supported:** Scheduled task management on the target, or beacon-side plugin compatibility with the shell handler's `@plugin.command` registry.
+
 
 ---
 
 ## Design Philosophy
 
-TornadoRevC2 is engineered for environments where deployment friction and operational footprint matter.
+TornadoRevC2 is engineered for environments where deployment friction
+and operational footprint matter. The shell handler and the beacon
+subsystem share this principle but realize it differently: the shell
+handler avoids artifacts by relying on shell primitives that are
+already present; the beacon avoids them by shipping a self-contained
+binary with no external configuration.
 
 ### Dependency-light, native-command design
 
@@ -129,6 +171,32 @@ Handler updates are delivered through Git on the operator machine. The `update` 
 ## Operational Security
 
 TornadoRevC2 applies a set of always-on operational security measures across every session. These are not optional flags — they run unconditionally so that even a hurried operator receives the full benefit.
+
+### Operational security (beacon)
+
+- **ECDSA P-256 signing** on every task (server → agent) and every
+  result (agent → server), with trust-on-first-use pinning per session.
+- **Cookie-based session tokens** with HMAC proof. No custom `X-`
+  headers, no enumerable integer IDs.
+- **Response padding.** Both `/beacon` and `/tasks` responses are
+  padded to a random size, so Content-Length does not correlate with
+  task activity.
+- **Jittered first check-in.** The initial beacon fires 2–17 seconds
+  after launch, matching the latency of a user-initiated app.
+- **Working-hours window.** Configurable via build flags; defaults to
+  08:00–19:00 local time.
+- **Native in-process execution** for `cat`, `ls`, `ps`, `id`, `env`,
+  `pwd`, `whoami`, `hostname`, `uname` — no `fork`, no `execve`.
+- **Command obfuscation via stdin-piped shells.** Arbitrary commands
+  travel via stdin to `/bin/sh -s` (Linux) or `cmd.exe /Q` (Windows);
+  the actual command never appears in argv.
+- **Shell history suppression.** Any child shell inherits
+  `HISTFILE=/dev/null`, `HISTSIZE=0`, `HISTCONTROL=ignorespace`,
+  `HISTIGNORE=*`.
+- **Compile-time OPSEC profiles.** `stealth`, `opsec`, and `paranoid`
+  bundle anti-sandbox, anti-debug, anti-VM, AMSI/ETW patching, string
+  obfuscation, garble, and UPX.
+
 
 ### Shell history suppression
 
@@ -307,6 +375,29 @@ The operator controls the tunnel with four commands:
 - `socks stop <proxy_id>` — stop a proxy; if it was the last proxy on the session, the remote agent is terminated and any on-disk artifact (Unix only) is removed from the target
 
 The agent is **shared across proxies on the same session** and is cleaned up only when the last proxy on that session stops or the session disconnects.
+
+### Beacon listener
+
+The beacon subsystem runs on a **dedicated port** (`--beacon-port`),
+separate from the shell listeners, and terminates TLS itself. It reuses
+the handler's certificate material and accepts three endpoints:
+`POST /beacon` (check-in), `GET /tasks` (poll), `POST /results`
+(result upload). ALPN advertises only `http/1.1` because Werkzeug
+cannot parse the HTTP/2 connection preface.
+
+C2 profile paths under `profiles/c2/` are **auto-discovered at listener
+startup**: every unique path declared by any profile is registered as a
+valid route. An agent built with `--c2-profile chrome` reaches a
+listener started without any matching flag. `--beacon-profile <name>`
+narrows registration to a single profile's paths.
+
+The beacon engine (`tornadorevc2/beacon/engine.py`) holds the single
+source of truth for beacon session state. A background thread reaps
+sessions that have been silent for 100× their normal TTL. A task queue
+per session is drained on each `/tasks` poll; scheduling parameters are
+pushed back as response headers so `sleep` changes in the console take
+effect within one interval.
+
 
 ---
 
@@ -681,6 +772,574 @@ TornadoRevC2 ships with **65 built-in plugins** organized by function. All enume
 | `bat` | Batch script streamed via `cmd.exe /Q` stdin |
 
 PEASS-ng scripts for in-memory privesccheck: [github.com/carlospolop/PEASS-ng](https://github.com/carlospolop/PEASS-ng)
+
+---
+
+## Beacon Subsystem
+
+TornadoRevC2 includes a **pull-based beacon subsystem** alongside the
+interactive shell handler. Both run in the same process, share the
+operator console, and share infrastructure (TLS certificates, malleable
+profiles, session logging). They share no session state and no code
+paths — the shell handler continues to operate exactly as before when
+the beacon subsystem is not enabled.
+
+### What a beacon is (and is not)
+
+A beacon is a **compiled implant** that wakes on its own schedule,
+checks in with the server, retrieves queued work, executes it, and
+returns to sleep. The operator queues commands; the beacon picks them
+up on its next check-in.
+
+| | Shell handler | Beacon subsystem |
+|---|---|---|
+| **Connection** | Persistent bidirectional socket | Stateless HTTP check-ins |
+| **Execution** | Synchronous, operator-typed | Queued, executed at next check-in |
+| **Latency** | Immediate | Bounded by sleep interval |
+| **Implant** | Shell (`bash`, `cmd.exe`, PowerShell) | Compiled Go binary |
+| **OPSEC profile** | Command obfuscation, in-process routing | Compile-time evasion flags |
+| **Authentication** | Session-scoped markers | ECDSA-signed tasks and results |
+
+The beacon is **not** a replacement for the shell handler. Interactive
+engagements, low-latency operations, and plugin-heavy workflows belong
+on the shell side. The beacon is for long-haul engagements where a
+compiled agent that survives reboots, retries on network failure, and
+self-destructs on a schedule is the right tool.
+
+### Key features
+
+| Category | Capabilities |
+|----------|-------------|
+| **Implant** | Go binary, cross-compiled from the operator machine · No runtime config file, no environment variables, no command-line arguments — every property is baked in at build time |
+| **Transport** | HTTPS with server-authenticated TLS by default · Optional mutual TLS using the handler's existing mTLS bundle · Optional RootCA pinning |
+| **Wire protocol** | Three endpoints: `POST /beacon`, `GET /tasks`, `POST /results` · JSON bodies with base64 for binary fields |
+| **Native execution** | `cat`, `ls`, `ps`, `id`, `env`, `pwd`, `whoami`, `hostname`, `uname` execute in-process — no `fork`, no `execve`, no Sysmon EventID 1 |
+| **Command execution** | `exec` spawns a child process. Used only when no native verb covers the operation |
+| **Scheduling** | Configurable sleep interval and jitter, negotiated on check-in · Re-check-in on session expiry · Kill date enforcement |
+| **Cryptography** | ECDSA P-256 task signing (server → agent) · ECDSA result signing (agent → server) · Trust-on-first-use public key pinning per session |
+| **OPSEC** | Compile-time evasion profiles · Anti-sandbox, anti-debug, anti-VM heuristics · AMSI/ETW patching · Sleep mask · String obfuscation · Garble · UPX |
+| **Malleable C2** | Named profiles under `profiles/c2/` control URI paths, User-Agent, and HTTP headers · Listener auto-discovers every profile's paths at startup |
+| **Chunked transfer** | Upload: `truncate` / `writechunk` / `sha256file` · Download: `filesize` / `readchunk` / `sha256file` · Chunk sizes jittered within `[base/2, base]` in both directions so the wire pattern does not correlate to a fixed TornadoRevC2 chunk size · Batched enqueue to respect the task queue cap · Local and remote SHA-256 verified before the transfer is declared complete · Every chunk served by the agent's in-process `os.Open` / `Seek` / `Read` / `Write` path — no `subprocess`, no `argv`, no process-creation telemetry |
+| **In-memory payloads** | `execmem <path> exe` on Windows (process hollowing via an embedded C# loader, same source as the shell handler's `inmemory` plugin) · `execmem <path> elf` on Linux (`memfd_create`, `/dev/shm` fallback) · On-disk file unlinked before invocation on both paths |
+| **Inline scripts** | `pyexec`, `psexec`, `shexec` deliver script source base64-encoded in the task and pipe it to `python3 -`, `powershell.exe -Command -`, or `/bin/sh -s` via stdin · Source never appears in argv |
+| **BOF/COFF** | `bof <name>` or `bof <path.o>` on Windows · Registry shared with the shell handler's `bofloader` plugin (`logs/.tornadorevc2_bofs.json`) · Argument packing matches the shell handler byte-for-byte · AMSI/ETW patched inside the loader |
+| **Build system** | `beacon-build` operator command — interactive wizard or non-interactive flags · Cross-compilation for Windows and Linux, amd64 and arm64 · Shellcode output via Donut · Per-build selection of OPSEC profile, C2 profile, TLS fingerprint, kill days, working-hours window, mTLS bundle directory · Custom mTLS bundle via `--mtls-dir` or individual `--mtls-cert` / `--mtls-key` / `--mtls-ca` paths · Silent by default; `--verbose` (or `BeaconBuildConfig.verbose`) enables diagnostic stderr on the target |
+
+### Architecture
+
+```text
+┌────────────────────────────────────────────────────────────────┐
+│                    Operator Console (handler)                  │
+│  Shell sessions · Beacon sessions · Plugin execution · Logging │
+│                    beacon-build · beacon <ID>                  │
+└─────────────────┬─────────────────────────────┬────────────────┘
+                  │                             │
+         SHELL HANDLER                    BEACON ENGINE
+       (interactive, live)              (queue, no live socket)
+                  │                             │
+                  │                    ┌────────┴────────┐
+                  │                    │                 │
+                  │             POST /beacon       GET /tasks
+                  │             POST /results       (TLS)
+                  │                    │                 │
+                  ▼                    ▼                 ▼
+        ┌──────────────────────────────────────────────────────┐
+        │              Target Host (Go agent)                  │
+        │  Native verbs · exec · sleep loop · kill date        │
+        │  No live socket · No runtime config                  │
+        └──────────────────────────────────────────────────────┘
+```
+
+The beacon listener runs on a **dedicated port** (`--beacon-port`), separate from the shell listeners. It terminates TLS itself and reuses the handler's existing certificate material. It never shares a port with the shell handler.
+
+### Requirements
+
+The beacon subsystem adds three dependencies on top of the shell handler:
+
+| Dependency | Purpose | Install |
+|-----------|---------|---------|
+| **Go toolchain 1.24+** | Cross-compiles the agent | System package manager or [go.dev/dl](https://go.dev/dl/) |
+| **Flask / Werkzeug** | HTTP listener | `pip install flask` |
+| **cryptography** | ECDSA signing | `pip install cryptography` |
+| **`github.com/refraction-networking/utls`** | Browser TLS ClientHello (Go module) | Pulled automatically by `go mod tidy` inside `agent/` |
+
+Optional:
+
+| Dependency | Purpose | Install |
+|-----------|---------|---------|
+| **garble** | Control-flow obfuscation (used by `opsec` and `paranoid` profiles) | `go install mvdan.cc/garble@latest` |
+| **UPX** | Binary packing (used by `paranoid` profile) | System package manager |
+| **Donut** | Shellcode output format | [TheWover/donut](https://github.com/TheWover/donut/releases) |
+
+The shell handler runs identically without any of these — the beacon subsystem is never imported unless `--beacon-port` is passed.
+
+### Quick Start
+
+#### 1. Start the handler with the beacon listener
+
+```bash
+python3 tornadorevc2.py --beacon-port 8881
+```
+
+The listener auto-discovers every C2 profile under `profiles/c2/` and
+registers its paths alongside the defaults. To narrow to a single
+profile, pass `--beacon-profile <name>`:
+
+```bash
+python3 tornadorevc2.py --beacon-port 8881 --beacon-profile chrome
+```
+
+For mTLS beacons:
+
+```bash
+python3 tornadorevc2.py --beacon-port 8881 --beacon-mtls-ca mtls_certs/ca.pem
+```
+
+#### 2. Build an agent
+
+Two ways:
+
+**Interactive wizard:**
+
+```
+tornado> beacon-build
+```
+
+Prompts for target OS, architecture, output format, callback URL,
+OPSEC profile, C2 profile, kill days, and whether to embed the mTLS
+client bundle.
+
+**Non-interactive:**
+
+```
+tornado> beacon-build linux amd64 --profile stealth --c2-profile chrome --kill-days 30
+tornado> beacon-build windows amd64 --profile opsec --c2-profile slack --mtls
+```
+
+Flags:
+
+| Flag | Values | Default |
+|------|--------|---------|
+| `--format <fmt>` | `exe`, `dll`, `elf`, `shellcode` | `exe` on Windows, `elf` elsewhere |
+| `--url <url>` | HTTPS callback URL | Derived from the running handler |
+| `--profile <name>` | `default`, `stealth`, `opsec`, `paranoid` | `default` |
+| `--c2-profile <name>` | A profile name under `profiles/c2/` | Handler default |
+| `--tls-profile <name>` | `go`, `chrome`, `firefox`, `safari` | `go` |
+| `--kill-days <N>` | Days until self-destruct (0 = no deadline) | `30` |
+| `--work-hours <spec>` | `HH:MM-HH:MM` or `off` (target local time; a wrapped window like `22:00-06:00` is valid) | `08:00-19:00` |
+| `--work-off` | Shorthand for `--work-hours off` | — |
+| `--mtls` | *(flag)* — embed the handler's own `mtls_certs/` bundle | off |
+| `--mtls-dir <dir>` | Directory containing `client.pem`, `client.key`, `ca.pem` — implies `--mtls` | off |
+| `--mtls-cert <path>` / `--mtls-key <path>` / `--mtls-ca <path>` | Override individual PEM paths — implies `--mtls` | off |
+
+Compiled agents land in `beacon_output/beacon_<os>_<arch>[.exe]`.
+
+**The build-time `--work-hours` value is a default, not a lock-in.** The runtime `workhours` command from the beacon console overrides it on the next poll, and the agent acknowledges the new window within one check-in cycle.
+
+**mTLS is a shared secret between the build and the listener.** A beacon built against PKI `A` can only check in against a listener configured for the same PKI `A`. If you build with a custom `--mtls-dir`, start the handler with `--beacon-mtls-dir` pointing at the same directory:
+
+```bash
+# Build against the operator's custom PKI
+beacon-build linux amd64 --url https://10.0.0.1:8881 --mtls-dir /etc/pki/eng
+
+# Start the handler against the same PKI
+python tornadorevc2.py -H 0.0.0.0 --beacon-port 8881 --beacon-mtls-dir /etc/pki/eng
+```
+
+#### 3. Deploy and run
+
+Run the agent on the target. On the first check-in the operator console prints:
+
+```
+[BEACON] New beacon #1001: alice@WIN-DEV (windows/amd64) | beacon 1001
+```
+
+#### 4. Operate
+
+```
+tornado> beacons                        # List active beacons
+tornado> beacon 1001                    # Attach to a beacon console
+● beacon#1001 > ls C:\Users\alice
+● beacon#1001 > cat C:\Users\alice\notes.txt
+● beacon#1001 > exec whoami /all
+● beacon#1001 > sleep 120 0.4           # Change check-in interval
+● beacon#1001 > exit                     # Detach (beacon keeps running)
+● beacon#1001 > kill                     # Self-destruct (confirmation prompt)
+```
+
+### OPSEC Profiles
+
+Every evasion feature is **compile-time only**. There is no configuration
+file on the target, no environment variable, no registry key. A captured
+binary contains everything it needs to run.
+
+| Profile | Features | Use case |
+|---------|----------|----------|
+| `default` | None | Lab testing, internal authorized assessments |
+| `stealth` | String obfuscation | Standard engagements |
+| `opsec` | String obfuscation, garble, AMSI bypass, ETW patch, anti-sandbox, anti-debug, anti-VM, PPID spoof | Monitored environments |
+| `paranoid` | Everything in `opsec` plus additional sleep-mask modes | High-risk targets with mature EDR |
+
+**Compile-time configuration means the binary is the configuration.**
+Rebuilding is the only way to change the callback URL, the sleep
+interval, or which evasion features are present. This is deliberate:
+a binary with the URL baked in is harder to pivot against than one that
+reads a config file.
+
+### C2 Profiles
+
+C2 profiles decouple the HTTP fingerprint from the build. Each profile
+is a JSON file under `profiles/c2/`:
+
+```json
+{
+  "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ...",
+  "linux_user_agent": "Mozilla/5.0 (X11; Linux x86_64) ...",
+  "beacon_path":  "/api/v1/analytics/init",
+  "tasks_path":   "/api/v1/analytics/poll",
+  "results_path": "/api/v1/analytics/event",
+  "extra_headers": {
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9"
+  },
+  "request_headers": {}
+}
+```
+
+Ships with `chrome` and `slack` as examples. Add new profiles by
+dropping a JSON file into the directory — no code change required.
+
+**How the listener learns about profile paths.** At startup the listener
+scans `profiles/c2/` and registers every unique path it finds as a
+valid route. An agent built with `--c2-profile chrome` reaches a
+listener that was started without any C2 profile flag. The
+`--beacon-profile <name>` flag narrows the listener to a single
+profile's paths if you want to exclude others.
+
+### Wire Protocol
+
+Three endpoints, two message types. JSON on the wire, base64 for binary
+fields. The listener speaks HTTP/1.1 over TLS; ALPN advertises only
+`http/1.1` because Werkzeug cannot parse the HTTP/2 preface.
+
+#### `POST /beacon` — check-in
+
+```json
+// request
+{
+  "identity": {
+    "hostname":   "WIN-DEV",
+    "username":   "alice",
+    "machine_id": "…",
+    "os":         "windows",
+    "arch":       "amd64",
+    "proto":      1
+  },
+  "agent_pubkey": "-----BEGIN PUBLIC KEY-----\n..."
+}
+
+// response
+{
+  "id":            1001,
+  "sleep":         60,
+  "jitter":        0.3,
+  "kill_deadline": 1735689600.0,
+  "proto":         1,
+  "cookie":        "<opaque HMAC-signed token; rotates every check-in>"
+}
+```
+
+The `agent_pubkey` field is optional. When present, the server pins it
+for the session's lifetime (trust-on-first-use). A later check-in
+presenting a different key for the same fingerprint is logged and
+refused.
+
+#### `GET /tasks` — poll for work
+
+Header: `Cookie: sid=<HMAC-signed session cookie>`
+
+The cookie is issued in the `/beacon` response and rotates on every check-in. Session IDs are not accepted as credentials on their own — an enumerable integer would let anyone who can reach the listener pull tasks for every live session.
+
+```json
+[
+  {"id": "3f8a2b1c", "verb": "cat",  "args": ["C:\\notes.txt"], "timeout": 60, "signature": "MEUCIQ..."},
+  {"id": "a1b2c3d4", "verb": "exec", "args": ["whoami", "/all"], "timeout": 30, "signature": "MEUCIQ..."}
+]
+```
+
+A 400 or 404 means the server no longer recognises the ID — the agent
+re-checks in for a fresh session ID rather than retrying forever.
+
+#### `POST /results` — upload output
+
+Header: `Cookie: sid=<HMAC-signed session cookie>`
+
+```json
+{
+  "id":        "3f8a2b1c",
+  "output":    "bWVldGluZyBhdCAxNTowMA==",
+  "error":     null,
+  "exit_code": 0,
+  "signature": "MEQCIF..."
+}
+```
+
+Server returns 204 on accept. If a public key was pinned at check-in,
+the signature is verified over `Result.signable()` before the result is
+delivered to the waiting task.
+
+### Native Commands
+
+The following verbs execute **in-process** on the target — no child
+process is spawned, no `execve` syscall fires, and no process-creation
+telemetry is generated.
+
+| Verb | Implementation |
+|------|----------------|
+| `cat <path>` | `os.ReadFile` |
+| `ls [path]` | `os.ReadDir` + `os.Stat` |
+| `ps` | `/proc` walk (Linux) / `tasklist` (Windows) |
+| `id` | `os.Getuid` + `os.Getgid` (Linux) / `user.Current()` (Windows) |
+| `env` | `os.Environ` |
+| `pwd` | `os.Getwd` |
+| `whoami` | `user.Current()` |
+| `hostname` | `os.Hostname` |
+| `uname` | `runtime.GOOS` + `runtime.GOARCH` |
+| `readfile <path>` | Alias for `cat` |
+| `sleep <N> [jitter]` | Update check-in interval at runtime |
+| `kill` / `exit` | Self-destruct — the agent exits within 1 second |
+
+**`exec`** is the only verb that spawns a child process. It exists for
+operations that require an actual binary (`netstat`, `curl`, batch
+scripts, etc.). Operators should prefer native verbs where possible.
+
+### Cryptography
+
+#### Task signing (server → agent)
+
+The handler generates a fresh ECDSA P-256 keypair at startup. Every task
+queued for a beacon is signed with the private key. The agent embeds the
+corresponding public key at build time and refuses to execute any task
+whose signature fails to verify.
+
+The signature covers the canonical JSON of `{id, verb, args, timeout}`
+serialised with sorted keys and no whitespace. The Go agent's
+`marshalCanonical` disables HTML escaping to match Python's
+`json.dumps` byte-for-byte — without this, any command containing
+`&`, `<`, or `>` would fail verification silently.
+
+#### Result signing (agent → server)
+
+The agent's keypair is generated at build time and embedded as a base64
+PEM. The public half is presented to the server at first check-in and
+pinned for the session's lifetime. Every result the agent posts is
+signed with its private key; the server verifies before delivering the
+output to the waiting task.
+
+Sessions that never present a public key accept unsigned results.
+Signature-verification failures increment a per-session `rejected_results`
+counter that surfaces in the `beacons` listing and logs a red line to
+the operator console.
+
+### Operator Console
+
+| Command | Description |
+|---------|-------------|
+| `beacons` / `bl` | List active beacons with ID, user@host, OS/arch, sleep interval, last check-in age, check-in count, and address |
+| `beacon <ID>` | Attach to a beacon's interactive console |
+| `beacon-build [<os> <arch> [flags]]` | Compile an agent — wizard if no arguments |
+| `beacon-rm <ID>` | Forget a session from the registry |
+
+**Inside the beacon submenu (`beacon <ID>`):**
+
+| Command | Description |
+|---------|-------------|
+| `ls`, `cat`, `ps`, `id`, `env`, `pwd`, `whoami`, `hostname`, `uname` | Native in-process verbs — no child process |
+| `<cmd> [args]` | Arbitrary command, routed through a stdin-piped shell |
+| `exec <cmd> [args]` | Direct spawn — argv visible in `ps` |
+| `pyexec <file> [-- args]` | Run a local Python script on the target |
+| `psexec <file> [-- args]` | Run a local PowerShell script (Windows) |
+| `shexec <file> [-- args]` | Run a local shell script |
+| `upload <local> <remote>` | Chunked upload with SHA-256 verification |
+| `download <remote> <local>` | Chunked download with SHA-256 verification |
+| `execmem <remote> exe\|elf [-- args]` | Execute a previously-uploaded payload in memory |
+| `bof <name\|path> [args]` | Run a registered BOF or a local `.o` file |
+| `bof-list` | List registered BOFs |
+| `sleep <N> [jitter]` | Change the check-in interval |
+| `workhours <start> <end>` / `workhours off` | Set or disable the working-hours window |
+| `tasks` | List outstanding tasks |
+| `info` | Show beacon identity |
+| `kill` | Queue a self-destruct (with confirmation) |
+| `forget` / `rm` / `remove` | Delete the session from the registry |
+
+Beacon sessions do not appear in `status` — that command is reserved
+for shell sessions. The `sessions` and `reconnects` commands show both
+kinds.
+
+### Session Logging
+
+Every beacon gets its own log directory under `logs/`, using the same
+convention as shell sessions:
+
+```text
+logs/b1001_alice@WIN-DEV_192.168.1.10_beacon/
+  session.log           Check-ins, command dispatches, signature events
+  plugins/              Reserved for future beacon-side plugins
+```
+
+Log entries include the check-in timestamp, source address, and — when
+a task is dispatched or a result returns — the task ID.
+
+### Limitations
+
+The beacon subsystem is not a full C2 platform. By design:
+
+- **No plugin compatibility.** Shell plugins assume synchronous
+  execution over a live socket. Beacon verbs are native and
+  self-contained. The `bofloader` registry is shared, but the plugin
+  itself only runs on shell sessions.
+- **No interactive streaming.** Output arrives in batches after each
+  check-in. There is no `tail -f`, no interactive `top`, no
+  persistent shell session.
+- **Transfer throughput is bounded by sleep.** Chunked transfer
+  queues one task per chunk. A large file over a 60-second sleep
+  takes hours; the console warns and recommends `sleep 0` first. The
+  batching layer keeps the task queue from overflowing, but it does
+  not make the transfer fast.
+- **`execmem exe` requires PowerShell and .NET on the target.** The
+  embedded loader compiles a C# class via `Add-Type` at first
+  invocation. Targets with constrained language mode or stripped
+  .NET cannot use it.
+- **BOF execution requires PowerShell.** Same reason. A native Go
+  COFF loader would remove this dependency but is a separate
+  multi-month project.
+- **ELF execmem needs static linking.** Dynamically-linked ELFs may
+  fail under `memfd_create` on some kernels. Build with `gcc
+  -static`.
+- **mTLS bundle must match between build and listener.** A beacon
+  built with `--mtls-dir /path/to/A` cannot check in against a
+  listener configured with `--beacon-mtls-dir /path/to/B`. The
+  agent will reject the server chain and retry forever, silently
+  unless the build enabled `Verbose`. Rebuilding the agent after
+  the listener changes is the only way to reconcile them. The
+  interactive `beacon-build` wizard checks for this mismatch and
+  warns before compiling.
+
+### Features shared with the shell handler
+
+The beacon applies the same operational security posture as the
+shell handler, with an implementation appropriate to a compiled
+agent:
+
+- **Shell history suppression.** Every child process spawned by the
+  agent — including interactive shells the operator starts via
+  `exec bash -i` — inherits `HISTFILE=/dev/null`, `HISTSIZE=0`,
+  `HISTCONTROL=ignorespace`, and `HISTIGNORE=*`. No shell history
+  is written on the target for any command the beacon runs.
+- **Command obfuscation.** Commands sent through the beacon console
+  are piped to a shell via stdin, not placed in argv. The shell
+  process appears in `/proc/<pid>/cmdline` as `/bin/sh` on Linux or
+  `cmd.exe` on Windows, with no indication of what it is running.
+  Sysmon EventID 1 and auditd `execve` see only the shell, not the
+  command. The `exec` command bypasses this for cases where the
+  literal argv matters — it runs the target binary as a direct
+  child process, with the argv visible in `ps`.
+- **Automatic reconnection.** If the beacon listener restarts or the
+  network flaps, the agent re-checks in for a fresh session ID on
+  the next wake-up. The listener returns 404 for any session ID it
+  does not recognise, and the agent's HTTP client has a 60-second
+  timeout so a hung server cannot freeze it indefinitely.
+- **Cookie-based session tokens.** `X-Beacon-Id` was an enumerable
+  integer. It is now an HMAC-signed cookie that rotates on every
+  check-in; only the most recent cookie for a session is valid.
+- **Response padding.** Both `/beacon` and `/tasks` responses are
+  padded to a random bucket size, so `Content-Length` does not
+  correlate with task activity.
+- **Jittered first check-in.** The agent waits 2–17 seconds before
+  its first outbound call, matching the latency of a user-launched
+  application.
+- **Working-hours window.** The agent suppresses check-ins outside a
+  configured window (default 08:00–19:00 local time). The window is
+  settable at build time and overridable at runtime from the
+  beacon console via `workhours`.
+- **uTLS browser fingerprint.** With `--tls-profile chrome|firefox|safari`
+  at build time, the agent presents a byte-exact browser ClientHello.
+  This closes the JA3/JA4 gap that otherwise identifies a Go client
+  in a single packet capture.
+
+### Project Structure (beacon-related)
+
+```text
+TornadoRevC2/
+├── tornadorevc2/
+│   ├── handler.py                    Shell handler (+ 5 additive beacon edits)
+│   └── beacon/                       Beacon server-side Python package
+│       ├── constants.py              Defaults and tunables
+│       ├── protocol.py               Task / Result dataclasses
+│       ├── session.py                BeaconSession, PendingTask
+│       ├── engine.py                 Registry, task dispatch, TOFU pinning
+│       ├── listener.py               Flask HTTP listener over TLS
+│       ├── console.py                Operator submenu
+│       ├── crypto.py                 TaskSigner wrapper
+│       └── builder.py                Go cross-compilation
+├── agent/                            Go implant
+│   ├── go.mod                        Module: tornadorevc2/agent
+│   ├── main.go                       Entry point, verbs, wire types
+│   ├── ps_{linux,windows}.go         Platform-specific process listing
+│   ├── id_{linux,windows}.go         Platform-specific identity
+│   ├── machineid_{linux,windows}.go  Platform-specific machine ID
+│   └── evasion/                      Compile-time evasion features
+│       ├── amsi_etw_windows.go       AMSI / ETW patching
+│       ├── amsi_etw_other.go         No-op stub
+│       ├── antisandbox_{linux,windows}.go
+│       ├── antidebug_{linux,windows}.go
+│       ├── antivm_{linux,windows}.go
+│       ├── sleepmask_{linux,windows}.go
+│       ├── ppid_spoof_windows.go     Windows-only self-respawn
+│       ├── ppid_spoof_other.go       No-op stub
+│       └── memwin_windows.go         Shared memory-write helpers
+├── profiles/
+│   └── c2/                           C2 profiles (chrome, slack, ...)
+│       ├── chrome.json
+│       └── slack.json
+├── tls_certs/                        Auto-generated on first run (gitignore)
+│   ├── server.pem
+│   └── server.key
+├── mtls_certs/                       Auto-generated on first run (gitignore)
+│   ├── ca.pem / ca.key
+│   ├── server-mtls.pem / server-mtls.key
+│   └── client.pem / client.key
+├── .keys/                            Auto-generated agent signing key (gitignore)
+│   └── agent_signing.key
+└── beacon_output/                    Compiled agents (gitignore this)
+```
+
+### Design principle
+
+The shell handler is not modified by the beacon subsystem except for
+a small number of additive edits, each tagged in the source with a
+`# BEACON-EDIT-N` comment:
+
+1. Beacon subsystem attributes in `TORNADOREVC2.__init__`
+2. Conditional beacon listener startup in `start()`, including
+   resolution of the mTLS bundle when `--beacon-mtls-ca` or
+   `--beacon-mtls-dir` is set
+3. Beacon command branches in `main_menu()` (`beacons`, `beacon`,
+   `beacon-build`, `beacon-rm`)
+4. Beacon argparse arguments in `main()`: `--beacon-port`,
+   `--beacon-mtls-ca`, `--beacon-mtls-dir`,
+   `--beacon-mtls-server-cert`, `--beacon-mtls-server-key`,
+   `--beacon-profile`
+5. Post-construction attribute assignments in `main()` connecting
+   the argparse values to the server instance
+6. The `beacon_build` method on `TORNADOREVC2`, which constructs the
+   build config, stages the server public key, decides the agent
+   signing keypair path, resolves the mTLS bundle, and runs the
+   mTLS-compatibility preflight warning
+
+Removing these regions restores a shell-only handler that behaves
+identically to the pre-beacon version. Grep for `# BEACON-EDIT` to
+see the exact set of touch points.
 
 ---
 
@@ -1268,6 +1927,14 @@ On first run, a full PKI is bootstrapped under `mtls_certs/`:
 - `ca.srl` — OpenSSL serial counter generated during certificate signing
 
 Ship **`client.pem` + `client.key` + `ca.pem`** with the authorized client. The client must present its certificate on connect or the handshake is rejected.
+
+**Beacon listener mTLS.** When `--beacon-mtls-ca` (or `--beacon-mtls-dir`) is passed at handler start, the beacon listener switches from server-only TLS to mutual TLS on the same certificate material:
+
+- **Default bundle** — the listener serves `mtls_certs/server-mtls.pem` and verifies client certificates against `mtls_certs/ca.pem`.
+- **Custom bundle** — pass `--beacon-mtls-dir <path>` to point the listener at a directory containing `ca.pem`, `server-mtls.pem`, and `server-mtls.key`. The beacon agent must be built against the same directory (via `beacon-build --mtls-dir <path>`), or the handshake will fail on both sides: the agent will not trust the server chain, and the server will not trust the agent's client certificate.
+- **Individual overrides** — `--beacon-mtls-server-cert` and `--beacon-mtls-server-key` override the default filenames when the operator's bundle uses different names.
+
+**The build-time and runtime bundles must match.** There is no negotiation and no fallback — a beacon built against PKI A cannot authenticate to a listener using PKI B. This is deliberate: it prevents an attacker who compromises the listener from accepting check-ins from agents built with their own CA. The interactive `beacon-build` wizard warns at build time when the selected bundle differs from the running listener's configuration.
 
 Start with explicit paths:
 
